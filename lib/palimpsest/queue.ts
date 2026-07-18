@@ -3,6 +3,7 @@ import {
   DomainError,
   assertFreshBase,
   buildOpenAiEditPrompt,
+  displayMaskForLayer,
 } from "./domain.mjs";
 import type { AppEnv } from "./runtime";
 import { readPngDimensions, sha256Hex } from "./runtime";
@@ -141,7 +142,7 @@ async function processOne(env: AppEnv): Promise<boolean> {
       job.regionY == null ||
       job.regionWidth == null ||
       job.regionHeight == null ||
-      !job.displayMaskBlobId
+      (job.executionMode === "demo" && !job.displayMaskBlobId)
     ) {
       throw new DomainError("INTERNAL_ERROR", "The queued edit is incomplete.");
     }
@@ -158,6 +159,9 @@ async function processOne(env: AppEnv): Promise<boolean> {
       await updateStage(env, job.id, ownerToken, fence, "generating");
       patch = await generateOpenAiPatch(env, job, env.OPENAI_API_KEY);
     } else {
+      if (!job.displayMaskBlobId) {
+        throw new DomainError("INTERNAL_ERROR", "The demo display mask is missing.");
+      }
       const maskRecord = await getBlobRecord(env, job.displayMaskBlobId);
       const seed = await sha256Hex(
         `${ARTWORK_ID}:${job.baseRevisionId}:${job.prompt}:${maskRecord?.sha256 ?? "mask"}`,
@@ -381,7 +385,11 @@ async function commitPatch(
   fence: number,
   sequence: number,
 ) {
-  if (job.tileX == null || job.tileY == null || !job.displayMaskBlobId) {
+  if (
+    job.tileX == null ||
+    job.tileY == null ||
+    (job.executionMode === "demo" && !job.displayMaskBlobId)
+  ) {
     throw new DomainError("INTERNAL_ERROR", "The patch metadata is incomplete.");
   }
   const revisionId = crypto.randomUUID();
@@ -427,7 +435,13 @@ async function commitPatch(
       `INSERT INTO revision_patches
        (revision_id, tile_x, tile_y, patch_blob_id, display_mask_blob_id)
        VALUES (?, ?, ?, ?, ?)`,
-    ).bind(revisionId, job.tileX, job.tileY, blobId, job.displayMaskBlobId),
+    ).bind(
+      revisionId,
+      job.tileX,
+      job.tileY,
+      blobId,
+      displayMaskForLayer(job.executionMode, job.displayMaskBlobId),
+    ),
     env.DB.prepare(
       `UPDATE artworks SET head_revision_id = ?, head_sequence = ?
        WHERE id = ? AND head_revision_id = ?`,

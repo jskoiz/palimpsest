@@ -3,6 +3,7 @@ import {
   DomainError,
   assertFreshBase,
   createDisplayMaskSvg,
+  displayMaskForLayer,
   escapeXml,
   resolveTileLayers,
   serializeHistory,
@@ -522,7 +523,8 @@ export async function getArtworkState(
        rp.tile_y AS tileY,
        p.id AS blobId,
        p.sha256 AS sha256,
-       m.id AS maskBlobId
+       m.id AS maskBlobId,
+       r.origin AS origin
      FROM revision_patches rp
      JOIN revisions r ON r.id = rp.revision_id
      JOIN blobs p ON p.id = rp.patch_blob_id
@@ -538,6 +540,7 @@ export async function getArtworkState(
       blobId: string;
       sha256: string;
       maskBlobId: string | null;
+      origin: string;
     }>();
 
   const resolved = resolveTileLayers(revisions.results, bases.results, patches.results);
@@ -554,15 +557,21 @@ export async function getArtworkState(
         url: `/api/blobs/${encodeURIComponent(tile.base.blobId)}`,
         sha256: tile.base.sha256,
       },
-      layers: tile.layers.map((layer: Record<string, unknown>) => ({
-        revisionId: layer.revisionId,
-        blobId: layer.blobId,
-        url: `/api/blobs/${encodeURIComponent(String(layer.blobId))}`,
-        sha256: layer.sha256,
-        maskUrl: layer.maskBlobId
-          ? `/api/blobs/${encodeURIComponent(String(layer.maskBlobId))}`
-          : null,
-      })),
+      layers: tile.layers.map((layer: Record<string, unknown>) => {
+        const maskBlobId = displayMaskForLayer(
+          String(layer.origin),
+          typeof layer.maskBlobId === "string" ? layer.maskBlobId : null,
+        );
+        return {
+          revisionId: layer.revisionId,
+          blobId: layer.blobId,
+          url: `/api/blobs/${encodeURIComponent(String(layer.blobId))}`,
+          sha256: layer.sha256,
+          maskUrl: maskBlobId
+            ? `/api/blobs/${encodeURIComponent(maskBlobId)}`
+            : null,
+        };
+      }),
     })),
   };
 }
@@ -702,22 +711,26 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
   const authorId = crypto.randomUUID();
   const sourceBlobId = crypto.randomUUID();
   const maskBlobId = crypto.randomUUID();
-  const displayMaskBlobId = crypto.randomUUID();
+  const displayMaskBlobId = input.executionMode === "demo" ? crypto.randomUUID() : null;
   const now = Date.now();
   const sourceHash = await sha256Hex(input.sourceBytes);
-  const displayMask = new TextEncoder().encode(
-    createDisplayMaskSvg({
-      region: input.region,
-      fill: input.fill,
-      strokes: input.strokes,
-    }),
-  );
-  const displayMaskHash = await sha256Hex(displayMask);
+  const displayMask = displayMaskBlobId
+    ? new TextEncoder().encode(
+        createDisplayMaskSvg({
+          region: input.region,
+          fill: input.fill,
+          strokes: input.strokes,
+        }),
+      )
+    : null;
+  const displayMaskHash = displayMask ? await sha256Hex(displayMask) : null;
   const sourceKey = `artworks/palimpsest/inputs/${jobId}/source-${sourceHash}.png`;
   const maskKey = `artworks/palimpsest/masks/${jobId}/provider-${maskHash}.png`;
-  const displayMaskKey = `artworks/palimpsest/masks/${jobId}/display-${displayMaskHash}.svg`;
+  const displayMaskKey = displayMaskHash
+    ? `artworks/palimpsest/masks/${jobId}/display-${displayMaskHash}.svg`
+    : null;
 
-  await Promise.all([
+  const blobWrites = [
     env.BLOBS.put(sourceKey, input.sourceBytes, {
       httpMetadata: { contentType: "image/png" },
       customMetadata: { sha256: sourceHash, private: "true" },
@@ -726,13 +739,16 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
       httpMetadata: { contentType: "image/png" },
       customMetadata: { sha256: maskHash, private: "true" },
     }),
-    env.BLOBS.put(displayMaskKey, displayMask, {
+  ];
+  if (displayMaskKey && displayMask && displayMaskHash) {
+    blobWrites.push(env.BLOBS.put(displayMaskKey, displayMask, {
       httpMetadata: { contentType: "image/svg+xml" },
       customMetadata: { sha256: displayMaskHash, immutable: "true" },
-    }),
-  ]);
+    }));
+  }
+  await Promise.all(blobWrites);
 
-  await env.DB.batch([
+  const statements = [
     env.DB.prepare(
       "INSERT INTO authors (id, display_name, source, created_at) VALUES (?, ?, 'visitor', ?)",
     ).bind(authorId, input.displayName, now),
@@ -746,18 +762,26 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
        (id, artwork_id, kind, r2_key, content_type, byte_length, sha256, width, height, created_at)
        VALUES (?, ?, 'mask', ?, 'image/png', ?, ?, 1024, 1024, ?)`,
     ).bind(maskBlobId, ARTWORK_ID, maskKey, input.maskBytes.byteLength, maskHash, now),
-    env.DB.prepare(
-      `INSERT INTO blobs
-       (id, artwork_id, kind, r2_key, content_type, byte_length, sha256, width, height, created_at)
-       VALUES (?, ?, 'display_mask', ?, 'image/svg+xml', ?, ?, 1024, 1024, ?)`,
-    ).bind(
-      displayMaskBlobId,
-      ARTWORK_ID,
-      displayMaskKey,
-      displayMask.byteLength,
-      displayMaskHash,
-      now,
-    ),
+  ];
+  if (displayMaskBlobId && displayMaskKey && displayMask && displayMaskHash) {
+    statements.push(
+      env.DB
+        .prepare(
+          `INSERT INTO blobs
+           (id, artwork_id, kind, r2_key, content_type, byte_length, sha256, width, height, created_at)
+           VALUES (?, ?, 'display_mask', ?, 'image/svg+xml', ?, ?, 1024, 1024, ?)`,
+        )
+        .bind(
+          displayMaskBlobId,
+          ARTWORK_ID,
+          displayMaskKey,
+          displayMask.byteLength,
+          displayMaskHash,
+          now,
+        ),
+    );
+  }
+  statements.push(
     env.DB.prepare(
       `INSERT INTO edit_jobs
        (id, artwork_id, kind, state, execution_mode, author_id, requester_hash,
@@ -788,7 +812,8 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
       now,
       now,
     ),
-  ]);
+  );
+  await env.DB.batch(statements);
 
   return getPublicJob(env, jobId);
 }

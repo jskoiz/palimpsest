@@ -6,6 +6,7 @@ import {
   assertFreshBase,
   buildOpenAiEditPrompt,
   createDisplayMaskSvg,
+  displayMaskForLayer,
   maskBlendInset,
   resolveTileLayers,
   serializeHistory,
@@ -128,6 +129,12 @@ test("filled object masks reserve a feathered blend margin", () => {
   assert.match(svg, /feGaussianBlur stdDeviation="10"/);
   assert.match(svg, /clipPath id="edit-bounds"/);
   assert.match(svg, /<rect x="124" y="224" width="336" height="272" fill="white"\/>/);
+});
+
+test("live image patches render as complete replacement tiles", () => {
+  assert.equal(displayMaskForLayer("openai", "display-mask"), null);
+  assert.equal(displayMaskForLayer("demo", "display-mask"), "display-mask");
+  assert.equal(displayMaskForLayer("seed", null), null);
 });
 
 test("live image prompts keep random objects whole without forcing an art style", () => {

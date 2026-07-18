@@ -1,6 +1,6 @@
 # Palimpsest
 
-Palimpsest is one canonical communal image with an immutable, linear memory of every accepted change. Visitors edit a bounded region, paint a mask, and submit a prompt; the artwork is reconstructed from tiled keyframes and patch layers instead of re-encoding the master.
+Palimpsest is one canonical communal image with an immutable, linear memory of every accepted change. Visitors edit a bounded region, paint a mask, and submit a prompt; the artwork is reconstructed from tiled keyframes and patch layers instead of re-encoding the master. Live image edits commit the generated tile as a complete replacement patch so a second display mask cannot crop a finished subject.
 
 ## Architecture
 
