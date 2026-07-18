@@ -179,6 +179,12 @@ button:disabled {
 
 .edit-is-open .artwork-stage {
   margin-right: 404px;
+  grid-template-columns: minmax(0, 1fr);
+  padding-right: 34px;
+}
+
+.edit-is-open .museum-label {
+  display: none;
 }
 
 .artwork-frame {
@@ -567,7 +573,9 @@ button:disabled {
   width: 404px;
   overflow: auto;
   overscroll-behavior: contain;
-  padding: 24px 24px max(28px, env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  padding: 24px 24px 0;
   border-left: 1px solid var(--hairline);
   background: var(--paper);
   animation: inspector-enter 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
@@ -595,6 +603,15 @@ button:disabled {
   font-size: 30px;
   font-weight: 500;
   letter-spacing: -0.02em;
+}
+
+.inspector-context {
+  margin: 8px 0 0;
+  color: var(--soft-ink);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .close-button {
@@ -645,6 +662,70 @@ button:disabled {
 
 .edit-step > .text-button {
   margin-top: 8px;
+}
+
+.confirm-patch-button {
+  width: 100%;
+  min-height: 46px;
+  margin-top: 14px;
+  border: 1px solid var(--vermilion);
+  background: var(--vermilion);
+  color: var(--light-on-dark);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.confirm-patch-button:hover {
+  border-color: var(--dark-vermilion);
+  background: var(--dark-vermilion);
+}
+
+.edit-inspector.is-positioning .mask-step,
+.edit-inspector.is-positioning .prompt-step {
+  display: none;
+}
+
+.upcoming-steps {
+  margin-top: 26px;
+  border-top: 1px solid var(--hairline);
+}
+
+.upcoming-step {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--soft-ink);
+}
+
+.upcoming-step > span {
+  align-self: start;
+  padding-top: 1px;
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-style: italic;
+}
+
+.upcoming-step strong {
+  color: var(--ink);
+  font-family: var(--font-display);
+  font-size: 16px;
+  font-weight: 500;
+}
+
+.upcoming-step p {
+  margin: 3px 0 0;
+  font-size: 11px;
+}
+
+.upcoming-step small {
+  padding-left: 12px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .mask-editor {
@@ -879,6 +960,20 @@ button:disabled {
 
 .submit-error {
   color: var(--dark-vermilion);
+}
+
+.inspector-submit {
+  position: sticky;
+  z-index: 4;
+  bottom: 0;
+  margin: auto -24px 0;
+  padding: 12px 24px max(28px, env(safe-area-inset-bottom));
+  border-top: 1px solid var(--hairline);
+  background: var(--paper);
+}
+
+.inspector-submit .submit-hint {
+  margin-top: 0;
 }
 
 .submit-edit {
@@ -1215,15 +1310,6 @@ button:disabled {
   }
 
   .edit-is-open .museum-label {
-    display: block;
-  }
-
-  .edit-is-open .museum-label blockquote {
-    margin: 12px 0;
-  }
-
-  .edit-is-open .museum-label .label-actions,
-  .edit-is-open .museum-label .provenance {
     display: none;
   }
 }
@@ -1438,14 +1524,16 @@ button:disabled {
   .edit-inspector {
     top: 0;
     max-height: none;
-    padding: 20px 18px max(20px, env(safe-area-inset-bottom));
+    padding: 20px 18px 0;
     border-top: 0;
   }
 
-  .submit-edit {
-    position: sticky;
-    bottom: 0;
-    box-shadow: 0 -8px 0 var(--paper);
+  .inspector-submit {
+    margin-right: -18px;
+    margin-left: -18px;
+    padding-right: 18px;
+    padding-bottom: max(20px, env(safe-area-inset-bottom));
+    padding-left: 18px;
   }
 
   .selection-instruction {

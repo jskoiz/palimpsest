@@ -976,6 +976,10 @@ export default function Palimpsest() {
               <div>
                 <p className="eyebrow">Contribution workspace</p>
                 <h2>Add one layer</h2>
+                <p className="inspector-context">
+                  Revision {String(currentRevision?.sequence ?? 0).padStart(3, "0")}
+                  {currentRevision?.author ? ` · ${currentRevision.author}` : ""}
+                </p>
               </div>
               <button
                 className="close-button"
@@ -990,20 +994,44 @@ export default function Palimpsest() {
               </button>
             </div>
 
-            <div className="edit-step patch-step">
+            <div
+              className={`edit-step patch-step${choosingRegion ? " is-active" : " is-complete"}`}
+              aria-current={choosingRegion ? "step" : undefined}
+            >
               <span className="step-number">01</span>
               <div>
                 <h3>Choose a patch</h3>
-                <p>Drag it on the artwork. Arrow keys nudge it precisely.</p>
+                <p>Drag the outlined patch on the artwork. Arrow keys nudge it precisely.</p>
               </div>
               <button
-                className="text-button"
+                className={choosingRegion ? "confirm-patch-button" : "text-button"}
                 type="button"
                 onClick={() => setChoosingRegion((value) => !value)}
               >
-                {choosingRegion ? "Use this patch" : "Reposition patch"}
+                {choosingRegion ? "Use selected patch" : "Reposition patch"}
               </button>
             </div>
+
+            {choosingRegion ? (
+              <div className="upcoming-steps" aria-label="Next contribution steps">
+                <div className="upcoming-step">
+                  <span>02</span>
+                  <div>
+                    <strong>Mark what may change</strong>
+                    <p>Paint a precise mask inside the patch.</p>
+                  </div>
+                  <small>Next</small>
+                </div>
+                <div className="upcoming-step">
+                  <span>03</span>
+                  <div>
+                    <strong>Describe the revision</strong>
+                    <p>Name the change that enters the archive.</p>
+                  </div>
+                  <small>Then</small>
+                </div>
+              </div>
+            ) : null}
 
             <div className="edit-step mask-step">
               <span className="step-number">02</span>
@@ -1118,20 +1146,22 @@ export default function Palimpsest() {
               </div>
             ) : null}
             {submitError ? <p className="submit-error" role="alert">{submitError}</p> : null}
-            {!canSubmit && !job ? (
-              <p className="submit-hint">
-                {choosingRegion
-                  ? "Position the patch, then choose Use this patch."
-                  : !validMask
-                    ? "Paint a mask or fill the assigned patch."
-                    : prompt.trim().length < 3
-                      ? "Add a short visual edit prompt."
-                      : "Add the name that should appear in history."}
-              </p>
-            ) : null}
-            <button className="submit-edit" type="button" disabled={!canSubmit} onClick={submitEdit}>
-              {isPreparing ? "Preparing your patch…" : "Add to the work"}
-            </button>
+            <div className="inspector-submit">
+              {!canSubmit && !job ? (
+                <p className="submit-hint">
+                  {choosingRegion
+                    ? "Confirm this patch to unlock masking."
+                    : !validMask
+                      ? "Paint a mask or fill the assigned patch."
+                      : prompt.trim().length < 3
+                        ? "Add a short visual edit prompt."
+                        : "Add the name that should appear in history."}
+                </p>
+              ) : null}
+              <button className="submit-edit" type="button" disabled={!canSubmit} onClick={submitEdit}>
+                {isPreparing ? "Preparing your patch…" : "Add to the work"}
+              </button>
+            </div>
           </aside>
         ) : null}
       </main>
