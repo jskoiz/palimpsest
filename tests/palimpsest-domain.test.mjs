@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
@@ -135,6 +136,14 @@ test("live image patches render as complete replacement tiles", () => {
   assert.equal(displayMaskForLayer("openai", "display-mask"), null);
   assert.equal(displayMaskForLayer("demo", "display-mask"), "display-mask");
   assert.equal(displayMaskForLayer("seed", null), null);
+});
+
+test("request handlers rely on packaged migrations instead of runtime schema DDL", async () => {
+  const storeSource = await readFile(
+    new URL("../lib/palimpsest/store.ts", import.meta.url),
+    "utf8",
+  );
+  assert.doesNotMatch(storeSource, /CREATE\s+(?:TABLE|INDEX|TRIGGER)/i);
 });
 
 test("live image prompts keep random objects whole without forcing an art style", () => {

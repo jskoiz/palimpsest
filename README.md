@@ -7,6 +7,7 @@ Palimpsest is one canonical communal image with an immutable, linear memory of e
 - Next.js-compatible UI on vinext and Cloudflare Workers
 - D1 for artworks, revisions, queue jobs, locks, rate windows, and blob metadata
 - R2 for canonical tiles, masks, patches, and keyframes
+- Generated D1 migrations are authoritative; request handlers never rerun schema DDL
 - Serial edit queue with leases, fencing, idempotency, and optimistic base-revision checks
 - Deterministic demo renderer, plus an explicit OpenAI image-edit path when `OPENAI_API_KEY` is configured
 - Append-only database triggers; restoring an earlier state creates a new revision
