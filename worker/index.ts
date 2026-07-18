@@ -1,7 +1,6 @@
 /** Cloudflare Worker entry point for Palimpsest. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
-import { processQueue } from "../lib/palimpsest/queue";
 import { ensurePalimpsest } from "../lib/palimpsest/store";
 
 interface Env {
@@ -49,17 +48,7 @@ const worker = {
       await ensurePalimpsest(env, request.url);
     }
 
-    const response = await handler.fetch(request, env, ctx);
-    const shouldDrain =
-      (request.method === "POST" &&
-        ["/api/edits", "/api/reverts", "/api/queue/drain"].includes(url.pathname) &&
-        response.status >= 200 &&
-        response.status < 300) ||
-      (request.method === "GET" && url.pathname.startsWith("/api/jobs/"));
-    if (shouldDrain) {
-      ctx.waitUntil(processQueue(env).catch(() => undefined));
-    }
-    return response;
+    return handler.fetch(request, env, ctx);
   },
 };
 

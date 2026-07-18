@@ -587,6 +587,7 @@ export default function Palimpsest() {
   const [displayName, setDisplayName] = useState("Anonymous visitor");
   const [executionMode, setExecutionMode] = useState<"demo" | "openai">("demo");
   const [job, setJob] = useState<Job | null>(null);
+  const drainInFlight = useRef(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [isPreparing, setIsPreparing] = useState(false);
   const [confirmRevert, setConfirmRevert] = useState(false);
@@ -609,6 +610,19 @@ export default function Palimpsest() {
   const refreshActivity = useCallback(async () => {
     const payload = await fetchJson<ActivityPayload>("/api/activity");
     setActivity(payload);
+  }, []);
+
+  const requestQueueDrain = useCallback(async () => {
+    if (drainInFlight.current) return;
+    drainInFlight.current = true;
+    try {
+      const response = await fetch("/api/queue/drain", { method: "POST" });
+      if (!response.ok) throw new Error("The queue could not be reached.");
+    } catch {
+      // The immutable job remains queued; the next status poll will retry this active request.
+    } finally {
+      drainInFlight.current = false;
+    }
   }, []);
 
   const refreshHistory = useCallback(
@@ -685,6 +699,7 @@ export default function Palimpsest() {
 
   useEffect(() => {
     if (!job || terminalJobStates.has(job.state)) return;
+    void requestQueueDrain();
     const timer = window.setTimeout(async () => {
       try {
         const payload = await fetchJson<{ job: Job }>(`/api/jobs/${encodeURIComponent(job.id)}`);
@@ -703,7 +718,7 @@ export default function Palimpsest() {
       }
     }, 1200);
     return () => window.clearTimeout(timer);
-  }, [job, refreshActivity, refreshHistory]);
+  }, [job, refreshActivity, refreshHistory, requestQueueDrain]);
 
   useEffect(() => {
     if (
@@ -821,6 +836,7 @@ export default function Palimpsest() {
         body: form,
       });
       setJob(payload.job);
+      void requestQueueDrain();
       await refreshActivity();
     } catch (error) {
       setSubmitError(error instanceof Error ? error.message : "The edit could not be submitted.");
@@ -847,6 +863,7 @@ export default function Palimpsest() {
         }),
       });
       setJob(payload.job);
+      void requestQueueDrain();
       setConfirmRevert(false);
     } catch (error) {
       setSubmitError(error instanceof Error ? error.message : "The restore could not be queued.");

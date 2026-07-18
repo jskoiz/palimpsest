@@ -26,10 +26,11 @@ type QueueJob = {
   createdAt: number;
 };
 
-const leaseMs = 5 * 60 * 1000;
+const leaseMs = 4 * 60 * 1000;
+const abandonedAfterMs = 3 * 60 * 1000;
 
-export async function processQueue(env: AppEnv): Promise<void> {
-  for (let processed = 0; processed < 4; processed += 1) {
+export async function processQueue(env: AppEnv, maxJobs = 1): Promise<void> {
+  for (let processed = 0; processed < maxJobs; processed += 1) {
     const didProcess = await processOne(env);
     if (!didProcess) return;
   }
@@ -42,9 +43,11 @@ async function processOne(env: AppEnv): Promise<boolean> {
     `UPDATE queue_locks
      SET state = 'held', owner_token = ?, fence = fence + 1,
          job_id = NULL, acquired_at = ?, heartbeat_at = ?, lease_expires_at = ?
-     WHERE artwork_id = ? AND (state = 'idle' OR lease_expires_at IS NULL OR lease_expires_at < ?)`,
+     WHERE artwork_id = ? AND (
+       state = 'idle' OR lease_expires_at IS NULL OR lease_expires_at < ? OR heartbeat_at < ?
+     )`,
   )
-    .bind(ownerToken, now, now, now + leaseMs, ARTWORK_ID, now)
+    .bind(ownerToken, now, now, now + leaseMs, ARTWORK_ID, now, now - abandonedAfterMs)
     .run();
   if (Number(acquired.meta.changes ?? 0) === 0) return false;
 
@@ -55,6 +58,8 @@ async function processOne(env: AppEnv): Promise<boolean> {
     .first<{ fence: number }>();
   if (!lock) return false;
   const fence = Number(lock.fence);
+
+  await recoverAbandonedJobs(env, now);
 
   const job = await env.DB.prepare(
     `SELECT
@@ -175,6 +180,30 @@ async function processOne(env: AppEnv): Promise<boolean> {
     await handleFailure(env, job, ownerToken, fence, error);
     return true;
   }
+}
+
+async function recoverAbandonedJobs(env: AppEnv, now: number) {
+  const staleBefore = now - abandonedAfterMs;
+  await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE edit_jobs
+       SET state = 'failed', error_code = 'QUEUE_LEASE_EXPIRED',
+           public_error_message = 'The queue could not safely resume this edit. Nothing was added to history.',
+           worker_token = NULL, lock_fence = NULL, lease_expires_at = NULL,
+           updated_at = ?, completed_at = ?
+       WHERE artwork_id = ?
+         AND state IN ('moderating', 'generating', 'committing')
+         AND updated_at < ? AND attempt_count >= 2`,
+    ).bind(now, now, ARTWORK_ID, staleBefore),
+    env.DB.prepare(
+      `UPDATE edit_jobs
+       SET state = 'queued', attempt_count = attempt_count + 1, available_at = ?,
+           worker_token = NULL, lock_fence = NULL, lease_expires_at = NULL, updated_at = ?
+       WHERE artwork_id = ?
+         AND state IN ('moderating', 'generating', 'committing')
+         AND updated_at < ? AND attempt_count < 2`,
+    ).bind(now, now, ARTWORK_ID, staleBefore),
+  ]);
 }
 
 async function updateStage(
