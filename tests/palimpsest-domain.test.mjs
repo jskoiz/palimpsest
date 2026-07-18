@@ -8,6 +8,10 @@ import {
   serializeHistory,
   validateRegion,
 } from "../lib/palimpsest/domain.mjs";
+import {
+  nudgeEditRegion,
+  positionEditRegion,
+} from "../lib/palimpsest/geometry.mjs";
 
 function expectCode(callback, code) {
   assert.throws(callback, (error) => error instanceof DomainError && error.code === code);
@@ -175,4 +179,41 @@ test("revert creates a new snapshot state without mutating its target", () => {
   const tiles = resolveTileLayers(revisions, baseTiles, patches);
   assert.deepEqual(tiles[0].layers.map((layer) => layer.blobId), ["p1"]);
   assert.deepEqual(patches.map((patch) => patch.blobId), ["p1", "p2"]);
+});
+
+test("patch positioning follows the pointer while remaining inside one tile", () => {
+  const region = {
+    tile: { x: 0, y: 0 },
+    region: { x: 320, y: 352, width: 384, height: 320 },
+  };
+
+  assert.deepEqual(positionEditRegion(region, 48, 72), {
+    tile: { x: 0, y: 0 },
+    region: { x: 48, y: 72, width: 384, height: 320 },
+  });
+  assert.deepEqual(positionEditRegion(region, 930, 980), {
+    tile: { x: 1, y: 1 },
+    region: { x: 0, y: 0, width: 384, height: 320 },
+  });
+  assert.deepEqual(positionEditRegion(region, -200, 2400), {
+    tile: { x: 0, y: 1 },
+    region: { x: 0, y: 704, width: 384, height: 320 },
+  });
+});
+
+test("keyboard nudging crosses tile seams without escaping the artwork", () => {
+  const rightEdge = {
+    tile: { x: 0, y: 0 },
+    region: { x: 640, y: 704, width: 384, height: 320 },
+  };
+  assert.deepEqual(nudgeEditRegion(rightEdge, 8, 8), {
+    tile: { x: 1, y: 1 },
+    region: { x: 0, y: 0, width: 384, height: 320 },
+  });
+
+  const artworkEdge = {
+    tile: { x: 1, y: 1 },
+    region: { x: 640, y: 704, width: 384, height: 320 },
+  };
+  assert.deepEqual(nudgeEditRegion(artworkEdge, 32, 32), artworkEdge);
 });

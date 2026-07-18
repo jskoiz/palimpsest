@@ -334,8 +334,26 @@ button:disabled {
   position: absolute;
   z-index: 12;
   border: 2px solid var(--vermilion);
+  cursor: grab;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.selected-region.is-positioning {
   box-shadow: 0 0 0 9999px rgba(25, 23, 20, 0.52);
-  pointer-events: none;
+}
+
+.selected-region.is-placed {
+  box-shadow: 0 0 0 1px rgba(244, 239, 230, 0.72);
+}
+
+.selected-region:active {
+  cursor: grabbing;
+}
+
+.selected-region:focus-visible {
+  outline: 3px solid var(--light-on-dark);
+  outline-offset: 3px;
 }
 
 .selected-region > i {
@@ -373,6 +391,21 @@ button:disabled {
   border-bottom: 2px solid;
 }
 
+.selected-region > span {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  padding: 5px 8px;
+  transform: translate(-50%, -50%);
+  background: rgba(25, 23, 20, 0.84);
+  color: var(--light-on-dark);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  pointer-events: none;
+  text-transform: uppercase;
+}
+
 .selection-instruction {
   position: absolute;
   z-index: 13;
@@ -384,6 +417,7 @@ button:disabled {
   background: var(--ink);
   color: var(--light-on-dark);
   font-size: 12px;
+  pointer-events: none;
   white-space: nowrap;
 }
 
@@ -1221,6 +1255,37 @@ button:disabled {
     border-top: 1px solid var(--ink);
     border-left: 0;
     box-shadow: 0 -16px 40px rgba(42, 31, 20, 0.1);
+  }
+
+  .edit-inspector.is-positioning {
+    top: auto;
+    max-height: 170px;
+    overflow: visible;
+    padding: 16px 70px max(16px, env(safe-area-inset-bottom)) 18px;
+  }
+
+  .edit-inspector.is-positioning > :not(.inspector-heading):not(.patch-step) {
+    display: none;
+  }
+
+  .edit-inspector.is-positioning .inspector-heading {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+  }
+
+  .edit-inspector.is-positioning .inspector-heading > div {
+    display: none;
+  }
+
+  .edit-inspector.is-positioning .patch-step {
+    margin: 0;
+    padding-top: 0;
+    border-top: 0;
+  }
+
+  .edit-inspector.is-positioning .patch-step .step-number {
+    top: 2px;
   }
 
   .edit-is-open .history-dock {

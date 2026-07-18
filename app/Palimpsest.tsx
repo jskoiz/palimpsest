@@ -2,8 +2,16 @@
 
 /* eslint-disable @next/next/no-img-element -- Immutable R2 tile layers must remain raw pixels for exact canvas compositing. */
 
-import type { CSSProperties, PointerEvent as ReactPointerEvent } from "react";
+import type {
+  CSSProperties,
+  KeyboardEvent as ReactKeyboardEvent,
+  PointerEvent as ReactPointerEvent,
+} from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  nudgeEditRegion,
+  positionEditRegion,
+} from "@/lib/palimpsest/geometry.mjs";
 
 type Revision = {
   id: string;
@@ -195,19 +203,30 @@ function ArtworkView({
   compareEnabled,
   comparePosition,
   onComparePosition,
+  editing,
   selecting,
   selectedRegion,
-  onSelectRegion,
+  onRegionChange,
+  onRegionConfirm,
 }: {
   state: ArtworkState | null;
   compareState: ArtworkState | null;
   compareEnabled: boolean;
   comparePosition: number;
   onComparePosition: (position: number) => void;
+  editing: boolean;
   selecting: boolean;
   selectedRegion: EditRegion;
-  onSelectRegion: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  onRegionChange: (region: EditRegion) => void;
+  onRegionConfirm: () => void;
 }) {
+  const regionRef = useRef<HTMLDivElement>(null);
+  const dragOffset = useRef<{ x: number; y: number } | null>(null);
+
+  useEffect(() => {
+    if (selecting) regionRef.current?.focus({ preventScroll: true });
+  }, [selecting]);
+
   if (!state) {
     return (
       <div className="artwork-frame artwork-loading" aria-label="Loading the current artwork">
@@ -224,10 +243,83 @@ function ArtworkView({
     height: `${(selectedRegion.region.height / 2048) * 100}%`,
   };
 
+  const canvasPoint = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    return {
+      x: Math.max(0, Math.min(2047, ((event.clientX - rect.left) / rect.width) * 2048)),
+      y: Math.max(0, Math.min(2047, ((event.clientY - rect.top) / rect.height) * 2048)),
+    };
+  };
+
+  const moveFromPointer = (
+    event: ReactPointerEvent<HTMLDivElement>,
+    offset: { x: number; y: number },
+  ) => {
+    const point = canvasPoint(event);
+    onRegionChange(
+      positionEditRegion(selectedRegion, point.x - offset.x, point.y - offset.y),
+    );
+  };
+
+  const beginRegionDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!editing) return;
+    const target = event.target as HTMLElement;
+    const grabbedRegion = Boolean(target.closest(".selected-region"));
+    if (!selecting && !grabbedRegion) return;
+
+    const point = canvasPoint(event);
+    const globalX = selectedRegion.tile.x * 1024 + selectedRegion.region.x;
+    const globalY = selectedRegion.tile.y * 1024 + selectedRegion.region.y;
+    const offset = grabbedRegion
+      ? { x: point.x - globalX, y: point.y - globalY }
+      : { x: selectedRegion.region.width / 2, y: selectedRegion.region.height / 2 };
+    dragOffset.current = offset;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    regionRef.current?.focus({ preventScroll: true });
+    moveFromPointer(event, offset);
+    event.preventDefault();
+  };
+
+  const continueRegionDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!dragOffset.current || !editing) return;
+    moveFromPointer(event, dragOffset.current);
+    event.preventDefault();
+  };
+
+  const endRegionDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    dragOffset.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
+
+  const moveRegionWithKeyboard = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    const step = event.shiftKey ? 32 : 8;
+    const deltas: Record<string, { x: number; y: number }> = {
+      ArrowLeft: { x: -step, y: 0 },
+      ArrowRight: { x: step, y: 0 },
+      ArrowUp: { x: 0, y: -step },
+      ArrowDown: { x: 0, y: step },
+    };
+    const delta = deltas[event.key];
+    if (delta) {
+      onRegionChange(nudgeEditRegion(selectedRegion, delta.x, delta.y));
+      event.preventDefault();
+      return;
+    }
+    if (selecting && (event.key === "Enter" || event.key === " ")) {
+      onRegionConfirm();
+      event.preventDefault();
+    }
+  };
+
   return (
     <div
       className={`artwork-frame${selecting ? " is-selecting" : ""}`}
-      onPointerDown={selecting ? onSelectRegion : undefined}
+      onPointerDown={editing ? beginRegionDrag : undefined}
+      onPointerMove={editing ? continueRegionDrag : undefined}
+      onPointerUp={editing ? endRegionDrag : undefined}
+      onPointerCancel={editing ? endRegionDrag : undefined}
     >
       <ArtworkLayers state={state} />
       {compareEnabled && compareState ? (
@@ -260,13 +352,24 @@ function ArtworkView({
           </div>
         </>
       ) : null}
-      {selecting ? (
+      {editing ? (
         <>
-          <div className="selection-veil" aria-hidden="true" />
-          <div className="selected-region" style={regionStyle} aria-hidden="true">
+          {selecting ? <div className="selection-veil" aria-hidden="true" /> : null}
+          <div
+            ref={regionRef}
+            className={`selected-region${selecting ? " is-positioning" : " is-placed"}`}
+            style={regionStyle}
+            role="button"
+            tabIndex={0}
+            aria-label="Selected edit patch. Drag to move it. Use the arrow keys to nudge it."
+            onKeyDown={moveRegionWithKeyboard}
+          >
             <i /><i /><i /><i />
+            <span>{selecting ? "Drag patch" : "Move"}</span>
           </div>
-          <p className="selection-instruction">Choose a tightly bounded patch</p>
+          {selecting ? (
+            <p className="selection-instruction">Drag or tap to move · Enter to confirm</p>
+          ) : null}
         </>
       ) : null}
     </div>
@@ -682,28 +785,6 @@ export default function Palimpsest() {
     setSubmitError(null);
   };
 
-  const chooseRegion = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const rect = event.currentTarget.getBoundingClientRect();
-    const canvasX = Math.max(0, Math.min(2047, ((event.clientX - rect.left) / rect.width) * 2048));
-    const canvasY = Math.max(0, Math.min(2047, ((event.clientY - rect.top) / rect.height) * 2048));
-    const tileX = Math.min(1, Math.floor(canvasX / 1024));
-    const tileY = Math.min(1, Math.floor(canvasY / 1024));
-    const localX = canvasX - tileX * 1024;
-    const localY = canvasY - tileY * 1024;
-    setEditRegion({
-      tile: { x: tileX, y: tileY },
-      region: {
-        x: Math.round(Math.max(0, Math.min(640, localX - 192))),
-        y: Math.round(Math.max(0, Math.min(704, localY - 160))),
-        width: 384,
-        height: 320,
-      },
-    });
-    setStrokes([]);
-    setFillMask(false);
-    setChoosingRegion(false);
-  };
-
   const submitEdit = async () => {
     if (!currentState || !history) return;
     const tile = currentState.tiles.find(
@@ -811,9 +892,11 @@ export default function Palimpsest() {
             compareEnabled={compareEnabled}
             comparePosition={comparePosition}
             onComparePosition={setComparePosition}
+            editing={editOpen}
             selecting={editOpen && choosingRegion}
             selectedRegion={editRegion}
-            onSelectRegion={chooseRegion}
+            onRegionChange={setEditRegion}
+            onRegionConfirm={() => setChoosingRegion(false)}
           />
           {loadingError ? (
             <div className="artwork-error" role="alert">
@@ -868,7 +951,10 @@ export default function Palimpsest() {
         </section>
 
         {editOpen ? (
-          <aside className="edit-inspector" aria-label="Contribute an edit">
+          <aside
+            className={`edit-inspector${choosingRegion ? " is-positioning" : ""}`}
+            aria-label="Contribute an edit"
+          >
             <div className="inspector-heading">
               <div>
                 <p className="eyebrow">Contribution workspace</p>
@@ -887,14 +973,18 @@ export default function Palimpsest() {
               </button>
             </div>
 
-            <div className="edit-step">
+            <div className="edit-step patch-step">
               <span className="step-number">01</span>
               <div>
                 <h3>Choose a patch</h3>
-                <p>Your edit can touch only this bounded area.</p>
+                <p>Drag it on the artwork. Arrow keys nudge it precisely.</p>
               </div>
-              <button className="text-button" type="button" onClick={() => setChoosingRegion(true)}>
-                {choosingRegion ? "Choose on artwork" : "Choose another area"}
+              <button
+                className="text-button"
+                type="button"
+                onClick={() => setChoosingRegion((value) => !value)}
+              >
+                {choosingRegion ? "Use this patch" : "Reposition patch"}
               </button>
             </div>
 
@@ -1014,7 +1104,7 @@ export default function Palimpsest() {
             {!canSubmit && !job ? (
               <p className="submit-hint">
                 {choosingRegion
-                  ? "Choose the patch on the artwork."
+                  ? "Position the patch, then choose Use this patch."
                   : !validMask
                     ? "Paint a mask or fill the assigned patch."
                     : prompt.trim().length < 3
