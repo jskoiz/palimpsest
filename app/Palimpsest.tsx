@@ -8,6 +8,7 @@ import type {
   PointerEvent as ReactPointerEvent,
 } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { maskBlendInset } from "@/lib/palimpsest/domain.mjs";
 import {
   nudgeEditRegion,
   positionEditRegion,
@@ -395,6 +396,7 @@ function RegionMaskEditor({
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const activePointer = useRef<number | null>(null);
+  const fillInset = maskBlendInset(region);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -405,7 +407,14 @@ function RegionMaskEditor({
     context.strokeStyle = "rgba(166, 59, 41, .58)";
     context.lineCap = "round";
     context.lineJoin = "round";
-    if (fill) context.fillRect(0, 0, region.width, region.height);
+    if (fill) {
+      context.fillRect(
+        fillInset,
+        fillInset,
+        region.width - fillInset * 2,
+        region.height - fillInset * 2,
+      );
+    }
     for (const stroke of strokes) {
       context.lineWidth = stroke.width;
       context.beginPath();
@@ -419,7 +428,7 @@ function RegionMaskEditor({
       }
       context.stroke();
     }
-  }, [fill, region.height, region.width, strokes]);
+  }, [fill, fillInset, region.height, region.width, strokes]);
 
   const pointFromEvent = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     const rect = event.currentTarget.getBoundingClientRect();
@@ -466,7 +475,7 @@ function RegionMaskEditor({
         width={region.width}
         height={region.height}
         tabIndex={0}
-        aria-label="Draw the mask for this edit. Use Fill patch for a keyboard-accessible alternative."
+        aria-label="Draw the mask for this edit. Use Fit object for a keyboard-accessible alternative."
         onPointerDown={pointerDown}
         onPointerMove={pointerMove}
         onPointerUp={pointerUp}
@@ -528,7 +537,13 @@ async function providerMask(
   context.fillRect(0, 0, 1024, 1024);
   context.globalCompositeOperation = "destination-out";
   if (fill) {
-    context.clearRect(region.x, region.y, region.width, region.height);
+    const inset = maskBlendInset(region);
+    context.clearRect(
+      region.x + inset,
+      region.y + inset,
+      region.width - inset * 2,
+      region.height - inset * 2,
+    );
   } else {
     context.lineCap = "round";
     context.lineJoin = "round";
@@ -1037,7 +1052,7 @@ export default function Palimpsest() {
               <span className="step-number">02</span>
               <div>
                 <h3>Mark what may change</h3>
-                <p>Paint over the part you want to revise. Everything else remains untouched.</p>
+                <p>Paint a detail, or fit a complete object with a soft blend margin.</p>
               </div>
               {selectedTile && !choosingRegion ? (
                 <>
@@ -1072,7 +1087,7 @@ export default function Palimpsest() {
                       Clear
                     </button>
                     <button type="button" onClick={() => { setFillMask(true); setStrokes([]); }}>
-                      Fill patch
+                      Fit object
                     </button>
                   </div>
                 </>

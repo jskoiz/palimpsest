@@ -1,4 +1,9 @@
-import { ARTWORK_ID, DomainError, assertFreshBase } from "./domain.mjs";
+import {
+  ARTWORK_ID,
+  DomainError,
+  assertFreshBase,
+  buildOpenAiEditPrompt,
+} from "./domain.mjs";
 import type { AppEnv } from "./runtime";
 import { readPngDimensions, sha256Hex } from "./runtime";
 import { getBlobRecord, getHead, makeDemoPatchSvg } from "./store";
@@ -299,7 +304,7 @@ async function generateOpenAiPatch(
   );
   form.append(
     "prompt",
-    `Create the complete edited version of the supplied mixed-media artwork tile. Preserve its composition, warm paper palette, graphite marks, mineral washes, light, and texture. Outside the transparent mask, preserve the source exactly. Inside the masked region only, apply this visual change: ${job.prompt}`,
+    buildOpenAiEditPrompt(job.prompt),
   );
   form.append("size", "1024x1024");
   form.append("quality", "medium");

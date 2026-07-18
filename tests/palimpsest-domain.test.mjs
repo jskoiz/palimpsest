@@ -4,6 +4,9 @@ import test from "node:test";
 import {
   DomainError,
   assertFreshBase,
+  buildOpenAiEditPrompt,
+  createDisplayMaskSvg,
+  maskBlendInset,
   resolveTileLayers,
   serializeHistory,
   validateRegion,
@@ -114,6 +117,26 @@ test("region constraints accept exact boundaries and reject unsafe masks", () =>
       }),
     "REGION_OUT_OF_BOUNDS",
   );
+});
+
+test("filled object masks reserve a feathered blend margin", () => {
+  const region = { x: 100, y: 200, width: 384, height: 320 };
+  assert.equal(maskBlendInset(region), 24);
+  assert.equal(maskBlendInset({ width: 64, height: 64 }), 24);
+
+  const svg = createDisplayMaskSvg({ region, fill: true, strokes: [] });
+  assert.match(svg, /feGaussianBlur stdDeviation="10"/);
+  assert.match(svg, /clipPath id="edit-bounds"/);
+  assert.match(svg, /<rect x="124" y="224" width="336" height="272" fill="white"\/>/);
+});
+
+test("live image prompts keep random objects whole without forcing an art style", () => {
+  const prompt = buildOpenAiEditPrompt("Add a bright plastic toy truck.");
+  assert.match(prompt, /entire subject comfortably inside the editable area/i);
+  assert.match(prompt, /Never crop, truncate/i);
+  assert.match(prompt, /without forcing it into a predefined artistic motif/i);
+  assert.match(prompt, /Add a bright plastic toy truck\./);
+  assert.doesNotMatch(prompt, /vermilion|graphite|mixed-media/i);
 });
 
 test("stale base revisions are rejected without an implicit rebase", () => {

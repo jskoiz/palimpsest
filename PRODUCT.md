@@ -14,11 +14,11 @@ Palimpsest is one canonical communal image with an immutable, linear memory. Eve
 
 ## Brand Personality
 
-Editorial, archival, contemplative. The product should feel like a living museum object with careful human stewardship, not a content dashboard or casual image generator.
+Editorial, archival, playful. The interface should feel carefully stewarded while the communal image is free to become funny, strange, photorealistic, messy, or surprising.
 
 ## Anti-references
 
-Generic SaaS dashboards, floating card grids, chat-first AI interfaces, neon creative tools, oversized empty panels, and controls that resemble plain text when they are required to continue.
+Generic SaaS dashboards, floating card grids, chat-first AI interfaces, neon creative tools, oversized empty panels, controls that resemble plain text when they are required to continue, and any system-imposed house style that makes every contribution look alike.
 
 ## Design Principles
 
@@ -27,6 +27,7 @@ Generic SaaS dashboards, floating card grids, chat-first AI interfaces, neon cre
 3. Treat history as part of the artwork, not a separate log.
 4. Show permanence and queue truth without operational clutter.
 5. Use restraint, typography, and spatial rhythm to create a museum-like atmosphere.
+6. Keep the frame coherent while letting contributions be random.
 
 ## Accessibility & Inclusion
 

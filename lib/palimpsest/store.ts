@@ -2,6 +2,7 @@ import {
   ARTWORK_ID,
   DomainError,
   assertFreshBase,
+  createDisplayMaskSvg,
   escapeXml,
   resolveTileLayers,
   serializeHistory,
@@ -641,23 +642,6 @@ export async function enforceRateLimit(
     throw new DomainError("RATE_LIMITED", "Too many contributions from this connection. Try again later.");
   }
   return Math.max(1, Math.ceil((windowStart + windowMs - now) / 1000));
-}
-
-export function createDisplayMaskSvg(mask: {
-  region: { x: number; y: number; width: number; height: number };
-  fill: boolean;
-  strokes: Array<{ width: number; points: Array<{ x: number; y: number }> }>;
-}): string {
-  const { x, y, width, height } = mask.region;
-  const content = mask.fill
-    ? `<rect x="${x}" y="${y}" width="${width}" height="${height}" fill="white"/>`
-    : mask.strokes
-        .map((stroke) => {
-          const points = stroke.points.map((point) => `${point.x + x},${point.y + y}`).join(" ");
-          return `<polyline points="${points}" fill="none" stroke="white" stroke-width="${stroke.width}" stroke-linecap="round" stroke-linejoin="round"/>`;
-        })
-        .join("");
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">${content}</svg>`;
 }
 
 type InsertEditInput = {
