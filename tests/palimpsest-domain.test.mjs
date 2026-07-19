@@ -16,6 +16,7 @@ import {
 import {
   nudgeEditRegion,
   positionEditRegion,
+  timelineIndexAtPosition,
 } from "../lib/palimpsest/geometry.mjs";
 
 function expectCode(callback, code) {
@@ -255,4 +256,14 @@ test("keyboard nudging crosses tile seams without escaping the artwork", () => {
     region: { x: 640, y: 704, width: 384, height: 320 },
   };
   assert.deepEqual(nudgeEditRegion(artworkEdge, 32, 32), artworkEdge);
+});
+
+test("timeline dragging selects the nearest revision and clamps to the track", () => {
+  assert.equal(timelineIndexAtPosition(100, 100, 800, 9), 0);
+  assert.equal(timelineIndexAtPosition(500, 100, 800, 9), 4);
+  assert.equal(timelineIndexAtPosition(900, 100, 800, 9), 8);
+  assert.equal(timelineIndexAtPosition(-200, 100, 800, 9), 0);
+  assert.equal(timelineIndexAtPosition(1_400, 100, 800, 9), 8);
+  assert.equal(timelineIndexAtPosition(500, 100, 0, 9), 0);
+  assert.equal(timelineIndexAtPosition(500, 100, 800, 1), 0);
 });

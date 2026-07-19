@@ -564,7 +564,20 @@ body {
 .mono-track {
   position: relative;
   flex: 1;
-  height: 18px;
+  height: 24px;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.mono-track.is-dragging {
+  cursor: grabbing;
+}
+
+.mono-track:focus-visible {
+  outline: 1px solid rgba(255, 255, 255, 0.72);
+  outline-offset: 3px;
 }
 
 .mono-track-line {
@@ -579,11 +592,12 @@ body {
 .mono-tick {
   position: absolute;
   top: 50%;
-  width: 18px;
-  height: 18px;
+  width: 24px;
+  height: 24px;
   transform: translate(-50%, -50%);
   display: grid;
   place-items: center;
+  pointer-events: none;
 }
 
 .mono-tick > span {
@@ -603,6 +617,23 @@ body {
   width: 11px;
   height: 11px;
   background: var(--accent);
+}
+
+.mono-tick.is-selected::after {
+  position: absolute;
+  width: 19px;
+  height: 19px;
+  border: 1px solid rgba(255, 255, 255, 0.78);
+  border-radius: 50%;
+  box-shadow: 0 0 0 3px rgba(224, 118, 95, 0.18);
+  content: "";
+  transition: transform 140ms, border-color 140ms, box-shadow 140ms;
+}
+
+.mono-track.is-dragging .mono-tick.is-selected::after {
+  border-color: #fff;
+  box-shadow: 0 0 0 5px rgba(224, 118, 95, 0.24);
+  transform: scale(1.08);
 }
 
 .mono-counter {

@@ -13,6 +13,7 @@ import { ARTWORK_SIZE, maskBlendInset } from "@/lib/palimpsest/domain.mjs";
 import {
   nudgeEditRegion,
   positionEditRegion,
+  timelineIndexAtPosition,
 } from "@/lib/palimpsest/geometry.mjs";
 
 type Revision = {
@@ -313,6 +314,7 @@ export default function Palimpsest() {
   const [compareOn, setCompareOn] = useState(false);
   const [comparePos, setComparePos] = useState(55);
   const [hoverIdx, setHoverIdx] = useState(-1);
+  const [timelineDragging, setTimelineDragging] = useState(false);
   const [view, setView] = useState({ zoom: 1, x: 0, y: 0 });
   const [panning, setPanning] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
@@ -342,6 +344,7 @@ export default function Palimpsest() {
   const panStart = useRef<{ x: number; y: number } | null>(null);
   const patchDrag = useRef<{ x: number; y: number } | null>(null);
   const compareDrag = useRef(false);
+  const timelineDrag = useRef<number | null>(null);
   const maskPointer = useRef<number | null>(null);
   const overlayCoverRef = useRef<HTMLDivElement>(null);
   const maskCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -812,6 +815,63 @@ export default function Palimpsest() {
     setCompareOn(false);
     setConfirmRestore(false);
     wake();
+  };
+
+  const timelineIndexFromPointer = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const bounds = event.currentTarget.getBoundingClientRect();
+    return timelineIndexAtPosition(
+      event.clientX,
+      bounds.left,
+      bounds.width,
+      revisions.length,
+    );
+  };
+
+  const timelineDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    timelineDrag.current = event.pointerId;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.currentTarget.focus();
+    setTimelineDragging(true);
+    const index = timelineIndexFromPointer(event);
+    setHoverIdx(index);
+    selectRevision(index);
+    event.preventDefault();
+  };
+
+  const timelineMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const index = timelineIndexFromPointer(event);
+    setHoverIdx(index);
+    if (timelineDrag.current === event.pointerId && index !== latest.current.selectedIndex) {
+      selectRevision(index);
+    }
+  };
+
+  const timelineUp = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (timelineDrag.current !== event.pointerId) return;
+    timelineDrag.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    setTimelineDragging(false);
+    setHoverIdx(-1);
+  };
+
+  const timelineKey = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    const last = revisions.length - 1;
+    let index: number | null = null;
+    if (event.key === "ArrowLeft" || event.key === "ArrowDown") {
+      index = Math.max(0, selectedIndex - 1);
+    } else if (event.key === "ArrowRight" || event.key === "ArrowUp") {
+      index = Math.min(last, selectedIndex + 1);
+    } else if (event.key === "Home") {
+      index = 0;
+    } else if (event.key === "End") {
+      index = last;
+    }
+    if (index === null) return;
+    event.preventDefault();
+    selectRevision(index);
   };
 
   const handleWheel = (event: ReactWheelEvent<HTMLElement>) => {
@@ -1317,12 +1377,31 @@ export default function Palimpsest() {
             >
               {playing ? "[⏸]" : "[▶]"}
             </button>
-            <div className="mono-track">
+            <div
+              className={`mono-track${timelineDragging ? " is-dragging" : ""}`}
+              role="slider"
+              tabIndex={0}
+              aria-label="Revision timeline"
+              aria-orientation="horizontal"
+              aria-valuemin={revisions[0]?.sequence ?? 0}
+              aria-valuemax={headRevision.sequence}
+              aria-valuenow={selectedRevision.sequence}
+              aria-valuetext={`${seqTag(selectedRevision.sequence)} — ${selectedRevision.author}`}
+              data-testid="revision-timeline"
+              title="Drag to scrub revisions"
+              onPointerDown={timelineDown}
+              onPointerMove={timelineMove}
+              onPointerUp={timelineUp}
+              onPointerCancel={timelineUp}
+              onPointerLeave={() => {
+                if (timelineDrag.current === null) setHoverIdx(-1);
+              }}
+              onKeyDown={timelineKey}
+            >
               <span className="mono-track-line" aria-hidden="true" />
               {revisions.map((revision, index) => (
-                <button
+                <span
                   key={revision.id}
-                  type="button"
                   className={`mono-tick${
                     index === selectedIndex
                       ? " is-selected"
@@ -1331,14 +1410,10 @@ export default function Palimpsest() {
                         : ""
                   }`}
                   style={{ left: `${tickLeft(index)}%` }}
-                  aria-label={`${seqTag(revision.sequence)} — ${revision.author}`}
-                  aria-current={index === selectedIndex ? "true" : undefined}
-                  onClick={() => selectRevision(index)}
-                  onPointerEnter={() => setHoverIdx(index)}
-                  onPointerLeave={() => setHoverIdx(-1)}
+                  aria-hidden="true"
                 >
                   <span />
-                </button>
+                </span>
               ))}
               {hoverRevision ? (
                 <div className="mono-tip" style={{ left: `${tickLeft(hoverIdx)}%` }}>
