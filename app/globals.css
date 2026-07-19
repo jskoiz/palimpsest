@@ -54,6 +54,28 @@ body {
   }
 }
 
+@keyframes welcome-drawer-in {
+  from {
+    opacity: 0;
+    transform: translateY(100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes welcome-drawer-out {
+  from {
+    opacity: 1;
+    transform: translateY(var(--drawer-drag, 0px));
+  }
+  to {
+    opacity: 0;
+    transform: translateY(100%);
+  }
+}
+
 @keyframes pulse {
   50% {
     opacity: 0.3;
@@ -485,6 +507,14 @@ body {
   color: var(--accent);
 }
 
+.mono-guide-toggle {
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.mono-guide-toggle:disabled {
+  opacity: 0.36;
+}
+
 .mono-revlabel {
   left: var(--edge);
   bottom: calc(20px + env(safe-area-inset-bottom, 0px));
@@ -900,6 +930,268 @@ body {
   color: var(--accent);
 }
 
+/* Welcome guide */
+
+.mono-welcome {
+  --drawer-drag: 0px;
+  position: fixed;
+  inset: auto 0 0;
+  width: 100%;
+  max-width: none;
+  max-height: min(68dvh, 640px);
+  margin: 0;
+  overflow: hidden;
+  border: 0;
+  border-top: 1px solid var(--hairline);
+  border-radius: 0;
+  padding: 0;
+  background: rgba(var(--ink), 0.94);
+  box-shadow: 0 -22px 72px rgba(0, 0, 0, 0.42);
+  color: rgba(255, 255, 255, 0.96);
+  font-family: var(--font-sans);
+  user-select: text;
+  -webkit-user-select: text;
+  transform: translateY(var(--drawer-drag));
+  transition: transform 180ms var(--panel-ease);
+}
+
+.mono-welcome[open] {
+  display: flex;
+  flex-direction: column;
+  animation: welcome-drawer-in 280ms var(--panel-ease) both;
+}
+
+.mono-welcome.is-closing {
+  pointer-events: none;
+  animation: welcome-drawer-out 220ms cubic-bezier(0.4, 0, 1, 1) both;
+}
+
+.mono-welcome.is-dragging {
+  cursor: grabbing;
+  transition: none;
+}
+
+.mono-welcome::backdrop {
+  background: rgba(var(--ink), 0.25);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  transition:
+    background 220ms ease,
+    backdrop-filter 220ms ease;
+}
+
+.mono-welcome.is-closing::backdrop {
+  background: rgba(var(--ink), 0);
+  backdrop-filter: blur(0);
+  -webkit-backdrop-filter: blur(0);
+}
+
+.mono-welcome-grab {
+  display: grid;
+  min-height: 44px;
+  place-items: center;
+  flex: 0 0 auto;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  cursor: ns-resize;
+  touch-action: none;
+}
+
+.mono-welcome-grab > span {
+  width: 54px;
+  height: 2px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.46);
+}
+
+.mono-welcome-scroll {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.mono-welcome-inner {
+  width: min(1180px, 100%);
+  margin: 0 auto;
+  padding: 0 clamp(26px, 4vw, 58px) calc(24px + env(safe-area-inset-bottom, 0px));
+}
+
+.mono-welcome-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  min-height: 48px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(var(--ink), 0.96);
+}
+
+.mono-welcome-kicker,
+.mono-welcome-path > section > span,
+.mono-welcome-controls-label {
+  font-family: var(--font-mono);
+}
+
+.mono-welcome-kicker {
+  color: var(--accent);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.mono-welcome-close {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  place-items: center;
+  flex: 0 0 auto;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.mono-welcome h1 {
+  max-width: 720px;
+  margin: 20px 0 8px;
+  font-size: 36px;
+  font-weight: 500;
+  letter-spacing: -0.035em;
+  line-height: 1;
+}
+
+.mono-welcome-intro {
+  max-width: 68ch;
+  margin: 0;
+  color: rgba(255, 255, 255, 0.74);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.mono-welcome-path {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  margin-top: 21px;
+  border-top: 1px solid rgba(255, 255, 255, 0.2);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.mono-welcome-path > section {
+  min-width: 0;
+  padding: 18px 22px 19px 0;
+}
+
+.mono-welcome-path > section + section {
+  border-left: 1px solid rgba(255, 255, 255, 0.16);
+  padding-left: 20px;
+}
+
+.mono-welcome-path > section > span {
+  color: var(--accent);
+  font-size: 8px;
+  letter-spacing: 0.05em;
+}
+
+.mono-welcome-path h2 {
+  margin: 9px 0 8px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.mono-welcome-path p {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.63);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.mono-welcome-path strong,
+.mono-welcome-foot strong {
+  color: rgba(255, 255, 255, 0.92);
+  font-weight: 500;
+}
+
+.mono-welcome-controls {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: 18px;
+  align-items: start;
+  padding: 18px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.mono-welcome-controls-label {
+  padding-top: 3px;
+  color: rgba(255, 255, 255, 0.48);
+  font-size: 8px;
+  letter-spacing: 0.05em;
+}
+
+.mono-welcome-controls dl {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 14px;
+  margin: 0;
+}
+
+.mono-welcome-controls dl > div {
+  min-width: 0;
+}
+
+.mono-welcome-controls dt,
+.mono-welcome-controls dd {
+  margin: 0;
+}
+
+.mono-welcome-controls dt {
+  min-height: 21px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.mono-welcome-controls dd {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 9px;
+}
+
+.mono-welcome kbd {
+  border: 1px solid rgba(255, 255, 255, 0.26);
+  border-radius: 2px;
+  padding: 2px 5px;
+  background: rgba(255, 255, 255, 0.05);
+  color: rgba(255, 255, 255, 0.86);
+  font: inherit;
+}
+
+.mono-welcome-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 28px;
+  padding-top: 20px;
+}
+
+.mono-welcome-foot p {
+  max-width: 500px;
+  margin: 0;
+  color: rgba(255, 255, 255, 0.66);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.mono-welcome-enter {
+  min-height: 44px;
+  flex: 0 0 auto;
+  padding: 0 16px !important;
+  background: var(--accent) !important;
+  color: rgb(var(--ink)) !important;
+  font-family: var(--font-mono) !important;
+  font-size: 10px !important;
+  font-weight: 600 !important;
+  text-shadow: none !important;
+}
+
 @media (max-width: 720px) {
   :root {
     --edge: 16px;
@@ -920,10 +1212,81 @@ body {
   .mono-queue-list {
     gap: 18px;
   }
+
+  .mono-welcome {
+    max-height: 82dvh;
+  }
+
+  .mono-welcome-inner {
+    padding-right: 22px;
+    padding-left: 22px;
+  }
+
+  .mono-welcome h1 {
+    font-size: 30px;
+  }
+
+  .mono-welcome-path {
+    grid-template-columns: 1fr;
+  }
+
+  .mono-welcome-path > section {
+    padding: 16px 0;
+  }
+
+  .mono-welcome-path > section + section {
+    border-top: 1px solid rgba(255, 255, 255, 0.16);
+    border-left: 0;
+    padding-left: 0;
+  }
+
+  .mono-welcome-controls {
+    grid-template-columns: 1fr;
+    gap: 11px;
+  }
+
+  .mono-welcome-controls dl {
+    grid-template-columns: repeat(5, minmax(76px, 1fr));
+    overflow-x: auto;
+    padding-bottom: 4px;
+  }
 }
 
 @media (max-width: 560px) {
   .mono-queue-entry:nth-child(3) {
+    display: none;
+  }
+
+  .mono-welcome h1 {
+    margin-top: 16px;
+    font-size: 27px;
+  }
+
+  .mono-welcome-controls dl {
+    grid-template-columns: repeat(2, 1fr);
+    row-gap: 16px;
+    overflow: visible;
+  }
+
+  .mono-welcome-foot {
+    position: sticky;
+    bottom: 0;
+    align-items: stretch;
+    flex-direction: column;
+    gap: 15px;
+    margin: 0 -22px;
+    padding: 15px 22px calc(16px + env(safe-area-inset-bottom, 0px));
+    border-top: 1px solid rgba(255, 255, 255, 0.16);
+    background: rgba(var(--ink), 0.98);
+  }
+
+  .mono-welcome-enter {
+    width: 100%;
+  }
+}
+
+@media (max-width: 560px) and (pointer: coarse) {
+  .mono-welcome-controls {
     display: none;
   }
 }

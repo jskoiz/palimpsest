@@ -126,6 +126,7 @@ const DEEP_IDLE_MS = 30000;
 const BRUSH_WIDTH = 30;
 const TILE_SIZE = 1024;
 const DEFAULT_REGION = { x: 320, y: 352, width: 384, height: 320 };
+const WELCOME_STORAGE_KEY = "palimpsest:welcome:v1";
 
 function pad3(value: number) {
   return String(value).padStart(3, "0");
@@ -207,6 +208,250 @@ function ArtworkLayers({
         <TileStack key={`${tile.x}-${tile.y}`} tile={tile} />
       ))}
     </div>
+  );
+}
+
+function WelcomeDrawer({
+  open,
+  onClose,
+}: {
+  open: boolean;
+  onClose: () => void;
+}) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const dismissTimerRef = useRef<number | null>(null);
+  const dragCleanupRef = useRef<(() => void) | null>(null);
+  const dragRef = useRef<{
+    pointerId: number;
+    startY: number;
+    offset: number;
+  } | null>(null);
+
+  const requestClose = useCallback(() => {
+    const dialog = dialogRef.current;
+    if (!dialog?.open || dialog.classList.contains("is-closing")) return;
+    dragCleanupRef.current?.();
+    dragCleanupRef.current = null;
+    dragRef.current = null;
+    dialog.classList.remove("is-dragging");
+    dialog.classList.add("is-closing");
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reduceMotion) {
+      onClose();
+      return;
+    }
+    dismissTimerRef.current = window.setTimeout(() => {
+      dismissTimerRef.current = null;
+      onClose();
+    }, 220);
+  }, [onClose]);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    let focusFrame = 0;
+    if (open && !dialog.open) {
+      if (dismissTimerRef.current) {
+        window.clearTimeout(dismissTimerRef.current);
+        dismissTimerRef.current = null;
+      }
+      dialog.classList.remove("is-closing", "is-dragging");
+      dialog.style.removeProperty("--drawer-drag");
+      dialog.showModal();
+      focusFrame = window.requestAnimationFrame(() => closeButtonRef.current?.focus());
+    } else if (!open && dialog.open) {
+      dragCleanupRef.current?.();
+      dragCleanupRef.current = null;
+      dragRef.current = null;
+      dialog.close();
+      dialog.classList.remove("is-closing", "is-dragging");
+      dialog.style.removeProperty("--drawer-drag");
+    }
+    return () => {
+      if (focusFrame) window.cancelAnimationFrame(focusFrame);
+    };
+  }, [open]);
+
+  useEffect(
+    () => () => {
+      if (dismissTimerRef.current) window.clearTimeout(dismissTimerRef.current);
+      dragCleanupRef.current?.();
+      dragCleanupRef.current = null;
+    },
+    [],
+  );
+
+  const drawerDragStart = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    const dialog = dialogRef.current;
+    if (!dialog || dialog.classList.contains("is-closing")) return;
+    dragCleanupRef.current?.();
+    const pointerId = event.pointerId;
+    dragRef.current = { pointerId, startY: event.clientY, offset: 0 };
+    dialog.classList.add("is-dragging");
+    event.preventDefault();
+
+    const move = (pointerEvent: PointerEvent) => {
+      const drag = dragRef.current;
+      const currentDialog = dialogRef.current;
+      if (!currentDialog || !drag || pointerEvent.pointerId !== pointerId) return;
+      drag.offset = Math.max(0, pointerEvent.clientY - drag.startY);
+      currentDialog.style.setProperty("--drawer-drag", `${drag.offset}px`);
+    };
+    const cleanup = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", cancel);
+    };
+    const finish = (pointerEvent: PointerEvent, allowDismiss: boolean) => {
+      const drag = dragRef.current;
+      const currentDialog = dialogRef.current;
+      if (!currentDialog || !drag || pointerEvent.pointerId !== pointerId) return;
+      drag.offset = Math.max(drag.offset, pointerEvent.clientY - drag.startY);
+      cleanup();
+      dragCleanupRef.current = null;
+      dragRef.current = null;
+      currentDialog.classList.remove("is-dragging");
+      const threshold = Math.min(160, currentDialog.clientHeight * 0.2);
+      if (allowDismiss && drag.offset >= threshold) {
+        requestClose();
+      } else {
+        currentDialog.style.removeProperty("--drawer-drag");
+      }
+    };
+    const up = (pointerEvent: PointerEvent) => finish(pointerEvent, true);
+    const cancel = (pointerEvent: PointerEvent) => finish(pointerEvent, false);
+
+    dragCleanupRef.current = cleanup;
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", cancel);
+  };
+
+  return (
+    <dialog
+      ref={dialogRef}
+      id="welcome-dialog"
+      className="mono-welcome"
+      data-testid="welcome-drawer"
+      aria-labelledby="welcome-title"
+      aria-describedby="welcome-description"
+      onCancel={(event) => {
+        event.preventDefault();
+        requestClose();
+      }}
+      onKeyDown={(event) => {
+        if (event.key !== "Escape") return;
+        event.preventDefault();
+        event.stopPropagation();
+        requestClose();
+      }}
+      onClick={(event) => {
+        if (event.target !== event.currentTarget) return;
+        const bounds = event.currentTarget.getBoundingClientRect();
+        const outside =
+          event.clientX < bounds.left ||
+          event.clientX > bounds.right ||
+          event.clientY < bounds.top ||
+          event.clientY > bounds.bottom;
+        if (outside) requestClose();
+      }}
+    >
+      <div
+        className="mono-welcome-grab"
+        data-testid="welcome-drawer-handle"
+        aria-hidden="true"
+        onPointerDown={drawerDragStart}
+      >
+        <span />
+      </div>
+      <div className="mono-welcome-scroll">
+        <div className="mono-welcome-inner">
+          <div className="mono-welcome-head">
+            <span className="mono-welcome-kicker">guide / one image · many hands</span>
+            <button
+              ref={closeButtonRef}
+              type="button"
+              className="mono-welcome-close"
+              aria-label="Close welcome guide"
+              onClick={requestClose}
+            >
+              ×
+            </button>
+          </div>
+
+          <h1 id="welcome-title">One image, every change remembered.</h1>
+          <p id="welcome-description" className="mono-welcome-intro">
+            Every accepted contribution becomes the next revision. Nothing that came
+            before is erased.
+          </p>
+
+          <div className="mono-welcome-path">
+            <section>
+              <span>01 / explore</span>
+              <h2>Move through the canvas</h2>
+              <p>
+                Drag whenever the artwork extends beyond the window. Scroll or use [−]
+                and [+] to zoom.
+              </p>
+            </section>
+            <section>
+              <span>02 / remember</span>
+              <h2>Follow its history</h2>
+              <p>
+                Move to the bottom edge for the timeline. Drag across it to scrub, play
+                the sequence, or compare a change.
+              </p>
+            </section>
+            <section>
+              <span>03 / contribute</span>
+              <h2>Leave one precise mark</h2>
+              <p>
+                Choose <strong>contribute</strong>, place a patch, paint exactly what may
+                change, then describe the edit. The queue accepts one at a time.
+              </p>
+            </section>
+          </div>
+
+          <div className="mono-welcome-controls" aria-label="Quick controls">
+            <span className="mono-welcome-controls-label">quick controls</span>
+            <dl>
+              <div>
+                <dt><kbd>drag</kbd></dt>
+                <dd>move artwork</dd>
+              </div>
+              <div>
+                <dt><kbd>←</kbd> <kbd>→</kbd></dt>
+                <dd>revisions</dd>
+              </div>
+              <div>
+                <dt><kbd>space</kbd></dt>
+                <dd>play history</dd>
+              </div>
+              <div>
+                <dt><kbd>C</kbd></dt>
+                <dd>contribute</dd>
+              </div>
+              <div>
+                <dt><kbd>Q</kbd></dt>
+                <dd>queue</dd>
+              </div>
+            </dl>
+          </div>
+
+          <div className="mono-welcome-foot">
+            <p>
+              Accepted edits are permanent revisions. Earlier looks can be revisited or
+              restored without erasing their history.
+            </p>
+            <button type="button" className="mono-welcome-enter" onClick={requestClose}>
+              enter the archive →
+            </button>
+          </div>
+        </div>
+      </div>
+    </dialog>
   );
 }
 
@@ -322,6 +567,7 @@ export default function Palimpsest() {
   const [panning, setPanning] = useState(false);
   const [panPointerFocused, setPanPointerFocused] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [welcomeOpen, setWelcomeOpen] = useState(false);
 
   const [step, setStep] = useState<1 | 2 | 3>(1);
   const [editRegion, setEditRegion] = useState<EditRegion>({
@@ -357,9 +603,10 @@ export default function Palimpsest() {
   const selectedRevision = revisions[selectedIndex] ?? null;
   const headRevision = revisions.at(-1) ?? null;
   const previousRevision = selectedIndex > 0 ? revisions[selectedIndex - 1] : null;
-  const panelOpen = historyOpen || queueOpen || editOpen;
+  const panelOpen = historyOpen || queueOpen || editOpen || welcomeOpen;
   const chromeShown = chromeVisible || panelOpen;
-  const showHistory = historyOpen && !queueOpen && !editOpen && revisions.length > 0;
+  const showHistory =
+    historyOpen && !queueOpen && !editOpen && !welcomeOpen && revisions.length > 0;
   const notCurrent = Boolean(selectedRevision && history && selectedRevision.id !== history.headRevisionId);
   const validMask = fillMask || strokes.length > 0;
   const jobActive = Boolean(job && !terminalJobStates.has(job.state));
@@ -381,6 +628,7 @@ export default function Palimpsest() {
     jobActive,
     history,
     currentState,
+    welcomeOpen,
   });
   useEffect(() => {
     latest.current = {
@@ -396,6 +644,7 @@ export default function Palimpsest() {
       jobActive,
       history,
       currentState,
+      welcomeOpen,
     };
   });
 
@@ -429,6 +678,28 @@ export default function Palimpsest() {
     setDeepIdle(false);
     armIdleTimers();
   }, [armIdleTimers]);
+
+  const closeWelcome = useCallback(() => {
+    try {
+      window.localStorage.setItem(WELCOME_STORAGE_KEY, "seen");
+    } catch {
+      // Private browsing and storage policies can make localStorage unavailable.
+    }
+    setWelcomeOpen(false);
+    wake();
+  }, [wake]);
+
+  const openWelcome = useCallback(() => {
+    setPlaying(false);
+    setCompareOn(false);
+    setConfirmRestore(false);
+    setQueueOpen(false);
+    setHistoryOpen(false);
+    setHoverIdx(-1);
+    setDeepIdle(false);
+    setChromeVisible(true);
+    setWelcomeOpen(true);
+  }, []);
 
   const showToast = useCallback((text: string) => {
     setToast(text);
@@ -491,6 +762,19 @@ export default function Palimpsest() {
     },
     [loadState],
   );
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      try {
+        if (window.localStorage.getItem(WELCOME_STORAGE_KEY) !== "seen") {
+          setWelcomeOpen(true);
+        }
+      } catch {
+        setWelcomeOpen(true);
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -779,6 +1063,7 @@ export default function Palimpsest() {
         return;
       }
       const current = latest.current;
+      if (current.welcomeOpen) return;
       switch (event.key) {
         case "ArrowLeft":
         case "ArrowRight":
@@ -896,6 +1181,7 @@ export default function Palimpsest() {
   };
 
   const handleWheel = (event: ReactWheelEvent<HTMLElement>) => {
+    if ((event.target as HTMLElement).closest(".mono-welcome")) return;
     const unit =
       event.deltaMode === 1
         ? event.deltaY * 33
@@ -909,7 +1195,7 @@ export default function Palimpsest() {
 
   const handleDoubleClick = (event: React.MouseEvent<HTMLElement>) => {
     const target = event.target as HTMLElement;
-    if (target.closest("button, input, .mono-strip, .mono-compare-handle")) return;
+    if (target.closest("button, input, .mono-strip, .mono-compare-handle, .mono-welcome")) return;
     if (view.zoom > 1) setView({ zoom: 1, x: 0, y: 0 });
     else zoomAt(event.clientX, event.clientY, 2);
     wake();
@@ -1353,6 +1639,18 @@ export default function Palimpsest() {
       <div className={`mono-chrome mono-drift mono-topright${chromeState}`}>
         <button
           type="button"
+          className="mono-guide-toggle"
+          aria-haspopup="dialog"
+          aria-controls="welcome-dialog"
+          aria-expanded={welcomeOpen}
+          aria-label={editOpen ? "Guide unavailable while contributing" : "Open welcome guide"}
+          disabled={editOpen}
+          onClick={openWelcome}
+        >
+          guide
+        </button>
+        <button
+          type="button"
           className="mono-queue-toggle"
           aria-label={`Queue, ${queueTotal} pending`}
           onClick={toggleQueue}
@@ -1731,6 +2029,8 @@ export default function Palimpsest() {
           </button>
         </div>
       ) : null}
+
+      <WelcomeDrawer open={welcomeOpen} onClose={closeWelcome} />
     </main>
   );
 }
