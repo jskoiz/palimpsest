@@ -6,9 +6,10 @@ import type {
   CSSProperties,
   KeyboardEvent as ReactKeyboardEvent,
   PointerEvent as ReactPointerEvent,
+  WheelEvent as ReactWheelEvent,
 } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { maskBlendInset } from "@/lib/palimpsest/domain.mjs";
+import { ARTWORK_SIZE, maskBlendInset } from "@/lib/palimpsest/domain.mjs";
 import {
   nudgeEditRegion,
   positionEditRegion,
@@ -115,21 +116,29 @@ type EditRegion = {
 };
 
 const terminalJobStates = new Set(["succeeded", "stale", "rejected", "failed"]);
-const dateFormatter = new Intl.DateTimeFormat("en", {
-  day: "numeric",
-  month: "long",
-  year: "numeric",
-  hour: "numeric",
-  minute: "2-digit",
-});
-const timeFormatter = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
 
-function relativeTime(date: string) {
-  const minutes = Math.round((new Date(date).getTime() - Date.now()) / 60_000);
-  if (Math.abs(minutes) < 60) return timeFormatter.format(minutes, "minute");
+const AUTO_HIDE = true;
+const IDLE_HIDE_MS = 4000;
+const DEEP_IDLE_MS = 30000;
+const BRUSH_WIDTH = 30;
+const TILE_SIZE = 1024;
+const DEFAULT_REGION = { x: 320, y: 352, width: 384, height: 320 };
+
+function pad3(value: number) {
+  return String(value).padStart(3, "0");
+}
+
+function seqTag(sequence: number) {
+  return `r${pad3(sequence)}`;
+}
+
+function compactTime(date: string) {
+  const minutes = Math.max(0, Math.round((Date.now() - new Date(date).getTime()) / 60_000));
+  if (minutes < 1) return "now";
+  if (minutes < 60) return `${minutes}m`;
   const hours = Math.round(minutes / 60);
-  if (Math.abs(hours) < 24) return timeFormatter.format(hours, "hour");
-  return timeFormatter.format(Math.round(hours / 24), "day");
+  if (hours < 24) return `${hours}h`;
+  return `${Math.round(hours / 24)}d`;
 }
 
 async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
@@ -194,293 +203,6 @@ function ArtworkLayers({
       {state.tiles.map((tile) => (
         <TileStack key={`${tile.x}-${tile.y}`} tile={tile} />
       ))}
-    </div>
-  );
-}
-
-function ArtworkView({
-  state,
-  compareState,
-  compareEnabled,
-  comparePosition,
-  onComparePosition,
-  editing,
-  selecting,
-  selectedRegion,
-  onRegionChange,
-  onRegionConfirm,
-}: {
-  state: ArtworkState | null;
-  compareState: ArtworkState | null;
-  compareEnabled: boolean;
-  comparePosition: number;
-  onComparePosition: (position: number) => void;
-  editing: boolean;
-  selecting: boolean;
-  selectedRegion: EditRegion;
-  onRegionChange: (region: EditRegion) => void;
-  onRegionConfirm: () => void;
-}) {
-  const regionRef = useRef<HTMLDivElement>(null);
-  const dragOffset = useRef<{ x: number; y: number } | null>(null);
-
-  useEffect(() => {
-    if (selecting) regionRef.current?.focus({ preventScroll: true });
-  }, [selecting]);
-
-  if (!state) {
-    return (
-      <div className="artwork-frame artwork-loading" aria-label="Loading the current artwork">
-        <img src="/seed/canonical.png" alt="Palimpsest communal artwork" />
-        <span>Opening the archive…</span>
-      </div>
-    );
-  }
-
-  const regionStyle = {
-    left: `${((selectedRegion.tile.x * 1024 + selectedRegion.region.x) / 2048) * 100}%`,
-    top: `${((selectedRegion.tile.y * 1024 + selectedRegion.region.y) / 2048) * 100}%`,
-    width: `${(selectedRegion.region.width / 2048) * 100}%`,
-    height: `${(selectedRegion.region.height / 2048) * 100}%`,
-  };
-
-  const canvasPoint = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const rect = event.currentTarget.getBoundingClientRect();
-    return {
-      x: Math.max(0, Math.min(2047, ((event.clientX - rect.left) / rect.width) * 2048)),
-      y: Math.max(0, Math.min(2047, ((event.clientY - rect.top) / rect.height) * 2048)),
-    };
-  };
-
-  const moveFromPointer = (
-    event: ReactPointerEvent<HTMLDivElement>,
-    offset: { x: number; y: number },
-  ) => {
-    const point = canvasPoint(event);
-    onRegionChange(
-      positionEditRegion(selectedRegion, point.x - offset.x, point.y - offset.y),
-    );
-  };
-
-  const beginRegionDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (!editing) return;
-    const target = event.target as HTMLElement;
-    const grabbedRegion = Boolean(target.closest(".selected-region"));
-    if (!selecting && !grabbedRegion) return;
-
-    const point = canvasPoint(event);
-    const globalX = selectedRegion.tile.x * 1024 + selectedRegion.region.x;
-    const globalY = selectedRegion.tile.y * 1024 + selectedRegion.region.y;
-    const offset = grabbedRegion
-      ? { x: point.x - globalX, y: point.y - globalY }
-      : { x: selectedRegion.region.width / 2, y: selectedRegion.region.height / 2 };
-    dragOffset.current = offset;
-    event.currentTarget.setPointerCapture(event.pointerId);
-    regionRef.current?.focus({ preventScroll: true });
-    moveFromPointer(event, offset);
-    event.preventDefault();
-  };
-
-  const continueRegionDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (!dragOffset.current || !editing) return;
-    moveFromPointer(event, dragOffset.current);
-    event.preventDefault();
-  };
-
-  const endRegionDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
-    dragOffset.current = null;
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-  };
-
-  const moveRegionWithKeyboard = (event: ReactKeyboardEvent<HTMLDivElement>) => {
-    const step = event.shiftKey ? 32 : 8;
-    const deltas: Record<string, { x: number; y: number }> = {
-      ArrowLeft: { x: -step, y: 0 },
-      ArrowRight: { x: step, y: 0 },
-      ArrowUp: { x: 0, y: -step },
-      ArrowDown: { x: 0, y: step },
-    };
-    const delta = deltas[event.key];
-    if (delta) {
-      onRegionChange(nudgeEditRegion(selectedRegion, delta.x, delta.y));
-      event.preventDefault();
-      return;
-    }
-    if (selecting && (event.key === "Enter" || event.key === " ")) {
-      onRegionConfirm();
-      event.preventDefault();
-    }
-  };
-
-  return (
-    <div
-      className={`artwork-frame${selecting ? " is-selecting" : ""}`}
-      onPointerDown={editing ? beginRegionDrag : undefined}
-      onPointerMove={editing ? continueRegionDrag : undefined}
-      onPointerUp={editing ? endRegionDrag : undefined}
-      onPointerCancel={editing ? endRegionDrag : undefined}
-    >
-      <ArtworkLayers state={state} />
-      {compareEnabled && compareState ? (
-        <>
-          <div
-            className="comparison-reveal"
-            style={{ clipPath: `inset(0 ${100 - comparePosition}% 0 0)` }}
-            aria-hidden="true"
-          >
-            <ArtworkLayers state={compareState} />
-          </div>
-          <div className="comparison-label comparison-label-before">
-            Before · R{String(state.revision.sequence).padStart(3, "0")}
-          </div>
-          <div className="comparison-label comparison-label-current">
-            Current · R{String(compareState.revision.sequence).padStart(3, "0")}
-          </div>
-          <input
-            className="comparison-slider"
-            type="range"
-            min="0"
-            max="100"
-            value={comparePosition}
-            aria-label="Before and current comparison"
-            aria-valuetext={`${comparePosition}% of the current revision visible`}
-            onChange={(event) => onComparePosition(Number(event.target.value))}
-          />
-          <div className="comparison-rule" style={{ left: `${comparePosition}%` }} aria-hidden="true">
-            <span />
-          </div>
-        </>
-      ) : null}
-      {editing ? (
-        <>
-          {selecting ? <div className="selection-veil" aria-hidden="true" /> : null}
-          <div
-            ref={regionRef}
-            className={`selected-region${selecting ? " is-positioning" : " is-placed"}`}
-            style={regionStyle}
-            role="button"
-            tabIndex={0}
-            aria-label="Selected edit patch. Drag to move it. Use the arrow keys to nudge it."
-            onKeyDown={moveRegionWithKeyboard}
-          >
-            <i /><i /><i /><i />
-            <span>{selecting ? "Drag patch" : "Move"}</span>
-          </div>
-          {selecting ? (
-            <p className="selection-instruction">Drag or tap to move · Enter to confirm</p>
-          ) : null}
-        </>
-      ) : null}
-    </div>
-  );
-}
-
-function RegionMaskEditor({
-  tile,
-  region,
-  strokes,
-  fill,
-  brushWidth,
-  onStrokes,
-  onFill,
-}: {
-  tile: Tile;
-  region: EditRegion["region"];
-  strokes: Stroke[];
-  fill: boolean;
-  brushWidth: number;
-  onStrokes: (strokes: Stroke[]) => void;
-  onFill: (fill: boolean) => void;
-}) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const activePointer = useRef<number | null>(null);
-  const fillInset = maskBlendInset(region);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    const context = canvas?.getContext("2d");
-    if (!canvas || !context) return;
-    context.clearRect(0, 0, region.width, region.height);
-    context.fillStyle = "rgba(166, 59, 41, .34)";
-    context.strokeStyle = "rgba(166, 59, 41, .58)";
-    context.lineCap = "round";
-    context.lineJoin = "round";
-    if (fill) {
-      context.fillRect(
-        fillInset,
-        fillInset,
-        region.width - fillInset * 2,
-        region.height - fillInset * 2,
-      );
-    }
-    for (const stroke of strokes) {
-      context.lineWidth = stroke.width;
-      context.beginPath();
-      const first = stroke.points[0];
-      if (!first) continue;
-      context.moveTo(first.x, first.y);
-      if (stroke.points.length === 1) {
-        context.lineTo(first.x + 0.01, first.y + 0.01);
-      } else {
-        for (const point of stroke.points.slice(1)) context.lineTo(point.x, point.y);
-      }
-      context.stroke();
-    }
-  }, [fill, fillInset, region.height, region.width, strokes]);
-
-  const pointFromEvent = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    const rect = event.currentTarget.getBoundingClientRect();
-    return {
-      x: Math.round(Math.max(0, Math.min(region.width, ((event.clientX - rect.left) / rect.width) * region.width))),
-      y: Math.round(Math.max(0, Math.min(region.height, ((event.clientY - rect.top) / rect.height) * region.height))),
-    };
-  };
-
-  const pointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    event.currentTarget.setPointerCapture(event.pointerId);
-    activePointer.current = event.pointerId;
-    onFill(false);
-    onStrokes([...strokes, { width: brushWidth, points: [pointFromEvent(event)] }]);
-  };
-  const pointerMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (activePointer.current !== event.pointerId || event.buttons === 0) return;
-    const point = pointFromEvent(event);
-    const next = [...strokes];
-    const last = next.at(-1);
-    const previous = last?.points.at(-1);
-    if (!last || (previous && Math.hypot(point.x - previous.x, point.y - previous.y) < 2)) return;
-    next[next.length - 1] = { ...last, points: [...last.points, point] };
-    onStrokes(next);
-  };
-  const pointerUp = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (activePointer.current === event.pointerId) activePointer.current = null;
-  };
-
-  const sourceStyle = {
-    width: `${(1024 / region.width) * 100}%`,
-    height: `${(1024 / region.height) * 100}%`,
-    left: `${-(region.x / region.width) * 100}%`,
-    top: `${-(region.y / region.height) * 100}%`,
-  };
-
-  return (
-    <div className="mask-editor" style={{ aspectRatio: `${region.width} / ${region.height}` }}>
-      <div className="mask-source" style={sourceStyle} aria-hidden="true">
-        <TileStack tile={tile} />
-      </div>
-      <canvas
-        ref={canvasRef}
-        width={region.width}
-        height={region.height}
-        tabIndex={0}
-        aria-label="Draw the mask for this edit. Use Fit object for a keyboard-accessible alternative."
-        onPointerDown={pointerDown}
-        onPointerMove={pointerMove}
-        onPointerUp={pointerUp}
-        onPointerCancel={pointerUp}
-      />
     </div>
   );
 }
@@ -569,10 +291,6 @@ async function providerMask(
   });
 }
 
-function provenanceClass(origin: Revision["origin"]) {
-  return origin === "openai" ? "is-live" : origin === "revert" ? "is-revert" : "is-seed";
-}
-
 export default function Palimpsest() {
   const [history, setHistory] = useState<HistoryPayload | null>(null);
   const [activity, setActivity] = useState<ActivityPayload>({
@@ -582,35 +300,120 @@ export default function Palimpsest() {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [selectedState, setSelectedState] = useState<ArtworkState | null>(null);
   const [currentState, setCurrentState] = useState<ArtworkState | null>(null);
-  const [previousState, setPreviousState] = useState<ArtworkState | null>(null);
+  const [beforeState, setBeforeState] = useState<ArtworkState | null>(null);
   const stateCache = useRef(new Map<string, ArtworkState>());
   const [loadingError, setLoadingError] = useState<string | null>(null);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [compareEnabled, setCompareEnabled] = useState(false);
-  const [comparePosition, setComparePosition] = useState(56);
-  const [drawerOpen, setDrawerOpen] = useState(false);
+
+  const [chromeVisible, setChromeVisible] = useState(true);
+  const [deepIdle, setDeepIdle] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [queueOpen, setQueueOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
-  const [choosingRegion, setChoosingRegion] = useState(false);
+  const [playing, setPlaying] = useState(false);
+  const [compareOn, setCompareOn] = useState(false);
+  const [comparePos, setComparePos] = useState(55);
+  const [hoverIdx, setHoverIdx] = useState(-1);
+  const [view, setView] = useState({ zoom: 1, x: 0, y: 0 });
+  const [panning, setPanning] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
+
+  const [step, setStep] = useState<1 | 2 | 3>(1);
   const [editRegion, setEditRegion] = useState<EditRegion>({
     tile: { x: 0, y: 0 },
-    region: { x: 320, y: 352, width: 384, height: 320 },
+    region: { ...DEFAULT_REGION },
   });
   const [strokes, setStrokes] = useState<Stroke[]>([]);
   const [fillMask, setFillMask] = useState(false);
-  const [brushWidth, setBrushWidth] = useState(24);
   const [prompt, setPrompt] = useState("");
-  const [displayName, setDisplayName] = useState("Anonymous visitor");
+  const [displayName, setDisplayName] = useState("anonymous visitor");
   const [executionMode, setExecutionMode] = useState<"demo" | "openai">("demo");
-  const [job, setJob] = useState<Job | null>(null);
-  const drainInFlight = useRef(false);
-  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [submitted, setSubmitted] = useState(false);
   const [isPreparing, setIsPreparing] = useState(false);
-  const [confirmRevert, setConfirmRevert] = useState(false);
-  const [copied, setCopied] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [confirmRestore, setConfirmRestore] = useState(false);
+  const [job, setJob] = useState<Job | null>(null);
+  const [pendingEdit, setPendingEdit] = useState<{ author: string; prompt: string } | null>(null);
+
+  const drainInFlight = useRef(false);
+  const idleTimer = useRef<number | null>(null);
+  const deepTimer = useRef<number | null>(null);
+  const toastTimer = useRef<number | null>(null);
+  const closeTimer = useRef<number | null>(null);
+  const panStart = useRef<{ x: number; y: number } | null>(null);
+  const patchDrag = useRef<{ x: number; y: number } | null>(null);
+  const compareDrag = useRef(false);
+  const maskPointer = useRef<number | null>(null);
+  const overlayCoverRef = useRef<HTMLDivElement>(null);
+  const maskCanvasRef = useRef<HTMLCanvasElement>(null);
 
   const revisions = history?.revisions ?? EMPTY_REVISIONS;
   const selectedRevision = revisions[selectedIndex] ?? null;
-  const currentRevision = revisions.at(-1) ?? null;
+  const headRevision = revisions.at(-1) ?? null;
+  const previousRevision = selectedIndex > 0 ? revisions[selectedIndex - 1] : null;
+  const panelOpen = historyOpen || queueOpen || editOpen;
+  const chromeShown = chromeVisible || panelOpen;
+  const showHistory = historyOpen && !queueOpen && !editOpen && revisions.length > 0;
+  const notCurrent = Boolean(selectedRevision && history && selectedRevision.id !== history.headRevisionId);
+  const validMask = fillMask || strokes.length > 0;
+  const jobActive = Boolean(job && !terminalJobStates.has(job.state));
+  const queueTotal = activity.queue.queued + activity.queue.active;
+  const queueBusy = activity.queue.active > 0 || jobActive;
+  const openaiAvailable = Boolean(history?.editing.openaiAvailable);
+
+  const latest = useRef({
+    panelOpen,
+    zoom: view.zoom,
+    playing,
+    selectedIndex,
+    selectedRevisionId: selectedRevision?.id ?? null,
+    revLen: revisions.length,
+    editOpen,
+    step,
+    submitted,
+    jobActive,
+    history,
+    currentState,
+  });
+  useEffect(() => {
+    latest.current = {
+      panelOpen,
+      zoom: view.zoom,
+      playing,
+      selectedIndex,
+      selectedRevisionId: selectedRevision?.id ?? null,
+      revLen: revisions.length,
+      editOpen,
+      step,
+      submitted,
+      jobActive,
+      history,
+      currentState,
+    };
+  });
+
+  const armIdleTimers = useCallback(() => {
+    if (idleTimer.current) window.clearTimeout(idleTimer.current);
+    if (deepTimer.current) window.clearTimeout(deepTimer.current);
+    if (!AUTO_HIDE) return;
+    idleTimer.current = window.setTimeout(() => {
+      if (!latest.current.panelOpen) setChromeVisible(false);
+    }, IDLE_HIDE_MS);
+    deepTimer.current = window.setTimeout(() => {
+      if (!latest.current.panelOpen && latest.current.zoom === 1) setDeepIdle(true);
+    }, DEEP_IDLE_MS);
+  }, []);
+
+  const wake = useCallback(() => {
+    setChromeVisible(true);
+    setDeepIdle(false);
+    armIdleTimers();
+  }, [armIdleTimers]);
+
+  const showToast = useCallback((text: string) => {
+    setToast(text);
+    if (toastTimer.current) window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), 4200);
+  }, []);
 
   const loadState = useCallback(async (revisionId: string) => {
     const cached = stateCache.current.get(revisionId);
@@ -663,6 +466,7 @@ export default function Palimpsest() {
           : await loadState(payload.revisions[index].id),
       );
       setLoadingError(null);
+      return payload;
     },
     [loadState],
   );
@@ -677,11 +481,24 @@ export default function Palimpsest() {
   }, [refreshActivity, refreshHistory]);
 
   useEffect(() => {
+    armIdleTimers();
+    const timers = [idleTimer, deepTimer, toastTimer, closeTimer];
+    return () => {
+      for (const timer of timers) {
+        if (timer.current) window.clearTimeout(timer.current);
+      }
+    };
+  }, [armIdleTimers]);
+
+  useEffect(() => {
     if (!selectedRevision) return;
     let active = true;
     loadState(selectedRevision.id)
       .then((state) => {
-        if (active) setSelectedState(state);
+        if (active) {
+          setSelectedState(state);
+          setLoadingError(null);
+        }
       })
       .catch((error: unknown) => {
         if (active) setLoadingError(error instanceof Error ? error.message : "That revision could not be opened.");
@@ -692,18 +509,18 @@ export default function Palimpsest() {
   }, [loadState, selectedRevision]);
 
   useEffect(() => {
-    if (!isPlaying || revisions.length === 0) return;
+    if (!playing || revisions.length === 0) return;
     const timer = window.setInterval(() => {
-      setSelectedIndex((index) => {
-        if (index >= revisions.length - 1) {
-          setIsPlaying(false);
-          return index;
-        }
-        return index + 1;
-      });
+      const last = revisions.length - 1;
+      const index = latest.current.selectedIndex;
+      if (index >= last) {
+        setPlaying(false);
+        return;
+      }
+      setSelectedIndex(index + 1);
     }, 900);
     return () => window.clearInterval(timer);
-  }, [isPlaying, revisions.length]);
+  }, [playing, revisions.length]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -718,105 +535,419 @@ export default function Palimpsest() {
     const timer = window.setTimeout(async () => {
       try {
         const payload = await fetchJson<{ job: Job }>(`/api/jobs/${encodeURIComponent(job.id)}`);
-        setJob(payload.job);
-        await refreshActivity();
+        if (!terminalJobStates.has(payload.job.state)) {
+          setJob(payload.job);
+          await refreshActivity();
+          return;
+        }
         if (payload.job.state === "succeeded" && payload.job.resultRevisionId) {
-          await refreshHistory(payload.job.resultRevisionId);
+          const refreshed = await refreshHistory(payload.job.resultRevisionId);
+          const accepted = refreshed.revisions.find(
+            (revision) => revision.id === payload.job.resultRevisionId,
+          );
+          if (accepted) {
+            showToast(
+              `${seqTag(accepted.sequence)} ${accepted.origin === "revert" ? "restored" : "accepted"} — ${accepted.author}`,
+            );
+          }
           setEditOpen(false);
-          setChoosingRegion(false);
+          setSubmitted(false);
+          setStep(1);
           setPrompt("");
           setStrokes([]);
           setFillMask(false);
+        } else {
+          showToast(payload.job.message ?? payload.job.error?.message ?? "nothing was added to the work");
         }
-      } catch (error) {
-        setSubmitError(error instanceof Error ? error.message : "Queue status could not be refreshed.");
+        setJob(null);
+        setPendingEdit(null);
+        await refreshActivity();
+      } catch {
+        setJob((current) => (current ? { ...current } : current));
       }
     }, 1200);
     return () => window.clearTimeout(timer);
-  }, [job, refreshActivity, refreshHistory, requestQueueDrain]);
+  }, [job, refreshActivity, refreshHistory, requestQueueDrain, showToast]);
 
   useEffect(() => {
-    if (
-      !compareEnabled ||
-      !selectedRevision ||
-      selectedRevision.id !== currentRevision?.id ||
-      selectedIndex === 0
-    ) {
-      return;
-    }
+    const newest = activity.recent[0];
+    if (!newest || !history) return;
+    if (latest.current.jobActive) return;
+    if (history.revisions.some((revision) => revision.id === newest.id)) return;
+    refreshHistory(latest.current.selectedRevisionId).catch(() => undefined);
+  }, [activity.recent, history, refreshHistory]);
+
+  useEffect(() => {
+    if (!compareOn || selectedIndex <= 0) return;
+    const previous = revisions[selectedIndex - 1];
+    if (!previous) return;
     let active = true;
-    loadState(revisions[selectedIndex - 1].id)
+    loadState(previous.id)
       .then((state) => {
-        if (active) setPreviousState(state);
+        if (active) setBeforeState(state);
       })
       .catch(() => undefined);
     return () => {
       active = false;
     };
-  }, [compareEnabled, currentRevision?.id, loadState, revisions, selectedIndex, selectedRevision]);
+  }, [compareOn, loadState, revisions, selectedIndex]);
 
-  const comparingCurrent = selectedRevision?.id === currentRevision?.id;
-  const expectedPreviousId = selectedIndex > 0 ? revisions[selectedIndex - 1]?.id : null;
-  const beforeState =
-    comparingCurrent && previousState?.revision.id === expectedPreviousId
-      ? previousState
-      : null;
-  const displayedState = compareEnabled && beforeState ? beforeState : selectedState;
-  const compareState = compareEnabled
-    ? comparingCurrent
-      ? beforeState
-        ? selectedState
-        : null
-      : currentState
-    : null;
-
-  const selectRevision = (index: number) => {
-    setIsPlaying(false);
-    setSelectedIndex(index);
-    setCompareEnabled(false);
-    setConfirmRevert(false);
-  };
-
-  const commitShareState = () => {
-    if (!selectedRevision) return;
+  useEffect(() => {
+    if (!selectedRevision || !history || playing) return;
     const url = new URL(window.location.href);
-    url.searchParams.set("revision", selectedRevision.id);
+    if (selectedRevision.id === history.headRevisionId) url.searchParams.delete("revision");
+    else url.searchParams.set("revision", selectedRevision.id);
     window.history.replaceState({}, "", url);
-  };
+  }, [history, playing, selectedRevision]);
 
-  const copyRevisionLink = async () => {
-    if (!selectedRevision) return;
-    const url = new URL(window.location.href);
-    url.searchParams.set("revision", selectedRevision.id);
-    await navigator.clipboard.writeText(url.toString());
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1800);
-  };
+  useEffect(() => {
+    const canvas = maskCanvasRef.current;
+    const context = canvas?.getContext("2d");
+    if (!canvas || !context) return;
+    const { width, height } = editRegion.region;
+    const accent =
+      getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#e0765f";
+    context.clearRect(0, 0, width, height);
+    context.fillStyle = `${accent}55`;
+    context.strokeStyle = `${accent}99`;
+    context.lineCap = "round";
+    context.lineJoin = "round";
+    if (fillMask) {
+      const inset = maskBlendInset(editRegion.region);
+      context.fillRect(inset, inset, width - inset * 2, height - inset * 2);
+    }
+    for (const stroke of strokes) {
+      const first = stroke.points[0];
+      if (!first) continue;
+      context.lineWidth = stroke.width;
+      context.beginPath();
+      context.moveTo(first.x, first.y);
+      if (stroke.points.length === 1) {
+        context.lineTo(first.x + 0.01, first.y + 0.01);
+      } else {
+        for (const point of stroke.points.slice(1)) context.lineTo(point.x, point.y);
+      }
+      context.stroke();
+    }
+  }, [editOpen, editRegion.region, fillMask, step, strokes, submitted]);
 
-  const returnToCurrent = () => {
-    if (!history) return;
-    selectRevision(history.revisions.length - 1);
-  };
+  const zoomAt = useCallback((cx: number, cy: number, factor: number) => {
+    setView((current) => {
+      const zoom = Math.max(1, Math.min(4, current.zoom * factor));
+      if (zoom === 1) return { zoom: 1, x: 0, y: 0 };
+      const scale = zoom / current.zoom;
+      return {
+        zoom,
+        x: cx - (cx - current.x) * scale,
+        y: cy - (cy - current.y) * scale,
+      };
+    });
+  }, []);
 
-  const openEditor = () => {
-    if (!history || !currentState) return;
-    returnToCurrent();
-    const assigned = currentState.revision.sequence % 4;
+  const scrub = useCallback(
+    (delta: number) => {
+      if (!latest.current.revLen) return;
+      setPlaying(false);
+      setQueueOpen(false);
+      setConfirmRestore(false);
+      setHistoryOpen(true);
+      setSelectedIndex((index) =>
+        Math.max(0, Math.min(latest.current.revLen - 1, index + delta)),
+      );
+      wake();
+    },
+    [wake],
+  );
+
+  const togglePlay = useCallback(() => {
+    const current = latest.current;
+    if (current.revLen < 2) return;
+    const next = !current.playing;
+    setQueueOpen(false);
+    setHistoryOpen(true);
+    setCompareOn(false);
+    setConfirmRestore(false);
+    if (next && current.selectedIndex >= current.revLen - 1) setSelectedIndex(0);
+    setPlaying(next);
+    wake();
+  }, [wake]);
+
+  const toggleQueue = useCallback(() => {
+    setQueueOpen((open) => !open);
+    setEditOpen(false);
+    setHistoryOpen(false);
+    setPlaying(false);
+    setCompareOn(false);
+    setSubmitted(false);
+    setConfirmRestore(false);
+    wake();
+  }, [wake]);
+
+  const openEditor = useCallback(() => {
+    const current = latest.current;
+    if (!current.history || !current.currentState) return;
+    const assigned = current.currentState.revision.sequence % 4;
     setEditRegion({
       tile: { x: assigned % 2, y: Math.floor(assigned / 2) },
-      region: { x: 320, y: 352, width: 384, height: 320 },
+      region: { ...DEFAULT_REGION },
     });
+    setSelectedIndex(current.revLen - 1);
+    setPlaying(false);
+    setCompareOn(false);
+    setQueueOpen(false);
+    setHistoryOpen(false);
     setEditOpen(true);
-    setChoosingRegion(true);
-    setCompareEnabled(false);
+    setStep(1);
     setStrokes([]);
     setFillMask(false);
-    setJob(null);
+    setPrompt("");
+    setSubmitted(false);
     setSubmitError(null);
+    setConfirmRestore(false);
+    setView({ zoom: 1, x: 0, y: 0 });
+    if (closeTimer.current) window.clearTimeout(closeTimer.current);
+    wake();
+  }, [wake]);
+
+  const closeEditor = useCallback(() => {
+    setEditOpen(false);
+    setSubmitted(false);
+    if (closeTimer.current) window.clearTimeout(closeTimer.current);
+    wake();
+  }, [wake]);
+
+  const closeAll = useCallback(() => {
+    setEditOpen(false);
+    setQueueOpen(false);
+    setHistoryOpen(false);
+    setCompareOn(false);
+    setPlaying(false);
+    setSubmitted(false);
+    setConfirmRestore(false);
+    setHoverIdx(-1);
+    setView({ zoom: 1, x: 0, y: 0 });
+    if (closeTimer.current) window.clearTimeout(closeTimer.current);
+    wake();
+  }, [wake]);
+
+  const returnToCurrent = useCallback(() => {
+    if (!latest.current.revLen) return;
+    setSelectedIndex(latest.current.revLen - 1);
+    setPlaying(false);
+    setCompareOn(false);
+    setConfirmRestore(false);
+    wake();
+  }, [wake]);
+
+  const nudgePatch = useCallback((deltaX: number, deltaY: number) => {
+    setEditRegion((region) => nudgeEditRegion(region, deltaX, deltaY));
+  }, []);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      const current = latest.current;
+      switch (event.key) {
+        case "ArrowLeft":
+        case "ArrowRight":
+        case "ArrowUp":
+        case "ArrowDown": {
+          if (target?.closest?.("[role=slider]")) break;
+          if (current.editOpen) {
+            if (current.step === 1 && !current.submitted) {
+              const amount = event.shiftKey ? 32 : 8;
+              const deltas: Record<string, [number, number]> = {
+                ArrowLeft: [-amount, 0],
+                ArrowRight: [amount, 0],
+                ArrowUp: [0, -amount],
+                ArrowDown: [0, amount],
+              };
+              const [dx, dy] = deltas[event.key];
+              nudgePatch(dx, dy);
+              event.preventDefault();
+            }
+          } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+            scrub(event.key === "ArrowLeft" ? -1 : 1);
+            event.preventDefault();
+          }
+          break;
+        }
+        case " ":
+          if (!current.editOpen) {
+            event.preventDefault();
+            togglePlay();
+          }
+          break;
+        case "c":
+        case "C":
+          if (!current.editOpen) openEditor();
+          break;
+        case "q":
+        case "Q":
+          toggleQueue();
+          break;
+        case "Escape":
+          closeAll();
+          break;
+        default:
+          break;
+      }
+      wake();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [closeAll, nudgePatch, openEditor, scrub, togglePlay, toggleQueue, wake]);
+
+  const selectRevision = (index: number) => {
+    setSelectedIndex(index);
+    setPlaying(false);
+    setCompareOn(false);
+    setConfirmRestore(false);
+    wake();
   };
 
+  const handleWheel = (event: ReactWheelEvent<HTMLElement>) => {
+    const unit =
+      event.deltaMode === 1
+        ? event.deltaY * 33
+        : event.deltaMode === 2
+          ? event.deltaY * window.innerHeight
+          : event.deltaY;
+    const factor = Math.max(0.5, Math.min(2, Math.pow(1.12, -unit / 100)));
+    zoomAt(event.clientX, event.clientY, factor);
+    wake();
+  };
+
+  const handleDoubleClick = (event: React.MouseEvent<HTMLElement>) => {
+    const target = event.target as HTMLElement;
+    if (target.closest("button, input, .mono-strip, .mono-compare-handle")) return;
+    if (view.zoom > 1) setView({ zoom: 1, x: 0, y: 0 });
+    else zoomAt(event.clientX, event.clientY, 2);
+    wake();
+  };
+
+  const panDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    panStart.current = { x: event.clientX - view.x, y: event.clientY - view.y };
+    setPanning(true);
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const panMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!panStart.current) return;
+    const start = panStart.current;
+    setView((current) => ({ ...current, x: event.clientX - start.x, y: event.clientY - start.y }));
+  };
+
+  const panUp = () => {
+    panStart.current = null;
+    setPanning(false);
+  };
+
+  const compareDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    compareDrag.current = true;
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const compareMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!compareDrag.current) return;
+    setComparePos(Math.max(2, Math.min(98, (event.clientX / window.innerWidth) * 100)));
+  };
+
+  const compareUp = () => {
+    compareDrag.current = false;
+  };
+
+  const compareKey = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    const delta = event.key === "ArrowLeft" ? -2 : 2;
+    setComparePos((position) => Math.max(2, Math.min(98, position + delta)));
+    event.preventDefault();
+  };
+
+  const artworkPoint = (event: ReactPointerEvent<Element>) => {
+    const rect = overlayCoverRef.current?.getBoundingClientRect();
+    if (!rect || rect.width === 0) return null;
+    return {
+      x: ((event.clientX - rect.left) / rect.width) * ARTWORK_SIZE,
+      y: ((event.clientY - rect.top) / rect.height) * ARTWORK_SIZE,
+    };
+  };
+
+  const patchDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (step !== 1 || submitted) return;
+    const point = artworkPoint(event);
+    if (!point) return;
+    patchDrag.current = {
+      x: point.x - (editRegion.tile.x * TILE_SIZE + editRegion.region.x),
+      y: point.y - (editRegion.tile.y * TILE_SIZE + editRegion.region.y),
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const patchMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!patchDrag.current) return;
+    const point = artworkPoint(event);
+    if (!point) return;
+    const offset = patchDrag.current;
+    setEditRegion((region) => positionEditRegion(region, point.x - offset.x, point.y - offset.y));
+  };
+
+  const patchUp = () => {
+    patchDrag.current = null;
+  };
+
+  const maskPoint = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const { width, height } = editRegion.region;
+    return {
+      x: Math.round(Math.max(0, Math.min(width, ((event.clientX - rect.left) / rect.width) * width))),
+      y: Math.round(Math.max(0, Math.min(height, ((event.clientY - rect.top) / rect.height) * height))),
+    };
+  };
+
+  const maskDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (step !== 2 || submitted) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    maskPointer.current = event.pointerId;
+    setFillMask(false);
+    const point = maskPoint(event);
+    setStrokes((current) => [...current, { width: BRUSH_WIDTH, points: [point] }]);
+  };
+
+  const maskMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (maskPointer.current !== event.pointerId || event.buttons === 0) return;
+    const point = maskPoint(event);
+    setStrokes((current) => {
+      const last = current.at(-1);
+      const previous = last?.points.at(-1);
+      if (!last || !previous) return current;
+      if (Math.hypot(point.x - previous.x, point.y - previous.y) < 2) return current;
+      return [...current.slice(0, -1), { ...last, points: [...last.points, point] }];
+    });
+  };
+
+  const maskUp = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (maskPointer.current === event.pointerId) maskPointer.current = null;
+  };
+
+  const cleanDisplayName = () => {
+    const name = displayName.replace(/\s+/g, " ").trim();
+    return name.length >= 2 ? name : "";
+  };
+
+  const canSubmit =
+    !isPreparing && !submitted && prompt.trim().length >= 3 && validMask && step === 3;
+
   const submitEdit = async () => {
-    if (!currentState || !history) return;
+    if (!currentState || !history || !canSubmit) return;
     const tile = currentState.tiles.find(
       (candidate) => candidate.x === editRegion.tile.x && candidate.y === editRegion.tile.y,
     );
@@ -834,8 +965,8 @@ export default function Palimpsest() {
         JSON.stringify({
           artworkId: "palimpsest",
           baseRevisionId: history.headRevisionId,
-          displayName,
-          prompt,
+          displayName: cleanDisplayName(),
+          prompt: prompt.trim(),
           executionMode,
           tile: editRegion.tile,
           region: editRegion.region,
@@ -851,8 +982,15 @@ export default function Palimpsest() {
         body: form,
       });
       setJob(payload.job);
+      setPendingEdit({ author: cleanDisplayName() || "anonymous visitor", prompt: prompt.trim() });
+      setSubmitted(true);
       void requestQueueDrain();
       await refreshActivity();
+      if (closeTimer.current) window.clearTimeout(closeTimer.current);
+      closeTimer.current = window.setTimeout(() => {
+        setEditOpen(false);
+        setSubmitted(false);
+      }, 2400);
     } catch (error) {
       setSubmitError(error instanceof Error ? error.message : "The edit could not be submitted.");
     } finally {
@@ -862,7 +1000,7 @@ export default function Palimpsest() {
 
   const submitRevert = async () => {
     if (!history || !selectedRevision || selectedRevision.id === history.headRevisionId) return;
-    setSubmitError(null);
+    setConfirmRestore(false);
     try {
       const payload = await fetchJson<{ job: Job }>("/api/reverts", {
         method: "POST",
@@ -874,403 +1012,566 @@ export default function Palimpsest() {
           artworkId: "palimpsest",
           baseRevisionId: history.headRevisionId,
           targetRevisionId: selectedRevision.id,
-          displayName,
+          displayName: cleanDisplayName(),
         }),
       });
       setJob(payload.job);
+      setPendingEdit({
+        author: cleanDisplayName() || "anonymous visitor",
+        prompt: `restore ${seqTag(selectedRevision.sequence)}`,
+      });
       void requestQueueDrain();
-      setConfirmRevert(false);
+      await refreshActivity();
+      showToast(`queued — restoring ${seqTag(selectedRevision.sequence)}`);
     } catch (error) {
-      setSubmitError(error instanceof Error ? error.message : "The restore could not be queued.");
+      showToast(error instanceof Error ? error.message : "The restore could not be queued.");
     }
   };
 
-  const selectedTile = currentState?.tiles.find(
-    (tile) => tile.x === editRegion.tile.x && tile.y === editRegion.tile.y,
-  );
-  const validMask = fillMask || strokes.length > 0;
-  const canSubmit =
-    !isPreparing &&
-    (!job || terminalJobStates.has(job.state)) &&
-    prompt.trim().length >= 3 &&
-    displayName.trim().length >= 2 &&
-    validMask &&
-    !choosingRegion;
+  const zoomStyle = { transform: `translate(${view.x}px, ${view.y}px) scale(${view.zoom})` };
+  const zoomClass = `mono-zoom${panning ? " is-panning" : ""}`;
+  const chromeState = playing ? " is-dimmed" : chromeShown ? "" : " is-hidden";
+
+  const compareReady =
+    compareOn &&
+    Boolean(previousRevision) &&
+    beforeState?.revision.id === previousRevision?.id;
+
+  const echoRegion = showHistory && !playing ? selectedRevision?.region ?? null : null;
+  const echoStyle = echoRegion
+    ? {
+        left: `${((echoRegion.tile.x * TILE_SIZE + echoRegion.x) / ARTWORK_SIZE) * 100}%`,
+        top: `${((echoRegion.tile.y * TILE_SIZE + echoRegion.y) / ARTWORK_SIZE) * 100}%`,
+        width: `${(echoRegion.width / ARTWORK_SIZE) * 100}%`,
+        height: `${(echoRegion.height / ARTWORK_SIZE) * 100}%`,
+      }
+    : undefined;
+
+  const patchStyle = {
+    left: `${((editRegion.tile.x * TILE_SIZE + editRegion.region.x) / ARTWORK_SIZE) * 100}%`,
+    top: `${((editRegion.tile.y * TILE_SIZE + editRegion.region.y) / ARTWORK_SIZE) * 100}%`,
+    width: `${(editRegion.region.width / ARTWORK_SIZE) * 100}%`,
+    height: `${(editRegion.region.height / ARTWORK_SIZE) * 100}%`,
+  };
+
+  const hoverRevision = hoverIdx >= 0 ? revisions[hoverIdx] ?? null : null;
+  const tickLeft = (index: number) =>
+    revisions.length > 1 ? (index / (revisions.length - 1)) * 100 : 50;
+
+  const queueEntries = [
+    ...(jobActive && pendingEdit
+      ? [
+          {
+            id: "pending",
+            author: pendingEdit.author,
+            state: job?.state === "queued" ? "waiting" : "making",
+            accent: job?.state !== "queued",
+            prompt: pendingEdit.prompt,
+          },
+        ]
+      : []),
+    ...activity.recent.map((revision) => ({
+      id: revision.id,
+      author: revision.author,
+      state: `done · ${compactTime(revision.createdAt)}`,
+      accent: false,
+      prompt: revision.prompt,
+    })),
+  ].slice(0, 3);
+
+  const submitLabel = submitted ? "queued ✓" : isPreparing ? "preparing…" : "add to the work →";
 
   return (
-    <div className={`palimpsest${editOpen ? " edit-is-open" : ""}`}>
-      <header className="site-header">
-        <button className="wordmark" type="button" onClick={returnToCurrent} aria-label="Palimpsest, return to current revision">
-          Palimpsest
-        </button>
-        <p>One image. Every change remembered.</p>
-        <div className="header-actions">
-          <button className="queue-button" type="button" onClick={() => setDrawerOpen(true)}>
-            <span className={activity.queue.active > 0 ? "status-dot is-active" : "status-dot"} />
-            Queue {activity.queue.queued + activity.queue.active}
-          </button>
-          <button className="contribute-button" type="button" onClick={openEditor}>
-            <span className="desktop-label">Contribute</span>
-            <span className="mobile-label">Edit</span>
-          </button>
-        </div>
-      </header>
-
-      <main className="exhibit">
-        <section className="artwork-stage" aria-labelledby="revision-heading">
-          <ArtworkView
-            state={displayedState}
-            compareState={compareState}
-            compareEnabled={compareEnabled}
-            comparePosition={comparePosition}
-            onComparePosition={setComparePosition}
-            editing={editOpen}
-            selecting={editOpen && choosingRegion}
-            selectedRegion={editRegion}
-            onRegionChange={setEditRegion}
-            onRegionConfirm={() => setChoosingRegion(false)}
-          />
-          {loadingError ? (
-            <div className="artwork-error" role="alert">
-              <p>{loadingError}</p>
-              <button type="button" onClick={() => refreshHistory()}>Try again</button>
-            </div>
-          ) : null}
-
-          <aside className="museum-label" aria-live="polite">
-            {selectedRevision ? (
-              <>
-                <p className="eyebrow" id="revision-heading">
-                  Revision {String(selectedRevision.sequence).padStart(3, "0")}
-                  {selectedRevision.id === history?.headRevisionId ? " · Current" : " · Historical"}
-                </p>
-                <h1>{selectedRevision.author}</h1>
-                <time dateTime={selectedRevision.createdAt}>
-                  {dateFormatter.format(new Date(selectedRevision.createdAt))}
-                </time>
-                <blockquote>“{selectedRevision.prompt}”</blockquote>
-                <p className={`provenance ${provenanceClass(selectedRevision.origin)}`}>
-                  {selectedRevision.provenance}
-                </p>
-                <div className="label-actions">
-                  <button type="button" onClick={() => setCompareEnabled((value) => !value)}>
-                    {compareEnabled ? "Close compare" : "Before / Current"}
-                  </button>
-                  <button type="button" onClick={copyRevisionLink}>
-                    {copied ? "Link copied" : "Copy link"}
-                  </button>
-                </div>
-                {selectedRevision.id !== history?.headRevisionId ? (
-                  <div className="restore-control">
-                    {!confirmRevert ? (
-                      <button type="button" onClick={() => setConfirmRevert(true)}>
-                        Restore this appearance
-                      </button>
-                    ) : (
-                      <div className="restore-confirmation">
-                        <p>This creates a new revision. Existing history remains unchanged.</p>
-                        <button type="button" onClick={submitRevert}>Restore as new revision</button>
-                        <button type="button" onClick={() => setConfirmRevert(false)}>Cancel</button>
-                      </div>
-                    )}
-                  </div>
-                ) : null}
-              </>
+    <main
+      className="mono-stage"
+      onPointerMove={wake}
+      onWheel={handleWheel}
+      onDoubleClick={handleDoubleClick}
+    >
+      <div className={zoomClass} style={zoomStyle}>
+        <div className={`mono-kenburns${deepIdle ? " is-drifting" : ""}`}>
+          <div className="mono-cover">
+            {selectedState ? (
+              <ArtworkLayers state={selectedState} />
             ) : (
-              <p className="eyebrow">Opening archive</p>
+              <img
+                className="mono-seed"
+                src="/seed/canonical.png"
+                alt="Palimpsest communal artwork"
+              />
             )}
-          </aside>
-        </section>
-
-        {editOpen ? (
-          <aside
-            className={`edit-inspector${choosingRegion ? " is-positioning" : ""}`}
-            aria-label="Contribute an edit"
-          >
-            <div className="inspector-heading">
-              <div>
-                <p className="eyebrow">Contribution workspace</p>
-                <h2>Add one layer</h2>
-                <p className="inspector-context">
-                  Revision {String(currentRevision?.sequence ?? 0).padStart(3, "0")}
-                  {currentRevision?.author ? ` · ${currentRevision.author}` : ""}
-                </p>
-              </div>
-              <button
-                className="close-button"
-                type="button"
-                aria-label="Close contribution workspace"
-                onClick={() => {
-                  setEditOpen(false);
-                  setChoosingRegion(false);
-                }}
-              >
-                ×
-              </button>
-            </div>
-
-            <div
-              className={`edit-step patch-step${choosingRegion ? " is-active" : " is-complete"}`}
-              aria-current={choosingRegion ? "step" : undefined}
-            >
-              <span className="step-number">01</span>
-              <div>
-                <h3>Choose a patch</h3>
-                <p>Drag the outlined patch on the artwork. Arrow keys nudge it precisely.</p>
-              </div>
-              <button
-                className={choosingRegion ? "confirm-patch-button" : "text-button"}
-                type="button"
-                onClick={() => setChoosingRegion((value) => !value)}
-              >
-                {choosingRegion ? "Use selected patch" : "Reposition patch"}
-              </button>
-            </div>
-
-            {choosingRegion ? (
-              <div className="upcoming-steps" aria-label="Next contribution steps">
-                <div className="upcoming-step">
-                  <span>02</span>
-                  <div>
-                    <strong>Mark what may change</strong>
-                    <p>Paint a precise mask inside the patch.</p>
-                  </div>
-                  <small>Next</small>
-                </div>
-                <div className="upcoming-step">
-                  <span>03</span>
-                  <div>
-                    <strong>Describe the revision</strong>
-                    <p>Name the change that enters the archive.</p>
-                  </div>
-                  <small>Then</small>
-                </div>
-              </div>
-            ) : null}
-
-            <div className="edit-step mask-step">
-              <span className="step-number">02</span>
-              <div>
-                <h3>Mark what may change</h3>
-                <p>Paint a detail, or fit a complete object with a soft blend margin.</p>
-              </div>
-              {selectedTile && !choosingRegion ? (
-                <>
-                  <RegionMaskEditor
-                    tile={selectedTile}
-                    region={editRegion.region}
-                    strokes={strokes}
-                    fill={fillMask}
-                    brushWidth={brushWidth}
-                    onStrokes={setStrokes}
-                    onFill={setFillMask}
-                  />
-                  <div className="mask-tools" role="toolbar" aria-label="Mask tools">
-                    <div className="brush-sizes" aria-label="Brush size">
-                      {[12, 24, 40].map((size) => (
-                        <button
-                          key={size}
-                          type="button"
-                          className={brushWidth === size ? "is-selected" : ""}
-                          aria-label={`${size} pixel brush`}
-                          aria-pressed={brushWidth === size}
-                          onClick={() => setBrushWidth(size)}
-                        >
-                          <span style={{ width: size / 2, height: size / 2 }} />
-                        </button>
-                      ))}
-                    </div>
-                    <button type="button" onClick={() => setStrokes((value) => value.slice(0, -1))} disabled={strokes.length === 0}>
-                      Undo
-                    </button>
-                    <button type="button" onClick={() => { setStrokes([]); setFillMask(false); }} disabled={!validMask}>
-                      Clear
-                    </button>
-                    <button type="button" onClick={() => { setFillMask(true); setStrokes([]); }}>
-                      Fit object
-                    </button>
-                  </div>
-                </>
-              ) : (
-                <div className="mask-placeholder">Choose the patch on the artwork to begin masking.</div>
-              )}
-            </div>
-
-            <div className="edit-step prompt-step">
-              <span className="step-number">03</span>
-              <div>
-                <h3>Describe the change</h3>
-                <p>Accepted edits become permanent entries in the shared history.</p>
-              </div>
-              <label>
-                <span>Edit prompt</span>
-                <textarea
-                  value={prompt}
-                  maxLength={500}
-                  rows={4}
-                  placeholder="Example: Add a thin vermilion thread curling through the leaves."
-                  onChange={(event) => setPrompt(event.target.value)}
-                />
-                <small>{prompt.length} / 500</small>
-              </label>
-              <label>
-                <span>Name shown in history</span>
-                <input
-                  value={displayName}
-                  maxLength={32}
-                  onChange={(event) => setDisplayName(event.target.value)}
-                />
-              </label>
-              <fieldset className="renderer-choice">
-                <legend>Renderer</legend>
-                <label>
-                  <input
-                    type="radio"
-                    name="renderer"
-                    checked={executionMode === "demo"}
-                    onChange={() => setExecutionMode("demo")}
-                  />
-                  <span><strong>Demo renderer</strong>Deterministic paper-and-ink treatment</span>
-                </label>
-                <label className={!history?.editing.openaiAvailable ? "is-disabled" : ""}>
-                  <input
-                    type="radio"
-                    name="renderer"
-                    checked={executionMode === "openai"}
-                    disabled={!history?.editing.openaiAvailable}
-                    onChange={() => setExecutionMode("openai")}
-                  />
-                  <span>
-                    <strong>Live AI edit</strong>
-                    {history?.editing.openaiAvailable ? "OpenAI image editing" : "Not configured on this site"}
-                  </span>
-                </label>
-              </fieldset>
-              <p className="base-revision-note">Based on revision {currentRevision?.sequence ?? "—"}</p>
-            </div>
-
-            {job ? (
-              <div className={`job-status job-${job.state}`} role="status" aria-live="assertive">
-                <p className="eyebrow">Queue · {job.executionMode}</p>
-                <strong>
-                  {job.state === "queued" && job.position
-                    ? `Queued · ${Math.max(0, job.position - 1)} ahead`
-                    : job.message ?? job.error?.message ?? "Nothing was added to history."}
-                </strong>
-                {job.state === "succeeded" ? <button type="button" onClick={copyRevisionLink}>Copy revision link</button> : null}
-              </div>
-            ) : null}
-            {submitError ? <p className="submit-error" role="alert">{submitError}</p> : null}
-            <div className="inspector-submit">
-              {!canSubmit && !job ? (
-                <p className="submit-hint">
-                  {choosingRegion
-                    ? "Confirm this patch to unlock masking."
-                    : !validMask
-                      ? "Paint a mask or fill the assigned patch."
-                      : prompt.trim().length < 3
-                        ? "Add a short visual edit prompt."
-                        : "Add the name that should appear in history."}
-                </p>
-              ) : null}
-              <button className="submit-edit" type="button" disabled={!canSubmit} onClick={submitEdit}>
-                {isPreparing ? "Preparing your patch…" : "Add to the work"}
-              </button>
-            </div>
-          </aside>
-        ) : null}
-      </main>
-
-      <section className="history-dock" aria-label="Revision history">
-        <div className="history-controls">
-          <button
-            className="play-button"
-            type="button"
-            aria-label={isPlaying ? "Pause timelapse" : "Play timelapse"}
-            onClick={() => setIsPlaying((value) => !value)}
-          >
-            {isPlaying ? "Ⅱ" : "▶"}
-          </button>
-          <div className="history-track">
-            <div className="history-ticks" aria-hidden="true">
-              {revisions.map((revision, index) => (
-                <i
-                  key={revision.id}
-                  className={`${provenanceClass(revision.origin)}${index === selectedIndex ? " is-current" : ""}`}
-                  style={{ left: `${revisions.length > 1 ? (index / (revisions.length - 1)) * 100 : 0}%` }}
-                />
-              ))}
-            </div>
-            <input
-              type="range"
-              min="0"
-              max={Math.max(0, revisions.length - 1)}
-              value={Math.min(selectedIndex, Math.max(0, revisions.length - 1))}
-              aria-label="Palimpsest revision"
-              aria-valuetext={
-                selectedRevision
-                  ? `Revision ${selectedRevision.sequence} of ${currentRevision?.sequence}, by ${selectedRevision.author}, ${dateFormatter.format(new Date(selectedRevision.createdAt))}`
-                  : "Loading revisions"
-              }
-              onChange={(event) => selectRevision(Number(event.target.value))}
-              onPointerUp={commitShareState}
-              onKeyUp={commitShareState}
-            />
-          </div>
-          <output>
-            {selectedRevision?.sequence ?? "—"} / {currentRevision?.sequence ?? "—"}
-          </output>
-        </div>
-        <div className="history-meta">
-          <p>
-            <span className="eyebrow">History</span>
-            {selectedRevision ? `${selectedRevision.author} · ${selectedRevision.prompt}` : "Opening the archive"}
-          </p>
-          <div>
-            {selectedRevision?.id !== history?.headRevisionId ? (
-              <button type="button" onClick={returnToCurrent}>Return to current</button>
-            ) : null}
-            <button type="button" onClick={() => setCompareEnabled((value) => !value)}>Before / Current</button>
-            <button type="button" onClick={copyRevisionLink}>{copied ? "Copied" : "Copy revision link"}</button>
           </div>
         </div>
-      </section>
+      </div>
 
-      {drawerOpen ? (
+      {compareReady && beforeState ? (
+        <div
+          className="mono-compare-clip"
+          style={{ clipPath: `inset(0 ${100 - comparePos}% 0 0)` }}
+          aria-hidden="true"
+        >
+          <div className={zoomClass} style={zoomStyle}>
+            <div className="mono-cover">
+              <ArtworkLayers state={beforeState} />
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {view.zoom > 1 ? (
+        <div
+          className="mono-pan"
+          aria-hidden="true"
+          onPointerDown={panDown}
+          onPointerMove={panMove}
+          onPointerUp={panUp}
+          onPointerCancel={panUp}
+        />
+      ) : null}
+
+      {echoRegion || editOpen ? (
+        <div className={`${zoomClass} mono-overlays`} style={zoomStyle}>
+          <div className="mono-cover" ref={overlayCoverRef}>
+            {echoRegion && selectedRevision ? (
+              <div className="mono-echo" style={echoStyle} aria-hidden="true">
+                <span>{seqTag(selectedRevision.sequence)} changed here</span>
+              </div>
+            ) : null}
+            {editOpen ? (
+              <div
+                className={`mono-patch${step === 1 && !submitted ? " is-draggable" : " is-set"}`}
+                style={patchStyle}
+                role="button"
+                aria-label="Selected edit patch. Drag to move it. Use the arrow keys to nudge it."
+                onPointerDown={patchDown}
+                onPointerMove={patchMove}
+                onPointerUp={patchUp}
+                onPointerCancel={patchUp}
+              >
+                {step === 1 && !submitted ? (
+                  <span className="mono-patch-label">drag patch</span>
+                ) : null}
+                {step >= 2 && !submitted ? (
+                  <canvas
+                    ref={maskCanvasRef}
+                    className={`mono-mask-canvas${step !== 2 ? " is-locked" : ""}`}
+                    width={editRegion.region.width}
+                    height={editRegion.region.height}
+                    aria-label="Paint the mask for this edit. Use fit whole object for a keyboard-accessible alternative."
+                    onPointerDown={maskDown}
+                    onPointerMove={maskMove}
+                    onPointerUp={maskUp}
+                    onPointerCancel={maskUp}
+                  />
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
+      <div className={`mono-scrim-top${chromeState}`} aria-hidden="true" />
+      <div
+        className={`mono-scrim-bottom${panelOpen ? " is-raised" : ""}${chromeState}`}
+        aria-hidden="true"
+      />
+
+      {compareReady && previousRevision && selectedRevision ? (
         <>
-          <button className="drawer-backdrop" type="button" aria-label="Close activity" onClick={() => setDrawerOpen(false)} />
-          <aside className="activity-drawer" aria-label="Queue and recent activity">
-            <div className="drawer-heading">
-              <div>
-                <p className="eyebrow">Queue</p>
-                <h2>{activity.queue.queued} waiting · {activity.queue.active} making</h2>
-              </div>
-              <button className="close-button" type="button" aria-label="Close activity" onClick={() => setDrawerOpen(false)}>×</button>
-            </div>
-            <p className="queue-truth">One contribution is made at a time. Newer work never silently overwrites an accepted revision.</p>
-            <div className="recent-heading"><span>Recent changes</span><span>State</span></div>
-            <ol className="recent-list">
-              {activity.recent.map((revision) => (
-                <li key={revision.id}>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const index = revisions.findIndex((candidate) => candidate.id === revision.id);
-                      if (index >= 0) selectRevision(index);
-                      setDrawerOpen(false);
-                    }}
-                  >
-                    <strong>{revision.author}</strong>
-                    <span>{revision.prompt}</span>
-                    <small>{relativeTime(revision.createdAt)}</small>
-                    <em className={provenanceClass(revision.origin)}>{revision.provenance}</em>
-                  </button>
-                </li>
-              ))}
-            </ol>
-          </aside>
+          <div className="mono-compare-line" style={{ left: `${comparePos}%` }} aria-hidden="true" />
+          <div
+            className="mono-compare-handle"
+            style={{ left: `${comparePos}%` }}
+            role="slider"
+            tabIndex={0}
+            aria-label="Before and current divider"
+            aria-valuemin={2}
+            aria-valuemax={98}
+            aria-valuenow={Math.round(comparePos)}
+            onPointerDown={compareDown}
+            onPointerMove={compareMove}
+            onPointerUp={compareUp}
+            onPointerCancel={compareUp}
+            onKeyDown={compareKey}
+          >
+            <span />
+          </div>
+          <div className="mono-compare-label is-before">
+            before · {seqTag(previousRevision.sequence)}
+          </div>
+          <div className="mono-compare-label is-after">
+            current · {seqTag(selectedRevision.sequence)}
+          </div>
         </>
       ) : null}
-    </div>
+
+      <button
+        className={`mono-chrome mono-drift mono-wordmark${chromeState}`}
+        type="button"
+        aria-label="Palimpsest — return to the current revision"
+        onClick={returnToCurrent}
+      >
+        Palimpsest
+      </button>
+      <div className={`mono-chrome mono-drift mono-topright${chromeState}`}>
+        <button
+          type="button"
+          className="mono-queue-toggle"
+          aria-label={`Queue, ${queueTotal} pending`}
+          onClick={toggleQueue}
+        >
+          <span className={`mono-live-dot${queueBusy ? " is-pulsing" : ""}`} aria-hidden="true" />
+          queue/{queueTotal}
+        </button>
+        <button type="button" className="mono-contribute" onClick={openEditor}>
+          contribute
+        </button>
+      </div>
+
+      {playing && selectedRevision ? (
+        <div className="mono-ghost" aria-hidden="true">
+          {seqTag(selectedRevision.sequence)}
+        </div>
+      ) : null}
+
+      {toast ? (
+        <div className="mono-toast-wrap">
+          <div className="mono-toast" role="status">
+            {toast}
+          </div>
+        </div>
+      ) : null}
+
+      {!panelOpen ? (
+        <>
+          <div className={`mono-chrome mono-revlabel${chromeState}`} aria-live="polite">
+            {selectedRevision
+              ? `${seqTag(selectedRevision.sequence)} — ${selectedRevision.author}`
+              : "opening the archive…"}
+          </div>
+          <div className={`mono-chrome mono-hints${chromeState}`}>
+            <span className="mono-hint-text">
+              scroll to zoom · double-click to zoom · ←→ scrub · space play
+            </span>
+            <span className="mono-zoom-control">
+              <button
+                type="button"
+                aria-label="Zoom out"
+                onClick={() => zoomAt(window.innerWidth / 2, window.innerHeight / 2, 0.8)}
+              >
+                [−]
+              </button>
+              {Math.round(view.zoom * 100)}%
+              <button
+                type="button"
+                aria-label="Zoom in"
+                onClick={() => zoomAt(window.innerWidth / 2, window.innerHeight / 2, 1.25)}
+              >
+                [+]
+              </button>
+            </span>
+          </div>
+          <div
+            className="mono-hotspot"
+            aria-hidden="true"
+            onPointerEnter={() => {
+              setHistoryOpen(true);
+              wake();
+            }}
+            onClick={() => {
+              setHistoryOpen(true);
+              wake();
+            }}
+          />
+        </>
+      ) : null}
+
+      {showHistory && selectedRevision && headRevision ? (
+        <section
+          className="mono-strip"
+          aria-label="Revision history"
+          onPointerLeave={() => {
+            if (playing || compareOn) return;
+            setHistoryOpen(false);
+            setHoverIdx(-1);
+            setConfirmRestore(false);
+            wake();
+          }}
+        >
+          <div className="mono-history-row">
+            <button
+              type="button"
+              className="mono-play"
+              aria-label={playing ? "Pause timelapse" : "Play timelapse"}
+              onClick={togglePlay}
+            >
+              {playing ? "[⏸]" : "[▶]"}
+            </button>
+            <div className="mono-track">
+              <span className="mono-track-line" aria-hidden="true" />
+              {revisions.map((revision, index) => (
+                <button
+                  key={revision.id}
+                  type="button"
+                  className={`mono-tick${
+                    index === selectedIndex
+                      ? " is-selected"
+                      : index === hoverIdx
+                        ? " is-hovered"
+                        : ""
+                  }`}
+                  style={{ left: `${tickLeft(index)}%` }}
+                  aria-label={`${seqTag(revision.sequence)} — ${revision.author}`}
+                  aria-current={index === selectedIndex ? "true" : undefined}
+                  onClick={() => selectRevision(index)}
+                  onPointerEnter={() => setHoverIdx(index)}
+                  onPointerLeave={() => setHoverIdx(-1)}
+                >
+                  <span />
+                </button>
+              ))}
+              {hoverRevision ? (
+                <div className="mono-tip" style={{ left: `${tickLeft(hoverIdx)}%` }}>
+                  {seqTag(hoverRevision.sequence)} · {hoverRevision.author} ·{" "}
+                  {hoverRevision.prompt}
+                </div>
+              ) : null}
+            </div>
+            <output className="mono-counter">
+              {pad3(selectedRevision.sequence)} / {pad3(headRevision.sequence)}
+            </output>
+          </div>
+          <div className="mono-meta-row">
+            <span className="mono-meta">
+              {selectedRevision.author} · &quot;{selectedRevision.prompt}&quot;
+            </span>
+            <div className="mono-meta-actions">
+              <button
+                type="button"
+                className={`mono-action${compareOn ? " is-accent" : ""}`}
+                disabled={selectedIndex === 0}
+                aria-pressed={compareOn}
+                onClick={() => {
+                  if (selectedIndex === 0) return;
+                  setCompareOn((value) => !value);
+                  setPlaying(false);
+                  wake();
+                }}
+              >
+                {compareOn ? "[x] compare" : "[ ] compare"}
+              </button>
+              {notCurrent ? (
+                <button
+                  type="button"
+                  className={`mono-action${confirmRestore ? " is-accent" : ""}`}
+                  onClick={() => {
+                    if (confirmRestore) void submitRevert();
+                    else setConfirmRestore(true);
+                    wake();
+                  }}
+                >
+                  {confirmRestore ? "confirm restore →" : "restore this look"}
+                </button>
+              ) : null}
+              {notCurrent ? (
+                <button type="button" className="mono-action is-accent" onClick={returnToCurrent}>
+                  return to current
+                </button>
+              ) : null}
+            </div>
+          </div>
+        </section>
+      ) : null}
+
+      {queueOpen ? (
+        <section className="mono-strip" aria-label="Contribution queue">
+          <div className="mono-strip-head">
+            <span className="mono-strip-summary">
+              queue — {activity.queue.queued} waiting · {activity.queue.active} making · one
+              contribution at a time
+            </span>
+            <button
+              type="button"
+              className="mono-strip-close"
+              aria-label="Close queue"
+              onClick={toggleQueue}
+            >
+              ×
+            </button>
+          </div>
+          <div className="mono-queue-list">
+            {queueEntries.map((entry, index) => (
+              <div
+                key={entry.id}
+                className="mono-queue-entry"
+                style={{ "--stagger": `${index * 70}ms` } as CSSProperties}
+              >
+                <span className="mono-queue-author">{entry.author}</span>
+                <span className={`mono-queue-state${entry.accent ? " is-accent" : ""}`}>
+                  {entry.state}
+                </span>
+                <p>{entry.prompt}</p>
+              </div>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      {editOpen ? (
+        <section className="mono-strip" aria-label="Contribute an edit">
+          <div className="mono-strip-head">
+            <div className="mono-steps">
+              <span className={`mono-step${step === 1 ? " is-active" : ""}`}>01 patch</span>
+              <span className={`mono-step${step === 2 ? " is-active" : ""}`}>02 mask</span>
+              <span className={`mono-step${step === 3 ? " is-active" : ""}`}>03 prompt</span>
+            </div>
+            <button
+              type="button"
+              className="mono-strip-close"
+              aria-label="Close contribution"
+              onClick={closeEditor}
+            >
+              ×
+            </button>
+          </div>
+          {step === 1 ? (
+            <div className="mono-edit-row">
+              <span className="mono-edit-hint">
+                drag the outlined patch anywhere on the artwork · arrow keys nudge
+              </span>
+              <button
+                type="button"
+                className="mono-action is-accent"
+                onClick={() => {
+                  setStep(2);
+                  wake();
+                }}
+              >
+                use this patch →
+              </button>
+            </div>
+          ) : null}
+          {step === 2 ? (
+            <div className="mono-edit-row">
+              <span className="mono-edit-hint">paint inside the patch to mark what may change</span>
+              <button
+                type="button"
+                className="mono-action"
+                disabled={strokes.length === 0}
+                onClick={() => setStrokes((current) => current.slice(0, -1))}
+              >
+                [undo]
+              </button>
+              <button
+                type="button"
+                className="mono-action"
+                disabled={!validMask}
+                onClick={() => {
+                  setStrokes([]);
+                  setFillMask(false);
+                }}
+              >
+                [clear]
+              </button>
+              <button
+                type="button"
+                className={`mono-action${fillMask ? " is-accent" : ""}`}
+                aria-pressed={fillMask}
+                onClick={() => {
+                  setFillMask((value) => {
+                    if (!value) setStrokes([]);
+                    return !value;
+                  });
+                }}
+              >
+                {fillMask ? "[x] fit whole object" : "[ ] fit whole object"}
+              </button>
+              <button
+                type="button"
+                className={`mono-action${validMask ? " is-accent" : ""}`}
+                disabled={!validMask}
+                onClick={() => {
+                  setStep(3);
+                  wake();
+                }}
+              >
+                continue →
+              </button>
+            </div>
+          ) : null}
+          {step === 3 ? (
+            <div className="mono-edit-form">
+              <input
+                className="mono-input"
+                value={prompt}
+                maxLength={500}
+                placeholder="describe the change…"
+                aria-label="Describe the change"
+                disabled={submitted}
+                onChange={(event) => setPrompt(event.target.value)}
+              />
+              <input
+                className="mono-input is-name"
+                value={displayName}
+                maxLength={32}
+                aria-label="Name shown in history"
+                disabled={submitted}
+                onChange={(event) => setDisplayName(event.target.value)}
+              />
+              {openaiAvailable ? (
+                <button
+                  type="button"
+                  className={`mono-action${executionMode === "openai" ? " is-accent" : ""}`}
+                  aria-pressed={executionMode === "openai"}
+                  disabled={submitted}
+                  onClick={() =>
+                    setExecutionMode((mode) => (mode === "openai" ? "demo" : "openai"))
+                  }
+                >
+                  {executionMode === "openai" ? "[x] live ai edit" : "[ ] live ai edit"}
+                </button>
+              ) : null}
+              <button
+                type="button"
+                className={`mono-action${canSubmit || submitted ? " is-accent" : ""}`}
+                disabled={!canSubmit}
+                onClick={() => void submitEdit()}
+              >
+                {submitLabel}
+              </button>
+            </div>
+          ) : null}
+          {submitted && job && headRevision ? (
+            <p className="mono-note">
+              queued{job.position ? ` — position ${job.position}` : ""} · based on{" "}
+              {seqTag(headRevision.sequence)} · accepted edits are permanent
+            </p>
+          ) : null}
+          {submitError ? (
+            <p className="mono-error-line" role="alert">
+              {submitError}
+            </p>
+          ) : null}
+        </section>
+      ) : null}
+
+      {loadingError ? (
+        <div className="mono-error-panel" role="alert">
+          <p>{loadingError}</p>
+          <button
+            type="button"
+            onClick={() => {
+              refreshHistory().catch((error: unknown) => {
+                setLoadingError(
+                  error instanceof Error ? error.message : "The archive could not be opened.",
+                );
+              });
+            }}
+          >
+            try again
+          </button>
+        </div>
+      ) : null}
+    </main>
   );
 }
