@@ -301,6 +301,13 @@ body {
   box-shadow: 0 0 0 9999px rgba(var(--ink), 0.3);
 }
 
+.mono-patch.is-masking {
+  border-color: rgba(255, 255, 255, 0.9);
+  box-shadow:
+    0 0 0 9999px rgba(var(--ink), 0.3),
+    0 0 0 3px rgba(224, 118, 95, 0.55);
+}
+
 .mono-patch.is-draggable {
   cursor: grab;
 }
@@ -327,12 +334,57 @@ body {
   inset: 0;
   width: 100%;
   height: 100%;
-  cursor: crosshair;
+  background: rgba(224, 118, 95, 0.04);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.2);
+  cursor:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='28' height='28' viewBox='0 0 28 28'%3E%3Ccircle cx='14' cy='14' r='9' fill='none' stroke='white' stroke-width='1.5'/%3E%3Cpath d='M14 2v5M14 21v5M2 14h5M21 14h5' stroke='%23e0765f' stroke-width='1.5'/%3E%3C/svg%3E")
+      14 14,
+    crosshair;
   touch-action: none;
+  transition: background 140ms ease, box-shadow 140ms ease;
+}
+
+.mono-mask-canvas:hover {
+  background: rgba(224, 118, 95, 0.09);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.45);
+}
+
+.mono-mask-canvas:active {
+  background: rgba(224, 118, 95, 0.13);
 }
 
 .mono-mask-canvas.is-locked {
   pointer-events: none;
+}
+
+.mono-mask-instruction {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transform: translate(-50%, -50%);
+  padding: 7px 9px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  background: rgba(var(--ink), 0.72);
+  color: #fff;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  line-height: 1.45;
+  letter-spacing: 0.02em;
+  text-shadow: var(--over-image-shadow);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.mono-mask-brush {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  border: 1px solid var(--accent);
+  border-radius: 50%;
+  box-shadow: 0 0 0 3px rgba(224, 118, 95, 0.18);
 }
 
 /* Scrims */

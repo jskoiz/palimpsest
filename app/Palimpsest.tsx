@@ -1139,7 +1139,7 @@ export default function Palimpsest() {
             ) : null}
             {editOpen ? (
               <div
-                className={`mono-patch${step === 1 && !submitted ? " is-draggable" : " is-set"}`}
+                className={`mono-patch${step === 1 && !submitted ? " is-draggable" : " is-set"}${step === 2 && !submitted ? " is-masking" : ""}`}
                 style={patchStyle}
                 role="button"
                 aria-label="Selected edit patch. Drag to move it. Use the arrow keys to nudge it."
@@ -1157,12 +1157,22 @@ export default function Palimpsest() {
                     className={`mono-mask-canvas${step !== 2 ? " is-locked" : ""}`}
                     width={editRegion.region.width}
                     height={editRegion.region.height}
-                    aria-label="Paint the mask for this edit. Use fit whole object for a keyboard-accessible alternative."
+                    aria-label="Drag to paint the part of this patch that may change. Use the entire patch button for a keyboard-accessible alternative."
                     onPointerDown={maskDown}
                     onPointerMove={maskMove}
                     onPointerUp={maskUp}
                     onPointerCancel={maskUp}
                   />
+                ) : null}
+                {step === 2 && !submitted && !validMask ? (
+                  <span className="mono-mask-instruction" aria-hidden="true">
+                    <span className="mono-mask-brush" />
+                    <span>
+                      drag to paint
+                      <br />
+                      what may change
+                    </span>
+                  </span>
                 ) : null}
               </div>
             ) : null}
@@ -1453,7 +1463,9 @@ export default function Palimpsest() {
           ) : null}
           {step === 2 ? (
             <div className="mono-edit-row">
-              <span className="mono-edit-hint">paint inside the patch to mark what may change</span>
+              <span className="mono-edit-hint">
+                drag your cursor inside the patch to paint what may change
+              </span>
               <button
                 type="button"
                 className="mono-action"
@@ -1484,7 +1496,7 @@ export default function Palimpsest() {
                   });
                 }}
               >
-                {fillMask ? "[x] fit whole object" : "[ ] fit whole object"}
+                {fillMask ? "[x] use entire patch" : "[ ] use entire patch"}
               </button>
               <button
                 type="button"
