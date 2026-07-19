@@ -14,6 +14,9 @@ import {
   validateRegion,
 } from "../lib/palimpsest/domain.mjs";
 import {
+  canvasPanBounds,
+  canvasViewCanPan,
+  constrainCanvasView,
   nudgeEditRegion,
   positionEditRegion,
   timelineIndexAtPosition,
@@ -256,6 +259,36 @@ test("keyboard nudging crosses tile seams without escaping the artwork", () => {
     region: { x: 640, y: 704, width: 384, height: 320 },
   };
   assert.deepEqual(nudgeEditRegion(artworkEdge, 32, 32), artworkEdge);
+});
+
+test("portrait cover canvases pan horizontally at base zoom without exposing gaps", () => {
+  assert.deepEqual(canvasPanBounds(390, 844, 1), {
+    minX: -227,
+    maxX: 227,
+    minY: 0,
+    maxY: 0,
+  });
+  assert.equal(canvasViewCanPan({ zoom: 1 }, 390, 844), true);
+  assert.deepEqual(constrainCanvasView({ zoom: 1, x: 500, y: 80 }, 390, 844), {
+    zoom: 1,
+    x: 227,
+    y: 0,
+  });
+});
+
+test("landscape and zoomed square canvases stay bounded on every hidden axis", () => {
+  assert.deepEqual(constrainCanvasView({ zoom: 1, x: -20, y: -500 }, 844, 390), {
+    zoom: 1,
+    x: 0,
+    y: -227,
+  });
+  assert.equal(canvasViewCanPan({ zoom: 1 }, 800, 800), false);
+  assert.equal(canvasViewCanPan({ zoom: 2 }, 800, 800), true);
+  assert.deepEqual(constrainCanvasView({ zoom: 2, x: 900, y: -900 }, 800, 800), {
+    zoom: 2,
+    x: 0,
+    y: -800,
+  });
 });
 
 test("timeline dragging selects the nearest revision and clamps to the track", () => {

@@ -11,6 +11,8 @@ import type {
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ARTWORK_SIZE, maskBlendInset } from "@/lib/palimpsest/domain.mjs";
 import {
+  canvasViewCanPan,
+  constrainCanvasView,
   nudgeEditRegion,
   positionEditRegion,
   timelineIndexAtPosition,
@@ -316,7 +318,9 @@ export default function Palimpsest() {
   const [hoverIdx, setHoverIdx] = useState(-1);
   const [timelineDragging, setTimelineDragging] = useState(false);
   const [view, setView] = useState({ zoom: 1, x: 0, y: 0 });
+  const [viewport, setViewport] = useState({ width: 0, height: 0 });
   const [panning, setPanning] = useState(false);
+  const [panPointerFocused, setPanPointerFocused] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
   const [step, setStep] = useState<1 | 2 | 3>(1);
@@ -341,7 +345,7 @@ export default function Palimpsest() {
   const deepTimer = useRef<number | null>(null);
   const toastTimer = useRef<number | null>(null);
   const closeTimer = useRef<number | null>(null);
-  const panStart = useRef<{ x: number; y: number } | null>(null);
+  const panStart = useRef<{ pointerId: number; x: number; y: number } | null>(null);
   const patchDrag = useRef<{ x: number; y: number } | null>(null);
   const compareDrag = useRef(false);
   const timelineDrag = useRef<number | null>(null);
@@ -362,6 +366,7 @@ export default function Palimpsest() {
   const queueTotal = activity.queue.queued + activity.queue.active;
   const queueBusy = activity.queue.active > 0 || jobActive;
   const openaiAvailable = Boolean(history?.editing.openaiAvailable);
+  const canPanCanvas = canvasViewCanPan(view, viewport.width, viewport.height);
 
   const latest = useRef({
     panelOpen,
@@ -393,6 +398,19 @@ export default function Palimpsest() {
       currentState,
     };
   });
+
+  useEffect(() => {
+    const syncViewport = () => {
+      const next = { width: window.innerWidth, height: window.innerHeight };
+      setViewport((current) =>
+        current.width === next.width && current.height === next.height ? current : next,
+      );
+      setView((current) => constrainCanvasView(current, next.width, next.height));
+    };
+    syncViewport();
+    window.addEventListener("resize", syncViewport);
+    return () => window.removeEventListener("resize", syncViewport);
+  }, []);
 
   const armIdleTimers = useCallback(() => {
     if (idleTimer.current) window.clearTimeout(idleTimer.current);
@@ -637,13 +655,16 @@ export default function Palimpsest() {
   const zoomAt = useCallback((cx: number, cy: number, factor: number) => {
     setView((current) => {
       const zoom = Math.max(1, Math.min(4, current.zoom * factor));
-      if (zoom === 1) return { zoom: 1, x: 0, y: 0 };
       const scale = zoom / current.zoom;
-      return {
-        zoom,
-        x: cx - (cx - current.x) * scale,
-        y: cy - (cy - current.y) * scale,
-      };
+      const next =
+        zoom === current.zoom
+          ? current
+          : {
+              zoom,
+              x: cx - (cx - current.x) * scale,
+              y: cy - (cy - current.y) * scale,
+            };
+      return constrainCanvasView(next, window.innerWidth, window.innerHeight);
     });
   }, []);
 
@@ -763,7 +784,7 @@ export default function Palimpsest() {
         case "ArrowRight":
         case "ArrowUp":
         case "ArrowDown": {
-          if (target?.closest?.("[role=slider]")) break;
+          if (target?.closest?.("[role=slider], [data-canvas-pan]")) break;
           if (current.editOpen) {
             if (current.step === 1 && !current.submitted) {
               const amount = event.shiftKey ? 32 : 8;
@@ -895,20 +916,59 @@ export default function Palimpsest() {
   };
 
   const panDown = (event: ReactPointerEvent<HTMLDivElement>) => {
-    panStart.current = { x: event.clientX - view.x, y: event.clientY - view.y };
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    panStart.current = {
+      pointerId: event.pointerId,
+      x: event.clientX - view.x,
+      y: event.clientY - view.y,
+    };
     setPanning(true);
+    setPanPointerFocused(true);
     event.currentTarget.setPointerCapture(event.pointerId);
   };
 
   const panMove = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (!panStart.current) return;
+    if (!panStart.current || panStart.current.pointerId !== event.pointerId) return;
     const start = panStart.current;
-    setView((current) => ({ ...current, x: event.clientX - start.x, y: event.clientY - start.y }));
+    setView((current) =>
+      constrainCanvasView(
+        { ...current, x: event.clientX - start.x, y: event.clientY - start.y },
+        window.innerWidth,
+        window.innerHeight,
+      ),
+    );
   };
 
-  const panUp = () => {
+  const panUp = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (panStart.current?.pointerId !== event.pointerId) return;
     panStart.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
     setPanning(false);
+  };
+
+  const panKey = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    const amount = event.shiftKey ? 120 : 48;
+    const deltas: Record<string, [number, number]> = {
+      ArrowLeft: [amount, 0],
+      ArrowRight: [-amount, 0],
+      ArrowUp: [0, amount],
+      ArrowDown: [0, -amount],
+    };
+    if (event.key !== "Home" && !deltas[event.key]) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setPanPointerFocused(false);
+    setView((current) => {
+      const [deltaX, deltaY] = deltas[event.key] ?? [0, 0];
+      const next =
+        event.key === "Home"
+          ? { ...current, x: 0, y: 0 }
+          : { ...current, x: current.x + deltaX, y: current.y + deltaY };
+      return constrainCanvasView(next, window.innerWidth, window.innerHeight);
+    });
+    wake();
   };
 
   const compareDown = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -1178,14 +1238,21 @@ export default function Palimpsest() {
         </div>
       ) : null}
 
-      {view.zoom > 1 ? (
+      {canPanCanvas ? (
         <div
-          className="mono-pan"
-          aria-hidden="true"
+          className={`mono-pan${panPointerFocused ? " is-pointer-focused" : ""}`}
+          data-canvas-pan
+          data-testid="canvas-pan"
+          role="group"
+          tabIndex={0}
+          aria-label="Artwork viewport. Drag to explore hidden areas. Use the arrow keys to move around and Home to recenter."
+          aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown Home"
           onPointerDown={panDown}
           onPointerMove={panMove}
           onPointerUp={panUp}
           onPointerCancel={panUp}
+          onKeyDown={panKey}
+          onBlur={() => setPanPointerFocused(false)}
         />
       ) : null}
 
@@ -1320,6 +1387,11 @@ export default function Palimpsest() {
               : "opening the archive…"}
           </div>
           <div className={`mono-chrome mono-hints${chromeState}`}>
+            {canPanCanvas ? (
+              <span className="mono-pan-hint" aria-hidden="true">
+                drag to move ·
+              </span>
+            ) : null}
             <span className="mono-hint-text">
               scroll to zoom · double-click to zoom · ←→ scrub · space play
             </span>

@@ -265,6 +265,14 @@ body {
   cursor: grabbing;
 }
 
+.mono-pan:focus-visible {
+  outline-offset: -4px;
+}
+
+.mono-pan.is-pointer-focused:focus-visible {
+  outline: none;
+}
+
 /* Artwork-space overlays: patch echo, edit patch, mask canvas */
 
 .mono-overlays {
@@ -496,6 +504,11 @@ body {
 
 .mono-hint-text {
   opacity: 0.7;
+}
+
+.mono-pan-hint {
+  opacity: 0.85;
+  white-space: nowrap;
 }
 
 .mono-zoom-control {
