@@ -3,13 +3,14 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
+  ARTWORK_SIZE,
   DomainError,
   assertFreshBase,
   buildOpenAiEditPrompt,
   createDisplayMaskSvg,
   displayMaskForLayer,
   maskBlendInset,
-  resolveTileLayers,
+  resolveLayerStack,
   serializeHistory,
   validateRegion,
 } from "../lib/palimpsest/domain.mjs";
@@ -17,8 +18,11 @@ import {
   canvasPanBounds,
   canvasViewCanPan,
   constrainCanvasView,
+  generationFrameForRegion,
   nudgeEditRegion,
   positionEditRegion,
+  regionRelativeToFrame,
+  regionsOverlap,
   timelineIndexAtPosition,
 } from "../lib/palimpsest/geometry.mjs";
 
@@ -40,8 +44,6 @@ test("revision ordering uses immutable sequence rather than timestamps", () => {
       regionY: 0,
       regionWidth: 128,
       regionHeight: 128,
-      tileX: 1,
-      tileY: 0,
     },
     {
       id: "r0",
@@ -66,8 +68,6 @@ test("revision ordering uses immutable sequence rather than timestamps", () => {
       regionY: 20,
       regionWidth: 256,
       regionHeight: 256,
-      tileX: 0,
-      tileY: 0,
     },
   ];
 
@@ -77,19 +77,71 @@ test("revision ordering uses immutable sequence rather than timestamps", () => {
   );
 });
 
-test("region constraints accept exact boundaries and reject unsafe masks", () => {
-  const boundary = validateRegion({
-    tile: { x: 1, y: 1 },
-    region: { x: 512, y: 768, width: 512, height: 256 },
+test("global region constraints accept seam crossing and every artwork boundary", () => {
+  const seamCrossing = validateRegion({
+    region: { x: 900, y: 900, width: 256, height: 256 },
     fill: true,
     strokes: [],
   });
-  assert.deepEqual(boundary.region, { x: 512, y: 768, width: 512, height: 256 });
+  assert.deepEqual(seamCrossing.region, {
+    x: 900,
+    y: 900,
+    width: 256,
+    height: 256,
+  });
 
+  const boundaryRegions = [
+    { x: 0, y: 700, width: 64, height: 64 },
+    { x: 700, y: 0, width: 64, height: 64 },
+    { x: ARTWORK_SIZE - 64, y: 700, width: 64, height: 64 },
+    { x: 700, y: ARTWORK_SIZE - 64, width: 64, height: 64 },
+  ];
+  for (const region of boundaryRegions) {
+    assert.deepEqual(validateRegion({ region, fill: true }).region, region);
+  }
+
+  const outsideRegions = [
+    { x: -1, y: 700, width: 64, height: 64 },
+    { x: 700, y: -1, width: 64, height: 64 },
+    { x: ARTWORK_SIZE - 63, y: 700, width: 64, height: 64 },
+    { x: 700, y: ARTWORK_SIZE - 63, width: 64, height: 64 },
+  ];
+  for (const region of outsideRegions) {
+    expectCode(() => validateRegion({ region, fill: true }), "REGION_OUT_OF_BOUNDS");
+  }
+});
+
+test("region constraints reject legacy tile fields and unsafe masks", () => {
   expectCode(
     () =>
       validateRegion({
         tile: { x: 0, y: 0 },
+        region: { x: 0, y: 0, width: 128, height: 128 },
+        fill: true,
+      }),
+    "INVALID_REQUEST",
+  );
+  expectCode(
+    () =>
+      validateRegion({
+        region: { x: 0, y: 0, width: 128, height: 128, tile: { x: 0, y: 0 } },
+        fill: true,
+      }),
+    "INVALID_REQUEST",
+  );
+
+  for (const region of [
+    { x: 0, y: 0, width: 63, height: 64 },
+    { x: 0, y: 0, width: 64, height: 63 },
+    { x: 0, y: 0, width: 513, height: 64 },
+    { x: 0, y: 0, width: 64, height: 513 },
+  ]) {
+    expectCode(() => validateRegion({ region, fill: true }), "REGION_OUT_OF_BOUNDS");
+  }
+
+  expectCode(
+    () =>
+      validateRegion({
         region: { x: 0, y: 0, width: 512, height: 257 },
         fill: true,
       }),
@@ -98,16 +150,6 @@ test("region constraints accept exact boundaries and reject unsafe masks", () =>
   expectCode(
     () =>
       validateRegion({
-        tile: { x: 0, y: 0 },
-        region: { x: 900, y: 0, width: 128, height: 128 },
-        fill: true,
-      }),
-    "REGION_OUT_OF_BOUNDS",
-  );
-  expectCode(
-    () =>
-      validateRegion({
-        tile: { x: 0, y: 0 },
         region: { x: 0, y: 0, width: 128, height: 128 },
         fill: false,
         strokes: [],
@@ -117,7 +159,6 @@ test("region constraints accept exact boundaries and reject unsafe masks", () =>
   expectCode(
     () =>
       validateRegion({
-        tile: { x: 0, y: 0 },
         region: { x: 0, y: 0, width: 128, height: 128 },
         strokes: [{ width: 16, points: [{ x: 129, y: 20 }] }],
       }),
@@ -136,10 +177,11 @@ test("filled object masks reserve a feathered blend margin", () => {
   assert.match(svg, /<rect x="124" y="224" width="336" height="272" fill="white"\/>/);
 });
 
-test("live image patches render as complete replacement tiles", () => {
-  assert.equal(displayMaskForLayer("openai", "display-mask"), null);
+test("generated layers retain the reservation mask", () => {
+  assert.equal(displayMaskForLayer("openai", "display-mask"), "display-mask");
   assert.equal(displayMaskForLayer("demo", "display-mask"), "display-mask");
-  assert.equal(displayMaskForLayer("seed", null), null);
+  assert.equal(displayMaskForLayer("openai", null), null);
+  assert.equal(displayMaskForLayer("seed", "unexpected-mask"), null);
 });
 
 test("request handlers rely on packaged migrations instead of runtime schema DDL", async () => {
@@ -174,7 +216,7 @@ test("history serialization is stable, shareable, unicode-safe, and secret-free"
       prompt: "Add a vermilion thread <without rewriting history>.",
       createdAt: Date.UTC(2026, 6, 17, 21, 30),
       origin: "demo",
-      regionX: 12,
+      regionX: 1036,
       regionY: 24,
       regionWidth: 320,
       regionHeight: 256,
@@ -191,74 +233,124 @@ test("history serialization is stable, shareable, unicode-safe, and secret-free"
   assert.equal(revision.createdAt, "2026-07-17T21:30:00.000Z");
   assert.equal(revision.sharePath, "/?revision=r%C3%A9vision-1");
   assert.deepEqual(revision.region, {
-    x: 12,
+    x: 1036,
     y: 24,
     width: 320,
     height: 256,
-    tile: { x: 1, y: 0 },
   });
   assert.equal("workerToken" in revision, false);
   assert.equal("r2Key" in revision, false);
   assert.equal("openaiKey" in revision, false);
 });
 
-test("revert creates a new snapshot state without mutating its target", () => {
-  const baseTiles = [
-    { tileX: 0, tileY: 0, blobId: "base-00" },
-    { tileX: 1, tileY: 0, blobId: "base-10" },
-    { tileX: 0, tileY: 1, blobId: "base-01" },
-    { tileX: 1, tileY: 1, blobId: "base-11" },
-  ];
+test("global layer stacks preserve revert history without mutating inputs", () => {
   const revisions = [
-    { id: "r0", sequence: 0, origin: "seed" },
-    { id: "r1", sequence: 1, origin: "demo" },
+    { id: "r4", sequence: 4, origin: "openai" },
     { id: "r2", sequence: 2, origin: "openai" },
+    { id: "r0", sequence: 0, origin: "seed" },
     { id: "r3", sequence: 3, origin: "revert", revertTargetRevisionId: "r1" },
+    { id: "r1", sequence: 1, origin: "demo" },
   ];
-  const patches = [
-    { revisionId: "r1", tileX: 0, tileY: 0, blobId: "p1" },
-    { revisionId: "r2", tileX: 0, tileY: 0, blobId: "p2" },
+  const layers = [
+    { revisionId: "r1", frame: { x: 0, y: 0, width: 1024, height: 1024 }, blobId: "p1" },
+    { revisionId: "r2", frame: { x: 512, y: 512, width: 1024, height: 1024 }, blobId: "p2" },
+    { revisionId: "r4", frame: { x: 1024, y: 1024, width: 1024, height: 1024 }, blobId: "p4" },
   ];
-  const tiles = resolveTileLayers(revisions, baseTiles, patches);
-  assert.deepEqual(tiles[0].layers.map((layer) => layer.blobId), ["p1"]);
-  assert.deepEqual(patches.map((patch) => patch.blobId), ["p1", "p2"]);
+  const stack = resolveLayerStack(revisions, layers);
+  assert.deepEqual(stack.map((layer) => layer.blobId), ["p1", "p4"]);
+  assert.deepEqual(layers.map((layer) => layer.blobId), ["p1", "p2", "p4"]);
 });
 
-test("patch positioning follows the pointer while remaining inside one tile", () => {
-  const region = {
-    tile: { x: 0, y: 0 },
-    region: { x: 320, y: 352, width: 384, height: 320 },
-  };
+test("patch positioning follows the pointer continuously across seams", () => {
+  const region = { x: 320, y: 352, width: 384, height: 320 };
 
   assert.deepEqual(positionEditRegion(region, 48, 72), {
-    tile: { x: 0, y: 0 },
-    region: { x: 48, y: 72, width: 384, height: 320 },
+    x: 48,
+    y: 72,
+    width: 384,
+    height: 320,
   });
   assert.deepEqual(positionEditRegion(region, 930, 980), {
-    tile: { x: 1, y: 1 },
-    region: { x: 0, y: 0, width: 384, height: 320 },
+    x: 930,
+    y: 980,
+    width: 384,
+    height: 320,
   });
   assert.deepEqual(positionEditRegion(region, -200, 2400), {
-    tile: { x: 0, y: 1 },
-    region: { x: 0, y: 704, width: 384, height: 320 },
+    x: 0,
+    y: 1728,
+    width: 384,
+    height: 320,
   });
 });
 
-test("keyboard nudging crosses tile seams without escaping the artwork", () => {
-  const rightEdge = {
-    tile: { x: 0, y: 0 },
-    region: { x: 640, y: 704, width: 384, height: 320 },
-  };
-  assert.deepEqual(nudgeEditRegion(rightEdge, 8, 8), {
-    tile: { x: 1, y: 1 },
-    region: { x: 0, y: 0, width: 384, height: 320 },
+test("keyboard nudging crosses seams without snapping or escaping the artwork", () => {
+  const atSeams = { x: 640, y: 704, width: 384, height: 320 };
+  assert.deepEqual(nudgeEditRegion(atSeams, 8, 8), {
+    x: 648,
+    y: 712,
+    width: 384,
+    height: 320,
   });
 
-  const artworkEdge = {
-    tile: { x: 1, y: 1 },
-    region: { x: 640, y: 704, width: 384, height: 320 },
-  };
+  const artworkEdge = { x: 1664, y: 1728, width: 384, height: 320 };
   assert.deepEqual(nudgeEditRegion(artworkEdge, 32, 32), artworkEdge);
+});
+
+test("generation frames center seam-crossing regions and clamp at every artwork edge", () => {
+  assert.deepEqual(
+    generationFrameForRegion({ x: 896, y: 832, width: 256, height: 384 }),
+    { x: 512, y: 512, width: 1024, height: 1024 },
+  );
+
+  const corners = [
+    [{ x: 0, y: 0, width: 64, height: 64 }, { x: 0, y: 0, width: 1024, height: 1024 }],
+    [{ x: 1984, y: 0, width: 64, height: 64 }, { x: 1024, y: 0, width: 1024, height: 1024 }],
+    [{ x: 0, y: 1984, width: 64, height: 64 }, { x: 0, y: 1024, width: 1024, height: 1024 }],
+    [{ x: 1984, y: 1984, width: 64, height: 64 }, { x: 1024, y: 1024, width: 1024, height: 1024 }],
+  ];
+  for (const [region, expectedFrame] of corners) {
+    assert.deepEqual(generationFrameForRegion(region), expectedFrame);
+  }
+});
+
+test("global regions convert to frame-local mask coordinates", () => {
+  const region = { x: 896, y: 832, width: 256, height: 384 };
+  const frame = generationFrameForRegion(region);
+  const frameLocalRegion = regionRelativeToFrame(region, frame);
+  assert.deepEqual(frameLocalRegion, { x: 384, y: 320, width: 256, height: 384 });
+  assert.deepEqual(regionRelativeToFrame(region), frameLocalRegion);
+
+  const svg = createDisplayMaskSvg({
+    region: frameLocalRegion,
+    fill: true,
+    strokes: [],
+  });
+  assert.match(svg, /<rect x="384" y="320" width="256" height="384"\/>/);
+});
+
+test("region overlap requires positive shared area", () => {
+  const leftHalf = { x: 0, y: 0, width: 1024, height: 2048 };
+  const rightHalf = { x: 1024, y: 0, width: 1024, height: 2048 };
+  const seamCrossing = { x: 900, y: 800, width: 256, height: 256 };
+
+  assert.equal(regionsOverlap(leftHalf, rightHalf), false);
+  assert.equal(regionsOverlap(leftHalf, seamCrossing), true);
+  assert.equal(regionsOverlap(rightHalf, seamCrossing), true);
+  assert.equal(
+    regionsOverlap(
+      { x: 0, y: 0, width: 10, height: 10 },
+      { x: 9, y: 9, width: 10, height: 10 },
+    ),
+    true,
+  );
+  assert.equal(
+    regionsOverlap(
+      { x: 0, y: 0, width: 0, height: 10 },
+      { x: 0, y: 0, width: 10, height: 10 },
+    ),
+    false,
+  );
 });
 
 test("portrait cover canvases pan horizontally at base zoom without exposing gaps", () => {
