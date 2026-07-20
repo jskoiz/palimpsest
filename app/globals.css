@@ -170,29 +170,27 @@ body {
 }
 
 .artwork-layers {
+  position: relative;
   width: 100%;
   height: 100%;
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  grid-template-rows: repeat(2, 1fr);
+  overflow: hidden;
   background: var(--canvas);
 }
 
-.tile-stack {
-  position: relative;
-  min-width: 0;
-  min-height: 0;
-  overflow: hidden;
-}
-
-.tile-stack > img {
+.artwork-base-tile,
+.artwork-global-layer {
   position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
   display: block;
   object-fit: fill;
   pointer-events: none;
+}
+
+.artwork-base-tile {
+  z-index: 0;
+}
+
+.artwork-global-layer {
+  z-index: 1;
 }
 
 .mono-seed {
@@ -319,8 +317,50 @@ body {
   white-space: nowrap;
 }
 
+.mono-reservations {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.mono-reservation {
+  position: absolute;
+  z-index: 1;
+  border: 1px dashed rgba(255, 255, 255, 0.58);
+  background: rgba(var(--ink), 0.035);
+  box-shadow: inset 0 0 0 1px rgba(var(--ink), 0.08);
+  color: rgba(255, 255, 255, 0.82);
+}
+
+.mono-reservation.is-active {
+  border-style: solid;
+  border-color: rgba(224, 118, 95, 0.66);
+  background: rgba(224, 118, 95, 0.045);
+}
+
+.mono-reservation.is-local {
+  border-color: rgba(224, 118, 95, 0.9);
+}
+
+.mono-reservation > span {
+  position: absolute;
+  left: 3px;
+  top: 3px;
+  max-width: calc(100% - 6px);
+  overflow: hidden;
+  padding: 2px 4px;
+  background: rgba(var(--ink), 0.6);
+  font-family: var(--font-mono);
+  font-size: 7px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  text-shadow: var(--over-image-shadow);
+  white-space: nowrap;
+}
+
 .mono-patch {
   position: absolute;
+  z-index: 2;
   border: 2px solid var(--accent);
   box-shadow: 0 0 0 9999px rgba(var(--ink), 0.5);
   pointer-events: auto;
@@ -344,6 +384,17 @@ body {
 
 .mono-patch.is-draggable:active {
   cursor: grabbing;
+}
+
+.mono-patch.is-unavailable {
+  border-color: rgba(255, 255, 255, 0.92);
+  background: repeating-linear-gradient(
+    135deg,
+    rgba(224, 118, 95, 0.11) 0,
+    rgba(224, 118, 95, 0.11) 7px,
+    transparent 7px,
+    transparent 14px
+  );
 }
 
 .mono-patch-label {
@@ -505,6 +556,10 @@ body {
 
 .mono-contribute {
   color: var(--accent);
+}
+
+.mono-contribute:disabled {
+  color: rgba(255, 255, 255, 0.38);
 }
 
 .mono-guide-toggle {
@@ -858,6 +913,27 @@ body {
   color: var(--accent);
 }
 
+.mono-overlap-note {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  margin: 8px 0 0;
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 9px;
+}
+
+.mono-overlap-note > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mono-overlap-note > button {
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+
 /* Timelapse ghost counter */
 
 .mono-ghost {
@@ -1187,6 +1263,15 @@ body {
     flex-wrap: wrap;
   }
 
+  .mono-edit-row {
+    flex-wrap: wrap;
+    row-gap: 8px;
+  }
+
+  .mono-edit-hint {
+    flex-basis: 100%;
+  }
+
   .mono-input.is-name {
     flex: 1 1 120px;
   }
@@ -1241,8 +1326,17 @@ body {
 }
 
 @media (max-width: 560px) {
+  .mono-queue-entry:nth-child(4),
   .mono-queue-entry:nth-child(3) {
     display: none;
+  }
+
+  .mono-overlap-note {
+    align-items: flex-start;
+  }
+
+  .mono-overlap-note > span {
+    white-space: normal;
   }
 
   .mono-welcome-controls dl {

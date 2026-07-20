@@ -13,10 +13,20 @@ import { ARTWORK_SIZE, maskBlendInset } from "@/lib/palimpsest/domain.mjs";
 import {
   canvasViewCanPan,
   constrainCanvasView,
+  generationFrameForRegion,
   nudgeEditRegion,
   positionEditRegion,
+  regionRelativeToFrame,
+  regionsOverlap,
   timelineIndexAtPosition,
 } from "@/lib/palimpsest/geometry.mjs";
+
+type Region = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
 
 type Revision = {
   id: string;
@@ -27,13 +37,7 @@ type Revision = {
   createdAt: string;
   origin: "seed" | "demo" | "openai" | "revert";
   status: "accepted";
-  region: {
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-    tile: { x: number; y: number };
-  } | null;
+  region: Region | null;
   revertTargetRevisionId: string | null;
   provenance: string;
   sharePath: string;
@@ -47,13 +51,13 @@ type Layer = {
   url: string;
   sha256: string;
   maskUrl: string | null;
+  frame: Region;
 };
 
 type Tile = {
   x: number;
   y: number;
   base: { blobId: string; url: string; sha256: string };
-  layers: Layer[];
 };
 
 type ArtworkState = {
@@ -62,6 +66,7 @@ type ArtworkState = {
   isCurrent: boolean;
   revision: Revision;
   tiles: Tile[];
+  layers: Layer[];
 };
 
 type HistoryPayload = {
@@ -86,6 +91,16 @@ type HistoryPayload = {
 type ActivityPayload = {
   queue: { queued: number; active: number };
   recent: Revision[];
+  activeRegions: ActiveRegion[];
+};
+
+type ActiveRegion = {
+  jobId: string;
+  author: string;
+  state: string;
+  region: Region;
+  createdAt: string;
+  updatedAt: string;
 };
 
 type Job = {
@@ -108,14 +123,16 @@ type Job = {
   updatedAt: string;
 };
 
+type PendingEdit = {
+  jobId: string;
+  author: string;
+  prompt: string;
+  region: Region | null;
+};
+
 type Stroke = {
   width: number;
   points: Array<{ x: number; y: number }>;
-};
-
-type EditRegion = {
-  tile: { x: number; y: number };
-  region: { x: number; y: number; width: number; height: number };
 };
 
 const terminalJobStates = new Set(["succeeded", "stale", "rejected", "failed"]);
@@ -124,9 +141,16 @@ const AUTO_HIDE = true;
 const IDLE_HIDE_MS = 4000;
 const DEEP_IDLE_MS = 30000;
 const BRUSH_WIDTH = 30;
-const TILE_SIZE = 1024;
-const DEFAULT_REGION = { x: 320, y: 352, width: 384, height: 320 };
+const COLLAB_POLL_MS = 3000;
+const HIDDEN_COLLAB_POLL_MS = 8000;
+const DEFAULT_REGION = { x: 832, y: 864, width: 384, height: 320 };
 const WELCOME_STORAGE_KEY = "palimpsest:welcome:v1";
+
+const EMPTY_ACTIVITY: ActivityPayload = {
+  queue: { queued: 0, active: 0 },
+  recent: [],
+  activeRegions: [],
+};
 
 function pad3(value: number) {
   return String(value).padStart(3, "0");
@@ -145,6 +169,77 @@ function compactTime(date: string) {
   return `${Math.round(hours / 24)}d`;
 }
 
+function regionStyle(region: Region): CSSProperties {
+  return {
+    left: `${(region.x / ARTWORK_SIZE) * 100}%`,
+    top: `${(region.y / ARTWORK_SIZE) * 100}%`,
+    width: `${(region.width / ARTWORK_SIZE) * 100}%`,
+    height: `${(region.height / ARTWORK_SIZE) * 100}%`,
+  };
+}
+
+function findOpenRegion(sequence: number, activeRegions: ActiveRegion[]) {
+  const centered = positionEditRegion(
+    DEFAULT_REGION,
+    DEFAULT_REGION.x,
+    DEFAULT_REGION.y,
+  );
+  const limitX = ARTWORK_SIZE - centered.width;
+  const limitY = ARTWORK_SIZE - centered.height;
+  const phase = sequence * 0.71;
+  for (let index = 0; index < 36; index += 1) {
+    const progress = index / 35;
+    const angle = phase + index * 2.399963229728653;
+    const candidate = positionEditRegion(
+      centered,
+      limitX / 2 + Math.cos(angle) * (limitX / 2) * Math.sqrt(progress),
+      limitY / 2 + Math.sin(angle) * (limitY / 2) * Math.sqrt(progress),
+    );
+    if (!activeRegions.some((active) => regionsOverlap(candidate, active.region))) {
+      return candidate;
+    }
+  }
+  return centered;
+}
+
+function activitySignature(activity: ActivityPayload) {
+  return JSON.stringify({
+    queue: activity.queue,
+    recent: activity.recent.map((revision) => [revision.id, revision.createdAt]),
+    activeRegions: activity.activeRegions.map((active) => [
+      active.jobId,
+      active.author,
+      active.state,
+      active.region.x,
+      active.region.y,
+      active.region.width,
+      active.region.height,
+      active.updatedAt,
+    ]),
+  });
+}
+
+function activeStateLabel(state: ActiveRegion["state"]) {
+  if (state === "queued") return "reserved";
+  if (state === "moderating") return "preparing";
+  if (state === "committing") return "finishing";
+  if (state === "generating") return "generating";
+  return state;
+}
+
+function overlapMessage(active: ActiveRegion) {
+  if (active.state === "queued") {
+    return `${active.author} reserved this area — move your patch into open space.`;
+  }
+  if (active.state === "moderating") {
+    return `${active.author} is preparing an edit here — move your patch into open space.`;
+  }
+  if (active.state === "committing") {
+    return `${active.author} is finishing an edit here — move your patch into open space.`;
+  }
+  return `${active.author} is generating here — move your patch into open space.`;
+}
+
 async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
   const response = await fetch(input, init);
   const body = (await response.json().catch(() => null)) as
@@ -161,36 +256,6 @@ async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
   return body as T;
 }
 
-function TileStack({ tile }: { tile: Tile }) {
-  return (
-    <div className="tile-stack" data-tile={`${tile.x}-${tile.y}`}>
-      <img src={tile.base.url} alt="" draggable={false} crossOrigin="anonymous" />
-      {tile.layers.map((layer) => {
-        const maskStyle = layer.maskUrl
-          ? ({
-              maskImage: `url("${layer.maskUrl}")`,
-              WebkitMaskImage: `url("${layer.maskUrl}")`,
-              maskSize: "100% 100%",
-              WebkitMaskSize: "100% 100%",
-              maskRepeat: "no-repeat",
-              WebkitMaskRepeat: "no-repeat",
-            } as CSSProperties)
-          : undefined;
-        return (
-          <img
-            key={`${layer.revisionId}-${layer.blobId}`}
-            src={layer.url}
-            alt=""
-            draggable={false}
-            crossOrigin="anonymous"
-            style={maskStyle}
-          />
-        );
-      })}
-    </div>
-  );
-}
-
 function ArtworkLayers({
   state,
   className = "",
@@ -205,7 +270,44 @@ function ArtworkLayers({
       aria-label={`Palimpsest, revision ${state.revision.sequence}, ${state.revision.prompt}`}
     >
       {state.tiles.map((tile) => (
-        <TileStack key={`${tile.x}-${tile.y}`} tile={tile} />
+        <img
+          key={`${tile.x}-${tile.y}-${tile.base.blobId}`}
+          className="artwork-base-tile"
+          src={tile.base.url}
+          alt=""
+          draggable={false}
+          crossOrigin="anonymous"
+          data-tile={`${tile.x}-${tile.y}`}
+          style={{
+            left: `${((tile.x * state.artwork.tileSize) / state.artwork.width) * 100}%`,
+            top: `${((tile.y * state.artwork.tileSize) / state.artwork.height) * 100}%`,
+            width: `${(state.artwork.tileSize / state.artwork.width) * 100}%`,
+            height: `${(state.artwork.tileSize / state.artwork.height) * 100}%`,
+          }}
+        />
+      ))}
+      {state.layers.map((layer) => (
+        <img
+          key={`${layer.revisionId}-${layer.blobId}`}
+          className="artwork-global-layer"
+          src={layer.url}
+          alt=""
+          draggable={false}
+          crossOrigin="anonymous"
+          style={{
+            ...regionStyle(layer.frame),
+            ...(layer.maskUrl
+              ? {
+                  maskImage: `url("${layer.maskUrl}")`,
+                  WebkitMaskImage: `url("${layer.maskUrl}")`,
+                  maskSize: "100% 100%",
+                  WebkitMaskSize: "100% 100%",
+                  maskRepeat: "no-repeat",
+                  WebkitMaskRepeat: "no-repeat",
+                }
+              : {}),
+          }}
+        />
       ))}
     </div>
   );
@@ -406,7 +508,8 @@ function WelcomeDrawer({
               <span>03</span>
               <h2>Contribute</h2>
               <p>
-                Place the patch, paint what may change, then describe the edit.
+                Place the patch anywhere. Live outlines show where others are working;
+                every other spot stays open.
               </p>
             </section>
           </div>
@@ -458,52 +561,100 @@ function loadImage(source: string): Promise<HTMLImageElement> {
   });
 }
 
-async function flattenTile(tile: Tile): Promise<Blob> {
-  const canvas = document.createElement("canvas");
-  canvas.width = 1024;
-  canvas.height = 1024;
-  const context = canvas.getContext("2d");
-  if (!context) throw new Error("This browser cannot prepare image edits.");
-  context.drawImage(await loadImage(tile.base.url), 0, 0, 1024, 1024);
-  for (const layer of tile.layers) {
-    const image = await loadImage(layer.url);
-    if (!layer.maskUrl) {
-      context.drawImage(image, 0, 0, 1024, 1024);
-      continue;
-    }
-    const offscreen = document.createElement("canvas");
-    offscreen.width = 1024;
-    offscreen.height = 1024;
-    const layerContext = offscreen.getContext("2d");
-    if (!layerContext) throw new Error("This browser cannot prepare image edits.");
-    layerContext.drawImage(image, 0, 0, 1024, 1024);
-    layerContext.globalCompositeOperation = "destination-in";
-    layerContext.drawImage(await loadImage(layer.maskUrl), 0, 0, 1024, 1024);
-    context.drawImage(offscreen, 0, 0);
-  }
+function canvasBlob(canvas: HTMLCanvasElement, message: string): Promise<Blob> {
   return new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error("The source tile could not be encoded."))), "image/png");
+    canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error(message))), "image/png");
   });
 }
 
+async function flattenArtworkFrame(state: ArtworkState, frame: Region): Promise<Blob> {
+  const composite = document.createElement("canvas");
+  composite.width = state.artwork.width;
+  composite.height = state.artwork.height;
+  const context = composite.getContext("2d");
+  if (!context) throw new Error("This browser cannot prepare image edits.");
+
+  const baseImages = await Promise.all(
+    state.tiles.map(async (tile) => ({ tile, image: await loadImage(tile.base.url) })),
+  );
+  for (const { tile, image } of baseImages) {
+    context.drawImage(
+      image,
+      tile.x * state.artwork.tileSize,
+      tile.y * state.artwork.tileSize,
+      state.artwork.tileSize,
+      state.artwork.tileSize,
+    );
+  }
+
+  const layerImages = await Promise.all(
+    state.layers.map(async (layer) => ({
+      layer,
+      image: await loadImage(layer.url),
+      mask: layer.maskUrl ? await loadImage(layer.maskUrl) : null,
+    })),
+  );
+  for (const { layer, image, mask } of layerImages) {
+    if (!mask) {
+      context.drawImage(
+        image,
+        layer.frame.x,
+        layer.frame.y,
+        layer.frame.width,
+        layer.frame.height,
+      );
+      continue;
+    }
+    const offscreen = document.createElement("canvas");
+    offscreen.width = layer.frame.width;
+    offscreen.height = layer.frame.height;
+    const layerContext = offscreen.getContext("2d");
+    if (!layerContext) throw new Error("This browser cannot prepare image edits.");
+    layerContext.drawImage(image, 0, 0, layer.frame.width, layer.frame.height);
+    layerContext.globalCompositeOperation = "destination-in";
+    layerContext.drawImage(mask, 0, 0, layer.frame.width, layer.frame.height);
+    context.drawImage(offscreen, layer.frame.x, layer.frame.y);
+  }
+
+  const source = document.createElement("canvas");
+  source.width = frame.width;
+  source.height = frame.height;
+  const sourceContext = source.getContext("2d");
+  if (!sourceContext) throw new Error("This browser cannot prepare image edits.");
+  sourceContext.drawImage(
+    composite,
+    frame.x,
+    frame.y,
+    frame.width,
+    frame.height,
+    0,
+    0,
+    frame.width,
+    frame.height,
+  );
+  return canvasBlob(source, "The artwork frame could not be encoded.");
+}
+
 async function providerMask(
-  region: EditRegion["region"],
+  region: Region,
+  frame: Region,
   strokes: Stroke[],
   fill: boolean,
 ): Promise<Blob> {
   const canvas = document.createElement("canvas");
-  canvas.width = 1024;
-  canvas.height = 1024;
+  canvas.width = frame.width;
+  canvas.height = frame.height;
   const context = canvas.getContext("2d");
   if (!context) throw new Error("This browser cannot prepare a mask.");
   context.fillStyle = "#111111";
-  context.fillRect(0, 0, 1024, 1024);
+  context.fillRect(0, 0, frame.width, frame.height);
   context.globalCompositeOperation = "destination-out";
+  const frameRegion = regionRelativeToFrame(region, frame);
   if (fill) {
     const inset = maskBlendInset(region);
     context.clearRect(
-      region.x + inset,
-      region.y + inset,
+      frameRegion.x + inset,
+      frameRegion.y + inset,
       region.width - inset * 2,
       region.height - inset * 2,
     );
@@ -515,29 +666,24 @@ async function providerMask(
       if (!first) continue;
       context.lineWidth = stroke.width;
       context.beginPath();
-      context.moveTo(region.x + first.x, region.y + first.y);
+      context.moveTo(frameRegion.x + first.x, frameRegion.y + first.y);
       if (stroke.points.length === 1) {
-        context.lineTo(region.x + first.x + 0.01, region.y + first.y + 0.01);
+        context.lineTo(frameRegion.x + first.x + 0.01, frameRegion.y + first.y + 0.01);
       } else {
         for (const point of stroke.points.slice(1)) {
-          context.lineTo(region.x + point.x, region.y + point.y);
+          context.lineTo(frameRegion.x + point.x, frameRegion.y + point.y);
         }
       }
       context.stroke();
     }
   }
   context.globalCompositeOperation = "source-over";
-  return new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error("The mask could not be encoded."))), "image/png");
-  });
+  return canvasBlob(canvas, "The mask could not be encoded.");
 }
 
 export default function Palimpsest() {
   const [history, setHistory] = useState<HistoryPayload | null>(null);
-  const [activity, setActivity] = useState<ActivityPayload>({
-    queue: { queued: 0, active: 0 },
-    recent: [],
-  });
+  const [activity, setActivity] = useState<ActivityPayload>(EMPTY_ACTIVITY);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [selectedState, setSelectedState] = useState<ArtworkState | null>(null);
   const [currentState, setCurrentState] = useState<ArtworkState | null>(null);
@@ -563,10 +709,11 @@ export default function Palimpsest() {
   const [welcomeOpen, setWelcomeOpen] = useState(false);
 
   const [step, setStep] = useState<1 | 2 | 3>(1);
-  const [editRegion, setEditRegion] = useState<EditRegion>({
-    tile: { x: 0, y: 0 },
-    region: { ...DEFAULT_REGION },
-  });
+  const [editRegion, setEditRegion] = useState<Region>({ ...DEFAULT_REGION });
+  const [editBase, setEditBase] = useState<{
+    revisionId: string;
+    state: ArtworkState;
+  } | null>(null);
   const [strokes, setStrokes] = useState<Stroke[]>([]);
   const [fillMask, setFillMask] = useState(false);
   const [prompt, setPrompt] = useState("");
@@ -577,15 +724,17 @@ export default function Palimpsest() {
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [confirmRestore, setConfirmRestore] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
-  const [pendingEdit, setPendingEdit] = useState<{ author: string; prompt: string } | null>(null);
+  const [pendingEdit, setPendingEdit] = useState<PendingEdit | null>(null);
 
   const drainInFlight = useRef(false);
+  const activityRequest = useRef<Promise<ActivityPayload> | null>(null);
+  const activitySignatureRef = useRef(activitySignature(EMPTY_ACTIVITY));
   const idleTimer = useRef<number | null>(null);
   const deepTimer = useRef<number | null>(null);
   const toastTimer = useRef<number | null>(null);
   const closeTimer = useRef<number | null>(null);
   const panStart = useRef<{ pointerId: number; x: number; y: number } | null>(null);
-  const patchDrag = useRef<{ x: number; y: number } | null>(null);
+  const patchDrag = useRef<{ pointerId: number; x: number; y: number } | null>(null);
   const compareDrag = useRef(false);
   const timelineDrag = useRef<number | null>(null);
   const maskPointer = useRef<number | null>(null);
@@ -607,6 +756,12 @@ export default function Palimpsest() {
   const queueBusy = activity.queue.active > 0 || jobActive;
   const openaiAvailable = Boolean(history?.editing.openaiAvailable);
   const canPanCanvas = canvasViewCanPan(view, viewport.width, viewport.height);
+  const otherActiveRegions = activity.activeRegions.filter(
+    (active) => active.jobId !== pendingEdit?.jobId,
+  );
+  const conflictingRegion = otherActiveRegions.find((active) =>
+    regionsOverlap(editRegion, active.region),
+  );
 
   const latest = useRef({
     panelOpen,
@@ -622,6 +777,7 @@ export default function Palimpsest() {
     history,
     currentState,
     welcomeOpen,
+    activeRegions: activity.activeRegions,
   });
   useEffect(() => {
     latest.current = {
@@ -638,6 +794,7 @@ export default function Palimpsest() {
       history,
       currentState,
       welcomeOpen,
+      activeRegions: activity.activeRegions,
     };
   });
 
@@ -710,9 +867,22 @@ export default function Palimpsest() {
     return state;
   }, []);
 
-  const refreshActivity = useCallback(async () => {
-    const payload = await fetchJson<ActivityPayload>("/api/activity");
-    setActivity(payload);
+  const refreshActivity = useCallback(() => {
+    if (activityRequest.current) return activityRequest.current;
+    const request = fetchJson<ActivityPayload>("/api/activity")
+      .then((payload) => {
+        const signature = activitySignature(payload);
+        if (signature !== activitySignatureRef.current) {
+          activitySignatureRef.current = signature;
+          setActivity(payload);
+        }
+        return payload;
+      })
+      .finally(() => {
+        activityRequest.current = null;
+      });
+    activityRequest.current = request;
+    return request;
   }, []);
 
   const requestQueueDrain = useCallback(async () => {
@@ -821,11 +991,42 @@ export default function Palimpsest() {
   }, [playing, revisions.length]);
 
   useEffect(() => {
-    const timer = window.setInterval(() => {
-      refreshActivity().catch(() => undefined);
-    }, 8000);
-    return () => window.clearInterval(timer);
-  }, [refreshActivity]);
+    let cancelled = false;
+    let timer: number | null = null;
+    const poll = async () => {
+      try {
+        const payload = await refreshActivity();
+        if (cancelled) return;
+        const sharedHeadRevisionId = payload.recent[0]?.id ?? null;
+        const current = latest.current;
+        if (
+          sharedHeadRevisionId &&
+          current.history &&
+          sharedHeadRevisionId !== current.history.headRevisionId
+        ) {
+          const followingHead =
+            current.selectedRevisionId === current.history.headRevisionId;
+          await refreshHistory(
+            followingHead ? sharedHeadRevisionId : current.selectedRevisionId,
+          );
+        }
+      } catch {
+        // Collaboration is eventually consistent; the next bounded poll retries.
+      } finally {
+        if (!cancelled) {
+          timer = window.setTimeout(
+            poll,
+            document.hidden ? HIDDEN_COLLAB_POLL_MS : COLLAB_POLL_MS,
+          );
+        }
+      }
+    };
+    timer = window.setTimeout(poll, COLLAB_POLL_MS);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [refreshActivity, refreshHistory]);
 
   useEffect(() => {
     if (!job || terminalJobStates.has(job.state)) return;
@@ -849,6 +1050,7 @@ export default function Palimpsest() {
             );
           }
           setEditOpen(false);
+          setEditBase(null);
           setSubmitted(false);
           setStep(1);
           setPrompt("");
@@ -866,14 +1068,6 @@ export default function Palimpsest() {
     }, 1200);
     return () => window.clearTimeout(timer);
   }, [job, refreshActivity, refreshHistory, requestQueueDrain, showToast]);
-
-  useEffect(() => {
-    const newest = activity.recent[0];
-    if (!newest || !history) return;
-    if (latest.current.jobActive) return;
-    if (history.revisions.some((revision) => revision.id === newest.id)) return;
-    refreshHistory(latest.current.selectedRevisionId).catch(() => undefined);
-  }, [activity.recent, history, refreshHistory]);
 
   useEffect(() => {
     if (!compareOn || selectedIndex <= 0) return;
@@ -902,7 +1096,7 @@ export default function Palimpsest() {
     const canvas = maskCanvasRef.current;
     const context = canvas?.getContext("2d");
     if (!canvas || !context) return;
-    const { width, height } = editRegion.region;
+    const { width, height } = editRegion;
     const accent =
       getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#e0765f";
     context.clearRect(0, 0, width, height);
@@ -911,7 +1105,7 @@ export default function Palimpsest() {
     context.lineCap = "round";
     context.lineJoin = "round";
     if (fillMask) {
-      const inset = maskBlendInset(editRegion.region);
+      const inset = maskBlendInset(editRegion);
       context.fillRect(inset, inset, width - inset * 2, height - inset * 2);
     }
     for (const stroke of strokes) {
@@ -927,7 +1121,7 @@ export default function Palimpsest() {
       }
       context.stroke();
     }
-  }, [editOpen, editRegion.region, fillMask, step, strokes, submitted]);
+  }, [editOpen, editRegion, fillMask, step, strokes, submitted]);
 
   const zoomAt = useCallback((cx: number, cy: number, factor: number) => {
     setView((current) => {
@@ -986,11 +1180,13 @@ export default function Palimpsest() {
 
   const openEditor = useCallback(() => {
     const current = latest.current;
-    if (!current.history || !current.currentState) return;
-    const assigned = current.currentState.revision.sequence % 4;
-    setEditRegion({
-      tile: { x: assigned % 2, y: Math.floor(assigned / 2) },
-      region: { ...DEFAULT_REGION },
+    if (!current.history || !current.currentState || current.jobActive) return;
+    setEditRegion(
+      findOpenRegion(current.currentState.revision.sequence, current.activeRegions),
+    );
+    setEditBase({
+      revisionId: current.currentState.revision.id,
+      state: current.currentState,
     });
     setSelectedIndex(current.revLen - 1);
     setPlaying(false);
@@ -1012,6 +1208,7 @@ export default function Palimpsest() {
 
   const closeEditor = useCallback(() => {
     setEditOpen(false);
+    setEditBase(null);
     setSubmitted(false);
     if (closeTimer.current) window.clearTimeout(closeTimer.current);
     wake();
@@ -1019,6 +1216,7 @@ export default function Palimpsest() {
 
   const closeAll = useCallback(() => {
     setEditOpen(false);
+    setEditBase(null);
     setQueueOpen(false);
     setHistoryOpen(false);
     setCompareOn(false);
@@ -1282,30 +1480,40 @@ export default function Palimpsest() {
 
   const patchDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (step !== 1 || submitted) return;
+    if (event.pointerType === "mouse" && event.button !== 0) return;
     const point = artworkPoint(event);
     if (!point) return;
     patchDrag.current = {
-      x: point.x - (editRegion.tile.x * TILE_SIZE + editRegion.region.x),
-      y: point.y - (editRegion.tile.y * TILE_SIZE + editRegion.region.y),
+      pointerId: event.pointerId,
+      x: point.x - editRegion.x,
+      y: point.y - editRegion.y,
     };
     event.currentTarget.setPointerCapture(event.pointerId);
+    event.currentTarget.focus();
+    event.preventDefault();
   };
 
   const patchMove = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (!patchDrag.current) return;
+    if (!patchDrag.current || patchDrag.current.pointerId !== event.pointerId) return;
     const point = artworkPoint(event);
     if (!point) return;
     const offset = patchDrag.current;
-    setEditRegion((region) => positionEditRegion(region, point.x - offset.x, point.y - offset.y));
+    setEditRegion((region) =>
+      positionEditRegion(region, point.x - offset.x, point.y - offset.y),
+    );
   };
 
-  const patchUp = () => {
+  const patchUp = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (patchDrag.current?.pointerId !== event.pointerId) return;
     patchDrag.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
   };
 
   const maskPoint = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     const rect = event.currentTarget.getBoundingClientRect();
-    const { width, height } = editRegion.region;
+    const { width, height } = editRegion;
     return {
       x: Math.round(Math.max(0, Math.min(width, ((event.clientX - rect.left) / rect.width) * width))),
       y: Math.round(Math.max(0, Math.min(height, ((event.clientY - rect.top) / rect.height) * height))),
@@ -1314,11 +1522,13 @@ export default function Palimpsest() {
 
   const maskDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (step !== 2 || submitted) return;
+    if (event.pointerType === "mouse" && event.button !== 0) return;
     event.currentTarget.setPointerCapture(event.pointerId);
     maskPointer.current = event.pointerId;
     setFillMask(false);
     const point = maskPoint(event);
     setStrokes((current) => [...current, { width: BRUSH_WIDTH, points: [point] }]);
+    event.preventDefault();
   };
 
   const maskMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
@@ -1343,32 +1553,35 @@ export default function Palimpsest() {
   };
 
   const canSubmit =
-    !isPreparing && !submitted && prompt.trim().length >= 3 && validMask && step === 3;
+    !isPreparing &&
+    !submitted &&
+    !jobActive &&
+    !conflictingRegion &&
+    prompt.trim().length >= 3 &&
+    validMask &&
+    step === 3;
 
   const submitEdit = async () => {
-    if (!currentState || !history || !canSubmit) return;
-    const tile = currentState.tiles.find(
-      (candidate) => candidate.x === editRegion.tile.x && candidate.y === editRegion.tile.y,
-    );
-    if (!tile) return;
+    if (!editBase || !canSubmit) return;
     setSubmitError(null);
     setIsPreparing(true);
     try {
+      const frame = generationFrameForRegion(editRegion);
       const [source, mask] = await Promise.all([
-        flattenTile(tile),
-        providerMask(editRegion.region, strokes, fillMask),
+        flattenArtworkFrame(editBase.state, frame),
+        providerMask(editRegion, frame, strokes, fillMask),
       ]);
       const form = new FormData();
       form.append(
         "meta",
         JSON.stringify({
           artworkId: "palimpsest",
-          baseRevisionId: history.headRevisionId,
+          baseRevisionId: editBase.revisionId,
           displayName: cleanDisplayName(),
           prompt: prompt.trim(),
           executionMode,
-          tile: editRegion.tile,
-          region: editRegion.region,
+          region: editRegion,
+          frame,
           fill: fillMask,
           strokes,
         }),
@@ -1381,7 +1594,12 @@ export default function Palimpsest() {
         body: form,
       });
       setJob(payload.job);
-      setPendingEdit({ author: cleanDisplayName() || "anonymous visitor", prompt: prompt.trim() });
+      setPendingEdit({
+        jobId: payload.job.id,
+        author: cleanDisplayName() || "anonymous visitor",
+        prompt: prompt.trim(),
+        region: { ...editRegion },
+      });
       setSubmitted(true);
       void requestQueueDrain();
       await refreshActivity();
@@ -1416,8 +1634,10 @@ export default function Palimpsest() {
       });
       setJob(payload.job);
       setPendingEdit({
+        jobId: payload.job.id,
         author: cleanDisplayName() || "anonymous visitor",
         prompt: `restore ${seqTag(selectedRevision.sequence)}`,
+        region: null,
       });
       void requestQueueDrain();
       await refreshActivity();
@@ -1437,21 +1657,8 @@ export default function Palimpsest() {
     beforeState?.revision.id === previousRevision?.id;
 
   const echoRegion = showHistory && !playing ? selectedRevision?.region ?? null : null;
-  const echoStyle = echoRegion
-    ? {
-        left: `${((echoRegion.tile.x * TILE_SIZE + echoRegion.x) / ARTWORK_SIZE) * 100}%`,
-        top: `${((echoRegion.tile.y * TILE_SIZE + echoRegion.y) / ARTWORK_SIZE) * 100}%`,
-        width: `${(echoRegion.width / ARTWORK_SIZE) * 100}%`,
-        height: `${(echoRegion.height / ARTWORK_SIZE) * 100}%`,
-      }
-    : undefined;
-
-  const patchStyle = {
-    left: `${((editRegion.tile.x * TILE_SIZE + editRegion.region.x) / ARTWORK_SIZE) * 100}%`,
-    top: `${((editRegion.tile.y * TILE_SIZE + editRegion.region.y) / ARTWORK_SIZE) * 100}%`,
-    width: `${(editRegion.region.width / ARTWORK_SIZE) * 100}%`,
-    height: `${(editRegion.region.height / ARTWORK_SIZE) * 100}%`,
-  };
+  const echoStyle = echoRegion ? regionStyle(echoRegion) : undefined;
+  const patchStyle = regionStyle(editRegion);
 
   const hoverRevision = hoverIdx >= 0 ? revisions[hoverIdx] ?? null : null;
   const tickLeft = (index: number) =>
@@ -1461,7 +1668,7 @@ export default function Palimpsest() {
     ...(jobActive && pendingEdit
       ? [
           {
-            id: "pending",
+            id: pendingEdit.jobId,
             author: pendingEdit.author,
             state: job?.state === "queued" ? "waiting" : "making",
             accent: job?.state !== "queued",
@@ -1469,6 +1676,13 @@ export default function Palimpsest() {
           },
         ]
       : []),
+    ...otherActiveRegions.map((active) => ({
+      id: active.jobId,
+      author: active.author,
+      state: activeStateLabel(active.state),
+      accent: active.state !== "queued",
+      prompt: `region ${active.region.x},${active.region.y} · ${active.region.width}×${active.region.height}`,
+    })),
     ...activity.recent.map((revision) => ({
       id: revision.id,
       author: revision.author,
@@ -1476,9 +1690,15 @@ export default function Palimpsest() {
       accent: false,
       prompt: revision.prompt,
     })),
-  ].slice(0, 3);
+  ].slice(0, 4);
 
-  const submitLabel = submitted ? "queued ✓" : isPreparing ? "preparing…" : "add to the work →";
+  const submitLabel = submitted
+    ? "reserved ✓"
+    : isPreparing
+      ? "preparing…"
+      : jobActive
+        ? "your edit is making…"
+        : "add to the work →";
 
   return (
     <main
@@ -1535,7 +1755,10 @@ export default function Palimpsest() {
         />
       ) : null}
 
-      {echoRegion || editOpen ? (
+      {echoRegion ||
+      editOpen ||
+      otherActiveRegions.length > 0 ||
+      (jobActive && pendingEdit?.region) ? (
         <div className={`${zoomClass} mono-overlays`} style={zoomStyle}>
           <div className="mono-cover" ref={overlayCoverRef}>
             {echoRegion && selectedRevision ? (
@@ -1543,12 +1766,51 @@ export default function Palimpsest() {
                 <span>{seqTag(selectedRevision.sequence)} changed here</span>
               </div>
             ) : null}
+            <div
+              className="mono-reservations"
+              role="list"
+              aria-label="Live reserved regions"
+              aria-live="polite"
+            >
+              {otherActiveRegions.map((active) => (
+                <div
+                  key={active.jobId}
+                  className={`mono-reservation${
+                    active.state === "generating" || active.state === "committing"
+                      ? " is-active"
+                      : ""
+                  }`}
+                  data-testid="active-reservation"
+                  style={regionStyle(active.region)}
+                  role="listitem"
+                  aria-label={`${active.author}, ${activeStateLabel(active.state)}, region ${active.region.x}, ${active.region.y}, ${active.region.width} by ${active.region.height}`}
+                >
+                  <span>
+                    {active.author} · {activeStateLabel(active.state)}
+                  </span>
+                </div>
+              ))}
+              {jobActive && pendingEdit?.region && job ? (
+                <div
+                  className="mono-reservation is-local is-active"
+                  data-testid="local-reservation"
+                  style={regionStyle(pendingEdit.region)}
+                  role="listitem"
+                  aria-label={`Your region, ${activeStateLabel(job.state)}`}
+                >
+                  <span>you · {activeStateLabel(job.state)}</span>
+                </div>
+              ) : null}
+            </div>
             {editOpen ? (
               <div
-                className={`mono-patch${step === 1 && !submitted ? " is-draggable" : " is-set"}${step === 2 && !submitted ? " is-masking" : ""}`}
+                className={`mono-patch${step === 1 && !submitted ? " is-draggable" : " is-set"}${step === 2 && !submitted ? " is-masking" : ""}${conflictingRegion ? " is-unavailable" : ""}`}
                 style={patchStyle}
-                role="button"
-                aria-label="Selected edit patch. Drag to move it. Use the arrow keys to nudge it."
+                data-testid="edit-patch"
+                role="group"
+                tabIndex={step === 1 && !submitted ? 0 : -1}
+                aria-label="Selected edit patch. Drag to move it anywhere on the artwork, including across seams. Use the arrow keys to nudge it."
+                aria-describedby={conflictingRegion ? "overlap-note" : undefined}
                 onPointerDown={patchDown}
                 onPointerMove={patchMove}
                 onPointerUp={patchUp}
@@ -1561,8 +1823,8 @@ export default function Palimpsest() {
                   <canvas
                     ref={maskCanvasRef}
                     className={`mono-mask-canvas${step !== 2 ? " is-locked" : ""}`}
-                    width={editRegion.region.width}
-                    height={editRegion.region.height}
+                    width={editRegion.width}
+                    height={editRegion.height}
                     aria-label="Drag to paint the part of this patch that may change. Use the entire patch button for a keyboard-accessible alternative."
                     onPointerDown={maskDown}
                     onPointerMove={maskMove}
@@ -1651,7 +1913,13 @@ export default function Palimpsest() {
           <span className={`mono-live-dot${queueBusy ? " is-pulsing" : ""}`} aria-hidden="true" />
           queue/{queueTotal}
         </button>
-        <button type="button" className="mono-contribute" onClick={openEditor}>
+        <button
+          type="button"
+          className="mono-contribute"
+          aria-label={jobActive ? "Your contribution is still being made" : "Contribute"}
+          disabled={jobActive}
+          onClick={openEditor}
+        >
           contribute
         </button>
       </div>
@@ -1835,8 +2103,8 @@ export default function Palimpsest() {
         <section className="mono-strip" aria-label="Contribution queue">
           <div className="mono-strip-head">
             <span className="mono-strip-summary">
-              queue — {activity.queue.queued} waiting · {activity.queue.active} making · one
-              contribution at a time
+              live work — {activity.queue.queued} reserved · {activity.queue.active} making ·
+              open space stays editable
             </span>
             <button
               type="button"
@@ -1885,11 +2153,12 @@ export default function Palimpsest() {
           {step === 1 ? (
             <div className="mono-edit-row">
               <span className="mono-edit-hint">
-                drag the outlined patch anywhere on the artwork · arrow keys nudge
+                drag anywhere on the full artwork · seams are open · arrow keys nudge
               </span>
               <button
                 type="button"
                 className="mono-action is-accent"
+                disabled={Boolean(conflictingRegion)}
                 onClick={() => {
                   setStep(2);
                   wake();
@@ -1990,6 +2259,16 @@ export default function Palimpsest() {
                 {submitLabel}
               </button>
             </div>
+          ) : null}
+          {conflictingRegion ? (
+            <p className="mono-overlap-note" id="overlap-note" role="status">
+              <span>{overlapMessage(conflictingRegion)}</span>
+              {step !== 1 ? (
+                <button type="button" onClick={() => setStep(1)}>
+                  move patch →
+                </button>
+              ) : null}
+            </p>
           ) : null}
           {submitted && job && headRevision ? (
             <p className="mono-note">
