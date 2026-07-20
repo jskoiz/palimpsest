@@ -336,7 +336,6 @@ function WelcomeDrawer({
       className="mono-welcome"
       data-testid="welcome-drawer"
       aria-labelledby="welcome-title"
-      aria-describedby="welcome-description"
       onCancel={(event) => {
         event.preventDefault();
         requestClose();
@@ -369,7 +368,9 @@ function WelcomeDrawer({
       <div className="mono-welcome-scroll">
         <div className="mono-welcome-inner">
           <div className="mono-welcome-head">
-            <span className="mono-welcome-kicker">guide / one image · many hands</span>
+            <span id="welcome-title" className="mono-welcome-kicker">
+              guide
+            </span>
             <button
               ref={closeButtonRef}
               type="button"
@@ -381,35 +382,23 @@ function WelcomeDrawer({
             </button>
           </div>
 
-          <h1 id="welcome-title">One image, every change remembered.</h1>
-          <p id="welcome-description" className="mono-welcome-intro">
-            Every accepted contribution becomes the next revision. Nothing that came
-            before is erased.
-          </p>
-
           <div className="mono-welcome-path">
             <section>
-              <span>01 / explore</span>
-              <h2>Move through the canvas</h2>
-              <p>
-                Drag whenever the artwork extends beyond the window. Scroll or use [−]
-                and [+] to zoom.
-              </p>
+              <span>01</span>
+              <h2>Move</h2>
+              <p>Drag the artwork. Scroll or use [−] [+] to zoom.</p>
             </section>
             <section>
-              <span>02 / remember</span>
-              <h2>Follow its history</h2>
-              <p>
-                Move to the bottom edge for the timeline. Drag across it to scrub, play
-                the sequence, or compare a change.
-              </p>
+              <span>02</span>
+              <h2>History</h2>
+              <p>Open the bottom edge. Drag the timeline to scrub.</p>
             </section>
             <section>
-              <span>03 / contribute</span>
-              <h2>Leave one precise mark</h2>
+              <span>03</span>
+              <h2>Edit</h2>
               <p>
-                Choose <strong>contribute</strong>, place a patch, paint exactly what may
-                change, then describe the edit. The queue accepts one at a time.
+                Choose contribute. Place the patch, paint the area, then describe the
+                change.
               </p>
             </section>
           </div>
@@ -419,19 +408,19 @@ function WelcomeDrawer({
             <dl>
               <div>
                 <dt><kbd>drag</kbd></dt>
-                <dd>move artwork</dd>
+                <dd>move</dd>
               </div>
               <div>
                 <dt><kbd>←</kbd> <kbd>→</kbd></dt>
-                <dd>revisions</dd>
+                <dd>history</dd>
               </div>
               <div>
                 <dt><kbd>space</kbd></dt>
-                <dd>play history</dd>
+                <dd>play</dd>
               </div>
               <div>
                 <dt><kbd>C</kbd></dt>
-                <dd>contribute</dd>
+                <dd>edit</dd>
               </div>
               <div>
                 <dt><kbd>Q</kbd></dt>
@@ -441,12 +430,8 @@ function WelcomeDrawer({
           </div>
 
           <div className="mono-welcome-foot">
-            <p>
-              Accepted edits are permanent revisions. Earlier looks can be revisited or
-              restored without erasing their history.
-            </p>
             <button type="button" className="mono-welcome-enter" onClick={requestClose}>
-              enter the archive →
+              done
             </button>
           </div>
         </div>

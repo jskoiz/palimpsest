@@ -12,9 +12,8 @@ export async function generateMetadata(): Promise<Metadata> {
     requestHeaders.get("x-forwarded-proto") ??
     (host.startsWith("localhost") ? "http" : "https");
   const metadataBase = new URL(`${protocol}://${host}`);
-  const title = "Palimpsest — One image, every change remembered";
-  const description =
-    "A canonical communal artwork with an immutable public history. Contribute one bounded edit, explore every revision, and watch the image remember.";
+  const title = "Palimpsest";
+  const description = "A shared artwork with a public revision history.";
 
   return {
     metadataBase,
@@ -31,7 +30,14 @@ export async function generateMetadata(): Promise<Metadata> {
       description,
       url: "/",
       siteName: "Palimpsest",
-      images: [{ url: "/og.png", width: 1536, height: 1024, alt: "Palimpsest communal artwork and living revision archive" }],
+      images: [
+        {
+          url: "/og.png",
+          width: 1536,
+          height: 1024,
+          alt: "Palimpsest artwork and revision timeline",
+        },
+      ],
     },
     twitter: {
       card: "summary_large_image",

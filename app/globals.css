@@ -1052,28 +1052,9 @@ body {
   line-height: 1;
 }
 
-.mono-welcome h1 {
-  max-width: 720px;
-  margin: 20px 0 8px;
-  font-size: 36px;
-  font-weight: 500;
-  letter-spacing: -0.035em;
-  line-height: 1;
-}
-
-.mono-welcome-intro {
-  max-width: 68ch;
-  margin: 0;
-  color: rgba(255, 255, 255, 0.74);
-  font-size: 14px;
-  line-height: 1.5;
-}
-
 .mono-welcome-path {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  margin-top: 21px;
-  border-top: 1px solid rgba(255, 255, 255, 0.2);
   border-bottom: 1px solid rgba(255, 255, 255, 0.2);
 }
 
@@ -1167,17 +1148,8 @@ body {
 .mono-welcome-foot {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 28px;
-  padding-top: 20px;
-}
-
-.mono-welcome-foot p {
-  max-width: 500px;
-  margin: 0;
-  color: rgba(255, 255, 255, 0.66);
-  font-size: 10px;
-  line-height: 1.5;
+  justify-content: flex-end;
+  padding-top: 16px;
 }
 
 .mono-welcome-enter {
@@ -1222,10 +1194,6 @@ body {
     padding-left: 22px;
   }
 
-  .mono-welcome h1 {
-    font-size: 30px;
-  }
-
   .mono-welcome-path {
     grid-template-columns: 1fr;
   }
@@ -1255,11 +1223,6 @@ body {
 @media (max-width: 560px) {
   .mono-queue-entry:nth-child(3) {
     display: none;
-  }
-
-  .mono-welcome h1 {
-    margin-top: 16px;
-    font-size: 27px;
   }
 
   .mono-welcome-controls dl {
