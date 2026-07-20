@@ -51,6 +51,8 @@ const MAX_ATTEMPTS = 2;
 const COMMIT_LOCK_LEASE_MS = 15_000;
 const COMMIT_LOCK_ATTEMPTS = 40;
 const COMMIT_LOCK_RETRY_MS = 25;
+const MODERATION_TIMEOUT_MS = 30_000;
+const IMAGE_EDIT_TIMEOUT_MS = 150_000;
 
 export type QueueProcessResult = {
   claimed: number;
@@ -334,14 +336,31 @@ async function updateStage(
 }
 
 async function moderatePrompt(apiKey: string, prompt: string) {
-  const response = await fetch("https://api.openai.com/v1/moderations", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ model: "omni-moderation-latest", input: prompt }),
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), MODERATION_TIMEOUT_MS);
+  let response: Response;
+  let body: { results?: Array<{ flagged?: boolean }> } | null;
+  try {
+    response = await fetch("https://api.openai.com/v1/moderations", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "omni-moderation-latest", input: prompt }),
+      signal: controller.signal,
+    });
+    body = (await response.json().catch(() => null)) as {
+      results?: Array<{ flagged?: boolean }>;
+    } | null;
+  } catch {
+    throw new DomainError(
+      "PROVIDER_TEMPORARY",
+      "Live image editing did not respond in time. Nothing was added to history.",
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
   if (!response.ok) {
     if (response.status === 401 || response.status === 403) {
       throw new DomainError(
@@ -357,10 +376,14 @@ async function moderatePrompt(apiKey: string, prompt: string) {
     }
     throw new DomainError("CONTENT_POLICY", "This prompt cannot be submitted as written.");
   }
-  const body = (await response.json()) as {
-    results?: Array<{ flagged?: boolean }>;
-  };
-  if (body.results?.[0]?.flagged) {
+  const result = body?.results?.[0];
+  if (!result) {
+    throw new DomainError(
+      "PROVIDER_TEMPORARY",
+      "Live image editing returned an invalid moderation response. Nothing was added to history.",
+    );
+  }
+  if (result.flagged) {
     throw new DomainError(
       "CONTENT_POLICY",
       "This prompt cannot be submitted. Describe a safe visual change without personal information.",
@@ -412,8 +435,11 @@ async function generateOpenAiPatch(
   form.append("moderation", "auto");
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 150_000);
+  const timeout = setTimeout(() => controller.abort(), IMAGE_EDIT_TIMEOUT_MS);
   let response: Response;
+  let body:
+    | { data?: Array<{ b64_json?: string }>; error?: { code?: string } }
+    | null;
   try {
     response = await fetch("https://api.openai.com/v1/images/edits", {
       method: "POST",
@@ -421,6 +447,9 @@ async function generateOpenAiPatch(
       body: form,
       signal: controller.signal,
     });
+    body = (await response.json().catch(() => null)) as
+      | { data?: Array<{ b64_json?: string }>; error?: { code?: string } }
+      | null;
   } catch {
     throw new DomainError(
       "PROVIDER_TEMPORARY",
@@ -431,9 +460,6 @@ async function generateOpenAiPatch(
   }
 
   const providerRequestId = response.headers.get("x-request-id") ?? undefined;
-  const body = (await response.json().catch(() => null)) as
-    | { data?: Array<{ b64_json?: string }>; error?: { code?: string } }
-    | null;
   if (!response.ok) {
     if (body?.error?.code === "moderation_blocked") {
       throw new DomainError(
