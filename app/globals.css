@@ -1052,9 +1052,18 @@ body {
   line-height: 1;
 }
 
+.mono-welcome-summary {
+  max-width: 72ch;
+  margin: 16px 0;
+  color: rgba(255, 255, 255, 0.74);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .mono-welcome-path {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
+  border-top: 1px solid rgba(255, 255, 255, 0.2);
   border-bottom: 1px solid rgba(255, 255, 255, 0.2);
 }
 

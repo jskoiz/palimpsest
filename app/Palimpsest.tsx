@@ -336,6 +336,7 @@ function WelcomeDrawer({
       className="mono-welcome"
       data-testid="welcome-drawer"
       aria-labelledby="welcome-title"
+      aria-describedby="welcome-description"
       onCancel={(event) => {
         event.preventDefault();
         requestClose();
@@ -382,23 +383,30 @@ function WelcomeDrawer({
             </button>
           </div>
 
+          <p id="welcome-description" className="mono-welcome-summary">
+            Palimpsest is a shared artwork. Each accepted edit creates the next
+            revision. Earlier revisions stay available.
+          </p>
+
           <div className="mono-welcome-path">
             <section>
               <span>01</span>
               <h2>Move</h2>
-              <p>Drag the artwork. Scroll or use [−] [+] to zoom.</p>
+              <p>
+                Drag when the artwork extends past the window. Scroll or use [−] [+] to
+                zoom.
+              </p>
             </section>
             <section>
               <span>02</span>
               <h2>History</h2>
-              <p>Open the bottom edge. Drag the timeline to scrub.</p>
+              <p>Open the timeline at the bottom. Drag to inspect any revision.</p>
             </section>
             <section>
               <span>03</span>
-              <h2>Edit</h2>
+              <h2>Contribute</h2>
               <p>
-                Choose contribute. Place the patch, paint the area, then describe the
-                change.
+                Place the patch, paint what may change, then describe the edit.
               </p>
             </section>
           </div>
@@ -420,7 +428,7 @@ function WelcomeDrawer({
               </div>
               <div>
                 <dt><kbd>C</kbd></dt>
-                <dd>edit</dd>
+                <dd>contribute</dd>
               </div>
               <div>
                 <dt><kbd>Q</kbd></dt>
