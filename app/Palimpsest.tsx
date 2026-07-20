@@ -439,7 +439,7 @@ function WelcomeDrawer({
 
           <div className="mono-welcome-foot">
             <button type="button" className="mono-welcome-enter" onClick={requestClose}>
-              done
+              done →
             </button>
           </div>
         </div>

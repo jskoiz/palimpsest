@@ -937,18 +937,26 @@ body {
   position: fixed;
   inset: auto 0 0;
   width: 100%;
+  height: 52dvh;
+  min-height: 420px;
   max-width: none;
-  max-height: min(68dvh, 640px);
+  max-height: min(600px, calc(100dvh - 24px));
   margin: 0;
   overflow: hidden;
   border: 0;
   border-top: 1px solid var(--hairline);
   border-radius: 0;
   padding: 0;
-  background: rgba(var(--ink), 0.94);
-  box-shadow: 0 -22px 72px rgba(0, 0, 0, 0.42);
+  background: linear-gradient(
+    to bottom,
+    rgba(var(--ink), 0.62) 0%,
+    rgba(var(--ink), 0.82) 38%,
+    rgba(var(--ink), 0.96) 100%
+  );
+  box-shadow: 0 -20px 56px rgba(0, 0, 0, 0.16);
   color: rgba(255, 255, 255, 0.96);
   font-family: var(--font-sans);
+  text-shadow: var(--over-image-shadow);
   user-select: text;
   -webkit-user-select: text;
   transform: translateY(var(--drawer-drag));
@@ -972,18 +980,12 @@ body {
 }
 
 .mono-welcome::backdrop {
-  background: rgba(var(--ink), 0.25);
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
-  transition:
-    background 220ms ease,
-    backdrop-filter 220ms ease;
+  background: rgba(var(--ink), 0.08);
+  transition: background 220ms ease;
 }
 
 .mono-welcome.is-closing::backdrop {
   background: rgba(var(--ink), 0);
-  backdrop-filter: blur(0);
-  -webkit-backdrop-filter: blur(0);
 }
 
 .mono-welcome-grab {
@@ -1011,8 +1013,7 @@ body {
 }
 
 .mono-welcome-inner {
-  width: min(1180px, 100%);
-  margin: 0 auto;
+  width: 100%;
   padding: 0 clamp(26px, 4vw, 58px) calc(24px + env(safe-area-inset-bottom, 0px));
 }
 
@@ -1026,7 +1027,7 @@ body {
   gap: 20px;
   min-height: 48px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(var(--ink), 0.96);
+  background: transparent;
 }
 
 .mono-welcome-kicker,
@@ -1164,13 +1165,13 @@ body {
 .mono-welcome-enter {
   min-height: 44px;
   flex: 0 0 auto;
-  padding: 0 16px !important;
-  background: var(--accent) !important;
-  color: rgb(var(--ink)) !important;
+  padding: 0 !important;
+  background: transparent !important;
+  color: var(--accent) !important;
   font-family: var(--font-mono) !important;
   font-size: 10px !important;
   font-weight: 600 !important;
-  text-shadow: none !important;
+  text-shadow: var(--over-image-shadow) !important;
 }
 
 @media (max-width: 720px) {
@@ -1195,7 +1196,17 @@ body {
   }
 
   .mono-welcome {
-    max-height: 82dvh;
+    height: 72dvh;
+    min-height: 520px;
+    max-height: calc(100dvh - 16px);
+  }
+
+  .mono-welcome-head {
+    background: linear-gradient(
+      to bottom,
+      rgba(var(--ink), 0.78),
+      rgba(var(--ink), 0.66)
+    );
   }
 
   .mono-welcome-inner {
@@ -1243,17 +1254,21 @@ body {
   .mono-welcome-foot {
     position: sticky;
     bottom: 0;
-    align-items: stretch;
+    align-items: flex-end;
     flex-direction: column;
     gap: 15px;
     margin: 0 -22px;
     padding: 15px 22px calc(16px + env(safe-area-inset-bottom, 0px));
     border-top: 1px solid rgba(255, 255, 255, 0.16);
-    background: rgba(var(--ink), 0.98);
+    background: linear-gradient(
+      to bottom,
+      rgba(var(--ink), 0.74),
+      rgba(var(--ink), 0.92)
+    );
   }
 
   .mono-welcome-enter {
-    width: 100%;
+    width: auto;
   }
 }
 
