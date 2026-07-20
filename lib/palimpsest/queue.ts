@@ -1,153 +1,267 @@
 import {
   ARTWORK_ID,
   DomainError,
-  assertFreshBase,
   buildOpenAiEditPrompt,
   displayMaskForLayer,
 } from "./domain.mjs";
+import { regionRelativeToFrame } from "./geometry.mjs";
 import type { AppEnv } from "./runtime";
 import { readPngDimensions, sha256Hex } from "./runtime";
-import { getBlobRecord, getHead, makeDemoPatchSvg } from "./store";
+import {
+  PREPARING_AVAILABLE_AT,
+  RESERVATION_LEASE_MS,
+  getBlobRecord,
+  makeDemoPatchSvg,
+  type GenerationFrame,
+  type GlobalRegion,
+} from "./store";
 
 type QueueJob = {
   id: string;
   kind: "edit" | "revert";
-  state: string;
+  state: "moderating" | "generating" | "committing";
   executionMode: "demo" | "openai" | "none";
   authorId: string;
   baseRevisionId: string;
   targetRevisionId: string | null;
   prompt: string;
-  tileX: number | null;
-  tileY: number | null;
   regionX: number | null;
   regionY: number | null;
   regionWidth: number | null;
   regionHeight: number | null;
+  frameX: number | null;
+  frameY: number | null;
+  frameWidth: number | null;
+  frameHeight: number | null;
   sourceBlobId: string | null;
   maskBlobId: string | null;
   displayMaskBlobId: string | null;
   attemptCount: number;
-  availableAt: number;
+  leaseFence: number;
+  workerToken: string;
   createdAt: number;
 };
 
-const leaseMs = 4 * 60 * 1000;
-const abandonedAfterMs = 3 * 60 * 1000;
+type CommitLock = {
+  ownerToken: string;
+  fence: number;
+};
 
-export async function processQueue(env: AppEnv, maxJobs = 1): Promise<void> {
-  for (let processed = 0; processed < maxJobs; processed += 1) {
-    const didProcess = await processOne(env);
-    if (!didProcess) return;
+const MAX_ATTEMPTS = 2;
+const COMMIT_LOCK_LEASE_MS = 15_000;
+const COMMIT_LOCK_ATTEMPTS = 40;
+const COMMIT_LOCK_RETRY_MS = 25;
+
+export type QueueProcessResult = {
+  claimed: number;
+  completed: number;
+  workerFailures: number;
+};
+
+function jobRegion(job: QueueJob): GlobalRegion {
+  if (
+    job.regionX == null ||
+    job.regionY == null ||
+    job.regionWidth == null ||
+    job.regionHeight == null
+  ) {
+    throw new DomainError("INTERNAL_ERROR", "The queued reservation has no region.");
   }
+  return {
+    x: Number(job.regionX),
+    y: Number(job.regionY),
+    width: Number(job.regionWidth),
+    height: Number(job.regionHeight),
+  };
 }
 
-async function processOne(env: AppEnv): Promise<boolean> {
-  const ownerToken = crypto.randomUUID();
+function jobFrame(job: QueueJob): GenerationFrame {
+  if (
+    job.frameX == null ||
+    job.frameY == null ||
+    job.frameWidth !== 1024 ||
+    job.frameHeight !== 1024
+  ) {
+    throw new DomainError("INTERNAL_ERROR", "The queued edit has no valid generation frame.");
+  }
+  return {
+    x: Number(job.frameX),
+    y: Number(job.frameY),
+    width: Number(job.frameWidth),
+    height: Number(job.frameHeight),
+  };
+}
+
+export async function processQueue(
+  env: AppEnv,
+  maxJobs = 4,
+): Promise<QueueProcessResult> {
+  const boundedMaxJobs = Math.max(1, Math.min(8, Math.floor(maxJobs)));
+  await recoverExpiredJobs(env, Date.now());
+
+  const claimed: QueueJob[] = [];
+  for (let index = 0; index < boundedMaxJobs; index += 1) {
+    const job = await claimNextJob(env);
+    if (!job) break;
+    claimed.push(job);
+  }
+
+  const results = await Promise.allSettled(
+    claimed.map((job) => processClaimedJob(env, job)),
+  );
+  return {
+    claimed: claimed.length,
+    completed: results.filter((result) => result.status === "fulfilled").length,
+    workerFailures: results.filter((result) => result.status === "rejected").length,
+  };
+}
+
+export const CLAIM_NEXT_JOB_SQL = `UPDATE edit_jobs
+SET state = CASE
+      WHEN kind = 'revert' THEN 'committing'
+      WHEN execution_mode = 'openai' THEN 'moderating'
+      ELSE 'generating'
+    END,
+    worker_token = ?,
+    lease_fence = lease_fence + 1,
+    lease_expires_at = ?,
+    started_at = COALESCE(started_at, ?),
+    updated_at = ?
+WHERE id = (
+  SELECT candidate.id
+  FROM edit_jobs candidate
+  WHERE candidate.artwork_id = ?
+    AND candidate.state = 'queued'
+    AND candidate.available_at <= ?
+    AND NOT EXISTS (
+      SELECT 1 FROM edit_jobs active
+      WHERE active.artwork_id = candidate.artwork_id
+        AND active.id <> candidate.id
+        AND active.state IN ('queued', 'moderating', 'generating', 'committing')
+        AND active.lease_expires_at > ?
+        AND active.region_x < candidate.region_x + candidate.region_width
+        AND active.region_x + active.region_width > candidate.region_x
+        AND active.region_y < candidate.region_y + candidate.region_height
+        AND active.region_y + active.region_height > candidate.region_y
+    )
+  ORDER BY candidate.created_at ASC, candidate.id ASC
+  LIMIT 1
+)
+  AND state = 'queued'
+  AND available_at <= ?
+RETURNING
+  id,
+  kind,
+  state,
+  execution_mode AS executionMode,
+  author_id AS authorId,
+  base_revision_id AS baseRevisionId,
+  target_revision_id AS targetRevisionId,
+  prompt,
+  region_x AS regionX,
+  region_y AS regionY,
+  region_width AS regionWidth,
+  region_height AS regionHeight,
+  frame_x AS frameX,
+  frame_y AS frameY,
+  frame_width AS frameWidth,
+  frame_height AS frameHeight,
+  source_blob_id AS sourceBlobId,
+  mask_blob_id AS maskBlobId,
+  display_mask_blob_id AS displayMaskBlobId,
+  attempt_count AS attemptCount,
+  lease_fence AS leaseFence,
+  worker_token AS workerToken,
+  created_at AS createdAt`;
+
+async function claimNextJob(env: AppEnv): Promise<QueueJob | null> {
+  const workerToken = crypto.randomUUID();
   const now = Date.now();
-  const acquired = await env.DB.prepare(
-    `UPDATE queue_locks
-     SET state = 'held', owner_token = ?, fence = fence + 1,
-         job_id = NULL, acquired_at = ?, heartbeat_at = ?, lease_expires_at = ?
-     WHERE artwork_id = ? AND (
-       state = 'idle' OR lease_expires_at IS NULL OR lease_expires_at < ? OR heartbeat_at < ?
-     )`,
-  )
-    .bind(ownerToken, now, now, now + leaseMs, ARTWORK_ID, now, now - abandonedAfterMs)
-    .run();
-  if (Number(acquired.meta.changes ?? 0) === 0) return false;
-
-  const lock = await env.DB.prepare(
-    "SELECT fence FROM queue_locks WHERE artwork_id = ? AND owner_token = ?",
-  )
-    .bind(ARTWORK_ID, ownerToken)
-    .first<{ fence: number }>();
-  if (!lock) return false;
-  const fence = Number(lock.fence);
-
-  await recoverAbandonedJobs(env, now);
-
-  const job = await env.DB.prepare(
-    `SELECT
-       id,
-       kind,
-       state,
-       execution_mode AS executionMode,
-       author_id AS authorId,
-       base_revision_id AS baseRevisionId,
-       target_revision_id AS targetRevisionId,
-       prompt,
-       tile_x AS tileX,
-       tile_y AS tileY,
-       region_x AS regionX,
-       region_y AS regionY,
-       region_width AS regionWidth,
-       region_height AS regionHeight,
-       source_blob_id AS sourceBlobId,
-       mask_blob_id AS maskBlobId,
-       display_mask_blob_id AS displayMaskBlobId,
-       attempt_count AS attemptCount,
-       available_at AS availableAt,
-       created_at AS createdAt
-     FROM edit_jobs
-     WHERE artwork_id = ? AND state = 'queued'
-     ORDER BY created_at ASC, id ASC
-     LIMIT 1`,
-  )
-    .bind(ARTWORK_ID)
+  return env.DB.prepare(CLAIM_NEXT_JOB_SQL)
+    .bind(
+      workerToken,
+      now + RESERVATION_LEASE_MS,
+      now,
+      now,
+      ARTWORK_ID,
+      now,
+      now,
+      now,
+    )
     .first<QueueJob>();
+}
 
-  if (!job || Number(job.availableAt) > now) {
-    await releaseLock(env, ownerToken, fence);
-    return false;
-  }
+export const EXPIRE_PREPARING_RESERVATION_SQL = `UPDATE edit_jobs
+SET state = 'failed',
+    error_code = 'QUEUE_PREPARATION_EXPIRED',
+    public_error_message = 'The edit inputs were not prepared before the reservation expired. Nothing was added to history.',
+    worker_token = NULL,
+    lease_expires_at = NULL,
+    updated_at = ?,
+    completed_at = ?
+WHERE artwork_id = ?
+  AND state = 'queued'
+  AND available_at = ?
+  AND worker_token IS NULL
+  AND (lease_expires_at IS NULL OR lease_expires_at <= ?)`;
 
-  const firstState =
-    job.kind === "revert"
-      ? "committing"
-      : job.executionMode === "openai"
-        ? "moderating"
-        : "generating";
-  const claimed = await env.DB.prepare(
-    `UPDATE edit_jobs
-     SET state = ?, worker_token = ?, lock_fence = ?, lease_expires_at = ?,
-         started_at = COALESCE(started_at, ?), updated_at = ?
-     WHERE id = ? AND state = 'queued'`,
-  )
-    .bind(firstState, ownerToken, fence, now + leaseMs, now, now, job.id)
-    .run();
-  if (Number(claimed.meta.changes ?? 0) === 0) {
-    await releaseLock(env, ownerToken, fence);
-    return false;
-  }
-  await env.DB.prepare(
-    "UPDATE queue_locks SET job_id = ? WHERE artwork_id = ? AND owner_token = ? AND fence = ?",
-  )
-    .bind(job.id, ARTWORK_ID, ownerToken, fence)
-    .run();
+async function recoverExpiredJobs(env: AppEnv, now: number) {
+  await env.DB.batch([
+    env.DB.prepare(EXPIRE_PREPARING_RESERVATION_SQL).bind(
+      now,
+      now,
+      ARTWORK_ID,
+      PREPARING_AVAILABLE_AT,
+      now,
+    ),
+    env.DB.prepare(
+      `UPDATE edit_jobs
+       SET state = 'failed',
+           error_code = 'QUEUE_LEASE_EXPIRED',
+           public_error_message = 'The worker lease expired repeatedly. Nothing was added to history.',
+           worker_token = NULL,
+           lease_expires_at = NULL,
+           updated_at = ?,
+           completed_at = ?
+       WHERE artwork_id = ?
+         AND state IN ('moderating', 'generating', 'committing')
+         AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+         AND attempt_count >= ?`,
+    ).bind(now, now, ARTWORK_ID, now, MAX_ATTEMPTS),
+    env.DB.prepare(
+      `UPDATE edit_jobs
+       SET state = 'queued',
+           attempt_count = attempt_count + 1,
+           available_at = ?,
+           worker_token = NULL,
+           lease_expires_at = NULL,
+           updated_at = ?
+       WHERE artwork_id = ?
+         AND state IN ('moderating', 'generating', 'committing')
+         AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+         AND attempt_count < ?`,
+    ).bind(now, now, ARTWORK_ID, now, MAX_ATTEMPTS),
+  ]);
+}
 
+async function processClaimedJob(env: AppEnv, job: QueueJob) {
   try {
-    const head = await getHead(env);
-    assertFreshBase(job.baseRevisionId, head.id);
-
     if (job.kind === "revert") {
-      await commitRevert(env, job, ownerToken, fence, head.sequence + 1);
-      return true;
+      await commitRevert(env, job);
+      return;
     }
 
-    if (
-      job.tileX == null ||
-      job.tileY == null ||
-      job.regionX == null ||
-      job.regionY == null ||
-      job.regionWidth == null ||
-      job.regionHeight == null ||
-      (job.executionMode === "demo" && !job.displayMaskBlobId)
-    ) {
-      throw new DomainError("INTERNAL_ERROR", "The queued edit is incomplete.");
+    const region = jobRegion(job);
+    const frame = jobFrame(job);
+    if (!job.displayMaskBlobId) {
+      throw new DomainError("INTERNAL_ERROR", "The generated layer mask is missing.");
     }
 
-    let patch: { bytes: Uint8Array; contentType: string; providerRequestId?: string };
+    let patch: {
+      bytes: Uint8Array;
+      contentType: string;
+      providerRequestId?: string;
+    };
     if (job.executionMode === "openai") {
       if (!env.OPENAI_API_KEY) {
         throw new DomainError(
@@ -156,24 +270,16 @@ async function processOne(env: AppEnv): Promise<boolean> {
         );
       }
       await moderatePrompt(env.OPENAI_API_KEY, job.prompt);
-      await updateStage(env, job.id, ownerToken, fence, "generating");
+      await updateStage(env, job, "moderating", "generating");
       patch = await generateOpenAiPatch(env, job, env.OPENAI_API_KEY);
     } else {
-      if (!job.displayMaskBlobId) {
-        throw new DomainError("INTERNAL_ERROR", "The demo display mask is missing.");
-      }
       const maskRecord = await getBlobRecord(env, job.displayMaskBlobId);
       const seed = await sha256Hex(
         `${ARTWORK_ID}:${job.baseRevisionId}:${job.prompt}:${maskRecord?.sha256 ?? "mask"}`,
       );
       const svg = makeDemoPatchSvg(
         job.prompt,
-        {
-          x: job.regionX,
-          y: job.regionY,
-          width: job.regionWidth,
-          height: job.regionHeight,
-        },
+        regionRelativeToFrame(region, frame),
         seed,
       );
       patch = {
@@ -182,62 +288,49 @@ async function processOne(env: AppEnv): Promise<boolean> {
       };
     }
 
-    await updateStage(env, job.id, ownerToken, fence, "committing");
-    await commitPatch(env, job, patch, ownerToken, fence, head.sequence + 1);
-    return true;
+    await updateStage(env, job, "generating", "committing");
+    await commitPatch(env, job, patch);
   } catch (error) {
-    await handleFailure(env, job, ownerToken, fence, error);
-    return true;
+    await handleFailure(env, job, error);
   }
-}
-
-async function recoverAbandonedJobs(env: AppEnv, now: number) {
-  const staleBefore = now - abandonedAfterMs;
-  await env.DB.batch([
-    env.DB.prepare(
-      `UPDATE edit_jobs
-       SET state = 'failed', error_code = 'QUEUE_LEASE_EXPIRED',
-           public_error_message = 'The queue could not safely resume this edit. Nothing was added to history.',
-           worker_token = NULL, lock_fence = NULL, lease_expires_at = NULL,
-           updated_at = ?, completed_at = ?
-       WHERE artwork_id = ?
-         AND state IN ('moderating', 'generating', 'committing')
-         AND updated_at < ? AND attempt_count >= 2`,
-    ).bind(now, now, ARTWORK_ID, staleBefore),
-    env.DB.prepare(
-      `UPDATE edit_jobs
-       SET state = 'queued', attempt_count = attempt_count + 1, available_at = ?,
-           worker_token = NULL, lock_fence = NULL, lease_expires_at = NULL, updated_at = ?
-       WHERE artwork_id = ?
-         AND state IN ('moderating', 'generating', 'committing')
-         AND updated_at < ? AND attempt_count < 2`,
-    ).bind(now, now, ARTWORK_ID, staleBefore),
-  ]);
 }
 
 async function updateStage(
   env: AppEnv,
-  jobId: string,
-  ownerToken: string,
-  fence: number,
-  state: string,
+  job: QueueJob,
+  expectedState: QueueJob["state"],
+  nextState: QueueJob["state"],
 ) {
   const now = Date.now();
   const result = await env.DB.prepare(
-    `UPDATE edit_jobs SET state = ?, updated_at = ?, lease_expires_at = ?
-     WHERE id = ? AND worker_token = ? AND lock_fence = ?`,
+    `UPDATE edit_jobs
+     SET state = ?, updated_at = ?, lease_expires_at = ?
+     WHERE id = ?
+       AND artwork_id = ?
+       AND state = ?
+       AND worker_token = ?
+       AND lease_fence = ?
+       AND lease_expires_at > ?`,
   )
-    .bind(state, now, now + leaseMs, jobId, ownerToken, fence)
+    .bind(
+      nextState,
+      now,
+      now + RESERVATION_LEASE_MS,
+      job.id,
+      ARTWORK_ID,
+      expectedState,
+      job.workerToken,
+      job.leaseFence,
+      now,
+    )
     .run();
   if (Number(result.meta.changes ?? 0) === 0) {
-    throw new DomainError("STALE_BASE_REVISION", "The queue lease expired before the edit could commit.");
+    throw new DomainError(
+      "QUEUE_LEASE_EXPIRED",
+      "The worker lease expired before the edit could advance safely.",
+    );
   }
-  await env.DB.prepare(
-    `UPDATE queue_locks SET heartbeat_at = ?, lease_expires_at = ?
-     WHERE artwork_id = ? AND owner_token = ? AND fence = ?`,
-  )
-    .bind(now, now + leaseMs, ARTWORK_ID, ownerToken, fence)
-    .run();
+  job.state = nextState;
 }
 
 async function moderatePrompt(apiKey: string, prompt: string) {
@@ -264,7 +357,9 @@ async function moderatePrompt(apiKey: string, prompt: string) {
     }
     throw new DomainError("CONTENT_POLICY", "This prompt cannot be submitted as written.");
   }
-  const body = (await response.json()) as { results?: Array<{ flagged?: boolean }> };
+  const body = (await response.json()) as {
+    results?: Array<{ flagged?: boolean }>;
+  };
   if (body.results?.[0]?.flagged) {
     throw new DomainError(
       "CONTENT_POLICY",
@@ -300,16 +395,17 @@ async function generateOpenAiPatch(
   form.append("model", "gpt-image-2");
   form.append(
     "image[]",
-    new File([await source.arrayBuffer()], "palimpsest-tile.png", { type: "image/png" }),
+    new File([await source.arrayBuffer()], "palimpsest-context.png", {
+      type: "image/png",
+    }),
   );
   form.append(
     "mask",
-    new File([await mask.arrayBuffer()], "palimpsest-mask.png", { type: "image/png" }),
+    new File([await mask.arrayBuffer()], "palimpsest-mask.png", {
+      type: "image/png",
+    }),
   );
-  form.append(
-    "prompt",
-    buildOpenAiEditPrompt(job.prompt),
-  );
+  form.append("prompt", buildOpenAiEditPrompt(job.prompt));
   form.append("size", "1024x1024");
   form.append("quality", "medium");
   form.append("output_format", "png");
@@ -369,170 +465,491 @@ async function generateOpenAiPatch(
   }
   const binary = atob(encoded);
   const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
   const dimensions = readPngDimensions(bytes);
   if (dimensions.width !== 1024 || dimensions.height !== 1024) {
-    throw new DomainError("PROVIDER_TEMPORARY", "Live image editing returned an invalid tile size.");
+    throw new DomainError(
+      "PROVIDER_TEMPORARY",
+      "Live image editing returned an invalid context-frame size.",
+    );
   }
   return { bytes, contentType: "image/png", providerRequestId };
 }
+
+async function acquireCommitLock(env: AppEnv, jobId: string): Promise<CommitLock> {
+  const ownerToken = crypto.randomUUID();
+  for (let attempt = 0; attempt < COMMIT_LOCK_ATTEMPTS; attempt += 1) {
+    const now = Date.now();
+    const lock = await env.DB.prepare(
+      `UPDATE artwork_commit_locks
+       SET owner_token = ?,
+           fence = fence + 1,
+           job_id = ?,
+           acquired_at = ?,
+           lease_expires_at = ?
+       WHERE artwork_id = ?
+         AND (owner_token IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
+       RETURNING fence`,
+    )
+      .bind(
+        ownerToken,
+        jobId,
+        now,
+        now + COMMIT_LOCK_LEASE_MS,
+        ARTWORK_ID,
+        now,
+      )
+      .first<{ fence: number }>();
+    if (lock) return { ownerToken, fence: Number(lock.fence) };
+    await new Promise((resolve) => setTimeout(resolve, COMMIT_LOCK_RETRY_MS));
+  }
+  throw new DomainError(
+    "PROVIDER_TEMPORARY",
+    "The final history commit is busy. This edit will be retried safely.",
+  );
+}
+
+async function releaseCommitLock(env: AppEnv, lock: CommitLock) {
+  await env.DB.prepare(
+    `UPDATE artwork_commit_locks
+     SET owner_token = NULL, job_id = NULL, acquired_at = NULL, lease_expires_at = NULL
+     WHERE artwork_id = ? AND owner_token = ? AND fence = ?`,
+  )
+    .bind(ARTWORK_ID, lock.ownerToken, lock.fence)
+    .run();
+}
+
+async function assertCommitStillValid(
+  env: AppEnv,
+  job: QueueJob,
+  lock: CommitLock,
+) {
+  const now = Date.now();
+  const checks = await env.DB.batch([
+    env.DB.prepare(
+      `SELECT j.id
+       FROM edit_jobs j
+       JOIN artwork_commit_locks commit_lock
+         ON commit_lock.artwork_id = j.artwork_id
+       WHERE j.id = ?
+         AND j.artwork_id = ?
+         AND j.state = 'committing'
+         AND j.worker_token = ?
+         AND j.lease_fence = ?
+         AND j.lease_expires_at > ?
+         AND commit_lock.owner_token = ?
+         AND commit_lock.fence = ?
+         AND commit_lock.job_id = j.id
+         AND commit_lock.lease_expires_at > ?`,
+    ).bind(
+      job.id,
+      ARTWORK_ID,
+      job.workerToken,
+      job.leaseFence,
+      now,
+      lock.ownerToken,
+      lock.fence,
+      now,
+    ),
+    env.DB.prepare(
+      `SELECT accepted.id, accepted.sequence
+       FROM edit_jobs job
+       JOIN revisions base
+         ON base.artwork_id = job.artwork_id AND base.id = job.base_revision_id
+       JOIN revisions accepted
+         ON accepted.artwork_id = base.artwork_id
+        AND accepted.sequence > base.sequence
+       WHERE job.id = ?
+         AND accepted.region_x IS NOT NULL
+         AND accepted.region_x < job.region_x + job.region_width
+         AND accepted.region_x + accepted.region_width > job.region_x
+         AND accepted.region_y < job.region_y + job.region_height
+         AND accepted.region_y + accepted.region_height > job.region_y
+       ORDER BY accepted.sequence ASC
+       LIMIT 1`,
+    ).bind(job.id),
+    env.DB.prepare(
+      `SELECT active.id
+       FROM edit_jobs job
+       JOIN edit_jobs active
+         ON active.artwork_id = job.artwork_id AND active.id <> job.id
+       WHERE job.id = ?
+         AND active.state IN ('queued', 'moderating', 'generating', 'committing')
+         AND active.lease_expires_at > ?
+         AND active.region_x < job.region_x + job.region_width
+         AND active.region_x + active.region_width > job.region_x
+         AND active.region_y < job.region_y + job.region_height
+         AND active.region_y + active.region_height > job.region_y
+       ORDER BY active.created_at ASC
+       LIMIT 1`,
+    ).bind(job.id, now),
+  ]);
+
+  if (!checks[0]?.results?.[0]) {
+    throw new DomainError(
+      "QUEUE_LEASE_EXPIRED",
+      "The worker lease was superseded before the final commit.",
+    );
+  }
+  if (checks[1]?.results?.[0]) {
+    throw new DomainError(
+      "STALE_BASE_REVISION",
+      "An accepted revision changed this region after the edit began. Nothing was added to history.",
+    );
+  }
+  if (checks[2]?.results?.[0]) {
+    throw new DomainError(
+      "STALE_BASE_REVISION",
+      "Another active reservation superseded this region before commit. Nothing was added to history.",
+    );
+  }
+}
+
+export const COMMIT_PATCH_REVISION_SQL = `WITH candidate(
+  revision_id, job_id, worker_token, lease_fence,
+  commit_token, commit_fence, now_ms
+) AS (VALUES (?, ?, ?, ?, ?, ?, ?))
+INSERT INTO revisions (
+  id, artwork_id, sequence, parent_revision_id, job_id, origin, status,
+  author_id, prompt, region_x, region_y, region_width, region_height, created_at
+)
+SELECT
+  c.revision_id,
+  job.artwork_id,
+  artwork.head_sequence + 1,
+  artwork.head_revision_id,
+  job.id,
+  job.execution_mode,
+  'accepted',
+  job.author_id,
+  job.prompt,
+  job.region_x,
+  job.region_y,
+  job.region_width,
+  job.region_height,
+  c.now_ms
+FROM candidate c
+JOIN edit_jobs job ON job.id = c.job_id
+JOIN artworks artwork ON artwork.id = job.artwork_id
+JOIN revisions base
+  ON base.artwork_id = job.artwork_id AND base.id = job.base_revision_id
+JOIN artwork_commit_locks commit_lock
+  ON commit_lock.artwork_id = job.artwork_id
+WHERE job.state = 'committing'
+  AND job.worker_token = c.worker_token
+  AND job.lease_fence = c.lease_fence
+  AND job.lease_expires_at > c.now_ms
+  AND commit_lock.owner_token = c.commit_token
+  AND commit_lock.fence = c.commit_fence
+  AND commit_lock.job_id = job.id
+  AND commit_lock.lease_expires_at > c.now_ms
+  AND NOT EXISTS (
+    SELECT 1 FROM revisions accepted
+    WHERE accepted.artwork_id = job.artwork_id
+      AND accepted.sequence > base.sequence
+      AND accepted.region_x IS NOT NULL
+      AND accepted.region_x < job.region_x + job.region_width
+      AND accepted.region_x + accepted.region_width > job.region_x
+      AND accepted.region_y < job.region_y + job.region_height
+      AND accepted.region_y + accepted.region_height > job.region_y
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM edit_jobs active
+    WHERE active.artwork_id = job.artwork_id
+      AND active.id <> job.id
+      AND active.state IN ('queued', 'moderating', 'generating', 'committing')
+      AND active.lease_expires_at > c.now_ms
+      AND active.region_x < job.region_x + job.region_width
+      AND active.region_x + active.region_width > job.region_x
+      AND active.region_y < job.region_y + job.region_height
+      AND active.region_y + active.region_height > job.region_y
+  )`;
 
 async function commitPatch(
   env: AppEnv,
   job: QueueJob,
   patch: { bytes: Uint8Array; contentType: string; providerRequestId?: string },
-  ownerToken: string,
-  fence: number,
-  sequence: number,
 ) {
-  if (
-    job.tileX == null ||
-    job.tileY == null ||
-    (job.executionMode === "demo" && !job.displayMaskBlobId)
-  ) {
-    throw new DomainError("INTERNAL_ERROR", "The patch metadata is incomplete.");
+  const frame = jobFrame(job);
+  const displayMaskBlobId = displayMaskForLayer(
+    job.executionMode,
+    job.displayMaskBlobId,
+  );
+  if (!displayMaskBlobId) {
+    throw new DomainError("INTERNAL_ERROR", "The generated layer mask is missing.");
   }
+
   const revisionId = crypto.randomUUID();
   const blobId = crypto.randomUUID();
   const hash = await sha256Hex(patch.bytes);
   const extension = patch.contentType === "image/png" ? "png" : "svg";
-  const key = `artworks/palimpsest/patches/${revisionId}/tile-${job.tileX}-${job.tileY}-${hash}.${extension}`;
-  const now = Date.now();
+  const key = `artworks/palimpsest/patches/${revisionId}/frame-${frame.x}-${frame.y}-${hash}.${extension}`;
   await env.BLOBS.put(key, patch.bytes, {
     httpMetadata: { contentType: patch.contentType },
     customMetadata: { sha256: hash, immutable: "true" },
   });
 
-  await env.DB.batch([
-    env.DB.prepare(
-      `INSERT INTO blobs
-       (id, artwork_id, kind, r2_key, content_type, byte_length, sha256, width, height, created_at)
-       VALUES (?, ?, 'patch', ?, ?, ?, ?, 1024, 1024, ?)`,
-    ).bind(blobId, ARTWORK_ID, key, patch.contentType, patch.bytes.byteLength, hash, now),
-    env.DB.prepare(
-      `INSERT INTO revisions
-       (id, artwork_id, sequence, parent_revision_id, job_id, origin, status, author_id,
-        prompt, region_x, region_y, region_width, region_height, tile_x, tile_y, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(
-      revisionId,
-      ARTWORK_ID,
-      sequence,
-      job.baseRevisionId,
-      job.id,
-      job.executionMode,
-      job.authorId,
-      job.prompt,
-      job.regionX,
-      job.regionY,
-      job.regionWidth,
-      job.regionHeight,
-      job.tileX,
-      job.tileY,
-      now,
-    ),
-    env.DB.prepare(
-      `INSERT INTO revision_patches
-       (revision_id, tile_x, tile_y, patch_blob_id, display_mask_blob_id)
-       VALUES (?, ?, ?, ?, ?)`,
-    ).bind(
-      revisionId,
-      job.tileX,
-      job.tileY,
-      blobId,
-      displayMaskForLayer(job.executionMode, job.displayMaskBlobId),
-    ),
-    env.DB.prepare(
-      `UPDATE artworks SET head_revision_id = ?, head_sequence = ?
-       WHERE id = ? AND head_revision_id = ?`,
-    ).bind(revisionId, sequence, ARTWORK_ID, job.baseRevisionId),
-    env.DB.prepare(
-      `UPDATE edit_jobs
-       SET state = 'succeeded', result_revision_id = ?, openai_request_id = ?,
-           updated_at = ?, completed_at = ?
-       WHERE id = ? AND worker_token = ? AND lock_fence = ?`,
-    ).bind(revisionId, patch.providerRequestId ?? null, now, now, job.id, ownerToken, fence),
-    env.DB.prepare(
-      `UPDATE queue_locks
-       SET state = 'idle', owner_token = NULL, job_id = NULL,
-           acquired_at = NULL, heartbeat_at = NULL, lease_expires_at = NULL
-       WHERE artwork_id = ? AND owner_token = ? AND fence = ?`,
-    ).bind(ARTWORK_ID, ownerToken, fence),
-  ]);
+  const lock = await acquireCommitLock(env, job.id);
+  try {
+    await assertCommitStillValid(env, job, lock);
+    const now = Date.now();
+    const committed = await env.DB.batch([
+      env.DB.prepare(COMMIT_PATCH_REVISION_SQL).bind(
+        revisionId,
+        job.id,
+        job.workerToken,
+        job.leaseFence,
+        lock.ownerToken,
+        lock.fence,
+        now,
+      ),
+      env.DB.prepare(
+        `INSERT INTO blobs (
+           id, artwork_id, kind, r2_key, content_type, byte_length,
+           sha256, width, height, created_at
+         )
+         SELECT ?, ?, 'patch', ?, ?, ?, ?, 1024, 1024, ?
+         WHERE EXISTS (SELECT 1 FROM revisions WHERE id = ?)`,
+      ).bind(
+        blobId,
+        ARTWORK_ID,
+        key,
+        patch.contentType,
+        patch.bytes.byteLength,
+        hash,
+        now,
+        revisionId,
+      ),
+      env.DB.prepare(
+        `INSERT INTO revision_patches (
+           revision_id, patch_blob_id, display_mask_blob_id,
+           frame_x, frame_y, frame_width, frame_height
+         )
+         SELECT ?, ?, ?, frame_x, frame_y, frame_width, frame_height
+         FROM edit_jobs
+         WHERE id = ? AND EXISTS (SELECT 1 FROM revisions WHERE id = ?)`,
+      ).bind(
+        revisionId,
+        blobId,
+        displayMaskBlobId,
+        job.id,
+        revisionId,
+      ),
+      env.DB.prepare(
+        `UPDATE artworks
+         SET head_revision_id = ?,
+             head_sequence = (SELECT sequence FROM revisions WHERE id = ?)
+         WHERE id = ?
+           AND EXISTS (SELECT 1 FROM revisions WHERE id = ?)
+           AND head_revision_id = (
+             SELECT parent_revision_id FROM revisions WHERE id = ?
+           )`,
+      ).bind(revisionId, revisionId, ARTWORK_ID, revisionId, revisionId),
+      env.DB.prepare(
+        `UPDATE edit_jobs
+         SET state = 'succeeded',
+             result_revision_id = ?,
+             openai_request_id = ?,
+             worker_token = NULL,
+             lease_expires_at = NULL,
+             updated_at = ?,
+             completed_at = ?
+         WHERE id = ?
+           AND worker_token = ?
+           AND lease_fence = ?
+           AND EXISTS (SELECT 1 FROM revisions WHERE id = ?)`,
+      ).bind(
+        revisionId,
+        patch.providerRequestId ?? null,
+        now,
+        now,
+        job.id,
+        job.workerToken,
+        job.leaseFence,
+        revisionId,
+      ),
+      env.DB.prepare(
+        `UPDATE artwork_commit_locks
+         SET owner_token = NULL, job_id = NULL, acquired_at = NULL,
+             lease_expires_at = NULL
+         WHERE artwork_id = ? AND owner_token = ? AND fence = ?`,
+      ).bind(ARTWORK_ID, lock.ownerToken, lock.fence),
+    ]);
+
+    if (Number(committed[0]?.meta.changes ?? 0) === 0) {
+      throw new DomainError(
+        "STALE_BASE_REVISION",
+        "This generated patch could not be rebased safely. Nothing was added to history.",
+      );
+    }
+  } finally {
+    await releaseCommitLock(env, lock);
+  }
 }
 
-async function commitRevert(
-  env: AppEnv,
-  job: QueueJob,
-  ownerToken: string,
-  fence: number,
-  sequence: number,
-) {
+export const COMMIT_REVERT_REVISION_SQL = `WITH candidate(
+  revision_id, job_id, worker_token, lease_fence,
+  commit_token, commit_fence, now_ms
+) AS (VALUES (?, ?, ?, ?, ?, ?, ?))
+INSERT INTO revisions (
+  id, artwork_id, sequence, parent_revision_id, job_id, origin, status,
+  author_id, prompt, region_x, region_y, region_width, region_height,
+  revert_target_revision_id, created_at
+)
+SELECT
+  c.revision_id,
+  job.artwork_id,
+  artwork.head_sequence + 1,
+  artwork.head_revision_id,
+  job.id,
+  'revert',
+  'accepted',
+  job.author_id,
+  job.prompt,
+  job.region_x,
+  job.region_y,
+  job.region_width,
+  job.region_height,
+  job.target_revision_id,
+  c.now_ms
+FROM candidate c
+JOIN edit_jobs job ON job.id = c.job_id
+JOIN artworks artwork ON artwork.id = job.artwork_id
+JOIN revisions base
+  ON base.artwork_id = job.artwork_id AND base.id = job.base_revision_id
+JOIN artwork_commit_locks commit_lock
+  ON commit_lock.artwork_id = job.artwork_id
+WHERE job.kind = 'revert'
+  AND job.state = 'committing'
+  AND job.worker_token = c.worker_token
+  AND job.lease_fence = c.lease_fence
+  AND job.lease_expires_at > c.now_ms
+  AND commit_lock.owner_token = c.commit_token
+  AND commit_lock.fence = c.commit_fence
+  AND commit_lock.job_id = job.id
+  AND commit_lock.lease_expires_at > c.now_ms
+  AND NOT EXISTS (
+    SELECT 1 FROM revisions accepted
+    WHERE accepted.artwork_id = job.artwork_id
+      AND accepted.sequence > base.sequence
+      AND accepted.region_x IS NOT NULL
+      AND accepted.region_x < job.region_x + job.region_width
+      AND accepted.region_x + accepted.region_width > job.region_x
+      AND accepted.region_y < job.region_y + job.region_height
+      AND accepted.region_y + accepted.region_height > job.region_y
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM edit_jobs active
+    WHERE active.artwork_id = job.artwork_id
+      AND active.id <> job.id
+      AND active.state IN ('queued', 'moderating', 'generating', 'committing')
+      AND active.lease_expires_at > c.now_ms
+      AND active.region_x < job.region_x + job.region_width
+      AND active.region_x + active.region_width > job.region_x
+      AND active.region_y < job.region_y + job.region_height
+      AND active.region_y + active.region_height > job.region_y
+  )`;
+
+async function commitRevert(env: AppEnv, job: QueueJob) {
   if (!job.targetRevisionId) {
     throw new DomainError("INTERNAL_ERROR", "The restore target is missing.");
   }
+  jobRegion(job);
   const revisionId = crypto.randomUUID();
-  const now = Date.now();
-  await env.DB.batch([
-    env.DB.prepare(
-      `INSERT INTO revisions
-       (id, artwork_id, sequence, parent_revision_id, job_id, origin, status, author_id,
-        prompt, revert_target_revision_id, created_at)
-       VALUES (?, ?, ?, ?, ?, 'revert', 'accepted', ?, ?, ?, ?)`,
-    ).bind(
-      revisionId,
-      ARTWORK_ID,
-      sequence,
-      job.baseRevisionId,
-      job.id,
-      job.authorId,
-      job.prompt,
-      job.targetRevisionId,
-      now,
-    ),
-    env.DB.prepare(
-      `UPDATE artworks SET head_revision_id = ?, head_sequence = ?
-       WHERE id = ? AND head_revision_id = ?`,
-    ).bind(revisionId, sequence, ARTWORK_ID, job.baseRevisionId),
-    env.DB.prepare(
-      `UPDATE edit_jobs SET state = 'succeeded', result_revision_id = ?,
-       updated_at = ?, completed_at = ?
-       WHERE id = ? AND worker_token = ? AND lock_fence = ?`,
-    ).bind(revisionId, now, now, job.id, ownerToken, fence),
-    env.DB.prepare(
-      `UPDATE queue_locks
-       SET state = 'idle', owner_token = NULL, job_id = NULL,
-           acquired_at = NULL, heartbeat_at = NULL, lease_expires_at = NULL
-       WHERE artwork_id = ? AND owner_token = ? AND fence = ?`,
-    ).bind(ARTWORK_ID, ownerToken, fence),
-  ]);
-}
-
-async function handleFailure(
-  env: AppEnv,
-  job: QueueJob,
-  ownerToken: string,
-  fence: number,
-  error: unknown,
-) {
-  const domain = error instanceof DomainError ? error : null;
-  const now = Date.now();
-  if (domain?.code === "PROVIDER_TEMPORARY" && Number(job.attemptCount) < 2) {
-    const attempt = Number(job.attemptCount) + 1;
-    await env.DB.batch([
+  const lock = await acquireCommitLock(env, job.id);
+  try {
+    await assertCommitStillValid(env, job, lock);
+    const now = Date.now();
+    const committed = await env.DB.batch([
+      env.DB.prepare(COMMIT_REVERT_REVISION_SQL).bind(
+        revisionId,
+        job.id,
+        job.workerToken,
+        job.leaseFence,
+        lock.ownerToken,
+        lock.fence,
+        now,
+      ),
+      env.DB.prepare(
+        `UPDATE artworks
+         SET head_revision_id = ?,
+             head_sequence = (SELECT sequence FROM revisions WHERE id = ?)
+         WHERE id = ?
+           AND EXISTS (SELECT 1 FROM revisions WHERE id = ?)
+           AND head_revision_id = (
+             SELECT parent_revision_id FROM revisions WHERE id = ?
+           )`,
+      ).bind(revisionId, revisionId, ARTWORK_ID, revisionId, revisionId),
       env.DB.prepare(
         `UPDATE edit_jobs
-         SET state = 'queued', attempt_count = ?, available_at = ?, worker_token = NULL,
-             lock_fence = NULL, lease_expires_at = NULL, updated_at = ?
-         WHERE id = ? AND worker_token = ? AND lock_fence = ?`,
-      ).bind(attempt, now + attempt * 5000, now, job.id, ownerToken, fence),
+         SET state = 'succeeded',
+             result_revision_id = ?,
+             worker_token = NULL,
+             lease_expires_at = NULL,
+             updated_at = ?,
+             completed_at = ?
+         WHERE id = ?
+           AND worker_token = ?
+           AND lease_fence = ?
+           AND EXISTS (SELECT 1 FROM revisions WHERE id = ?)`,
+      ).bind(
+        revisionId,
+        now,
+        now,
+        job.id,
+        job.workerToken,
+        job.leaseFence,
+        revisionId,
+      ),
       env.DB.prepare(
-        `UPDATE queue_locks
-         SET state = 'idle', owner_token = NULL, job_id = NULL,
-             acquired_at = NULL, heartbeat_at = NULL, lease_expires_at = NULL
+        `UPDATE artwork_commit_locks
+         SET owner_token = NULL, job_id = NULL, acquired_at = NULL,
+             lease_expires_at = NULL
          WHERE artwork_id = ? AND owner_token = ? AND fence = ?`,
-      ).bind(ARTWORK_ID, ownerToken, fence),
+      ).bind(ARTWORK_ID, lock.ownerToken, lock.fence),
     ]);
+    if (Number(committed[0]?.meta.changes ?? 0) === 0) {
+      throw new DomainError(
+        "STALE_BASE_REVISION",
+        "The full-canvas restore could not commit against the current artwork.",
+      );
+    }
+  } finally {
+    await releaseCommitLock(env, lock);
+  }
+}
+
+async function handleFailure(env: AppEnv, job: QueueJob, error: unknown) {
+  const domain = error instanceof DomainError ? error : null;
+  const now = Date.now();
+  if (domain?.code === "PROVIDER_TEMPORARY" && job.attemptCount < MAX_ATTEMPTS) {
+    const attempt = Number(job.attemptCount) + 1;
+    await env.DB.prepare(
+      `UPDATE edit_jobs
+       SET state = 'queued',
+           attempt_count = ?,
+           available_at = ?,
+           worker_token = NULL,
+           lease_expires_at = ?,
+           updated_at = ?
+       WHERE id = ?
+         AND worker_token = ?
+         AND lease_fence = ?
+         AND lease_expires_at > ?`,
+    )
+      .bind(
+        attempt,
+        now + attempt * 5000,
+        now + RESERVATION_LEASE_MS,
+        now,
+        job.id,
+        job.workerToken,
+        job.leaseFence,
+        now,
+      )
+      .run();
     return;
   }
 
@@ -545,28 +962,30 @@ async function handleFailure(
   const code = domain?.code ?? "INTERNAL_ERROR";
   const message =
     domain?.message ?? "The edit could not be completed. Nothing was added to history.";
-  await env.DB.batch([
-    env.DB.prepare(
-      `UPDATE edit_jobs
-       SET state = ?, error_code = ?, public_error_message = ?, updated_at = ?, completed_at = ?
-       WHERE id = ? AND worker_token = ? AND lock_fence = ?`,
-    ).bind(state, code, message, now, now, job.id, ownerToken, fence),
-    env.DB.prepare(
-      `UPDATE queue_locks
-       SET state = 'idle', owner_token = NULL, job_id = NULL,
-           acquired_at = NULL, heartbeat_at = NULL, lease_expires_at = NULL
-       WHERE artwork_id = ? AND owner_token = ? AND fence = ?`,
-    ).bind(ARTWORK_ID, ownerToken, fence),
-  ]);
-}
-
-async function releaseLock(env: AppEnv, ownerToken: string, fence: number) {
   await env.DB.prepare(
-    `UPDATE queue_locks
-     SET state = 'idle', owner_token = NULL, job_id = NULL,
-         acquired_at = NULL, heartbeat_at = NULL, lease_expires_at = NULL
-     WHERE artwork_id = ? AND owner_token = ? AND fence = ?`,
+    `UPDATE edit_jobs
+     SET state = ?,
+         error_code = ?,
+         public_error_message = ?,
+         worker_token = NULL,
+         lease_expires_at = NULL,
+         updated_at = ?,
+         completed_at = ?
+     WHERE id = ?
+       AND worker_token = ?
+       AND lease_fence = ?
+       AND lease_expires_at > ?`,
   )
-    .bind(ARTWORK_ID, ownerToken, fence)
+    .bind(
+      state,
+      code,
+      message,
+      now,
+      now,
+      job.id,
+      job.workerToken,
+      job.leaseFence,
+      now,
+    )
     .run();
 }

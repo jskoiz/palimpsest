@@ -7,9 +7,14 @@ export async function POST(request: Request) {
   try {
     const env = getRuntimeEnv();
     await ensurePalimpsest(env, request.url);
-    await processQueue(env, 1);
+    const result = await processQueue(env, 4);
     return Response.json(
-      { processed: true, message: "The serial queue has been checked." },
+      {
+        processed: result.claimed,
+        completed: result.completed,
+        workerFailures: result.workerFailures,
+        message: "Independent reservations were processed concurrently.",
+      },
       { headers: { "Cache-Control": "no-store", "X-Request-Id": requestId } },
     );
   } catch (error) {

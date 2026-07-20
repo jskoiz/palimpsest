@@ -84,8 +84,6 @@ export const revisions = sqliteTable(
     regionY: integer("region_y"),
     regionWidth: integer("region_width"),
     regionHeight: integer("region_height"),
-    tileX: integer("tile_x"),
-    tileY: integer("tile_y"),
     revertTargetRevisionId: text("revert_target_revision_id"),
     createdAt,
   },
@@ -141,16 +139,18 @@ export const revisionPatches = sqliteTable(
   "revision_patches",
   {
     revisionId: text("revision_id")
+      .primaryKey()
       .notNull()
       .references(() => revisions.id),
-    tileX: integer("tile_x").notNull(),
-    tileY: integer("tile_y").notNull(),
     patchBlobId: text("patch_blob_id")
       .notNull()
       .references(() => blobs.id),
     displayMaskBlobId: text("display_mask_blob_id").references(() => blobs.id),
+    frameX: integer("frame_x").notNull(),
+    frameY: integer("frame_y").notNull(),
+    frameWidth: integer("frame_width").notNull(),
+    frameHeight: integer("frame_height").notNull(),
   },
-  (table) => [primaryKey({ columns: [table.revisionId, table.tileX, table.tileY] })],
 );
 
 export const editJobs = sqliteTable(
@@ -183,12 +183,14 @@ export const editJobs = sqliteTable(
     baseRevisionId: text("base_revision_id").notNull(),
     targetRevisionId: text("target_revision_id"),
     prompt: text("prompt").notNull(),
-    tileX: integer("tile_x"),
-    tileY: integer("tile_y"),
     regionX: integer("region_x"),
     regionY: integer("region_y"),
     regionWidth: integer("region_width"),
     regionHeight: integer("region_height"),
+    frameX: integer("frame_x"),
+    frameY: integer("frame_y"),
+    frameWidth: integer("frame_width"),
+    frameHeight: integer("frame_height"),
     sourceBlobId: text("source_blob_id"),
     maskBlobId: text("mask_blob_id"),
     displayMaskBlobId: text("display_mask_blob_id"),
@@ -197,7 +199,7 @@ export const editJobs = sqliteTable(
     attemptCount: integer("attempt_count").notNull().default(0),
     availableAt: integer("available_at").notNull(),
     workerToken: text("worker_token"),
-    lockFence: integer("lock_fence"),
+    leaseFence: integer("lease_fence").notNull().default(0),
     leaseExpiresAt: integer("lease_expires_at"),
     resultRevisionId: text("result_revision_id"),
     openaiRequestId: text("openai_request_id"),
@@ -220,20 +222,22 @@ export const editJobs = sqliteTable(
       table.createdAt,
       table.id,
     ),
-    index("edit_jobs_requester_idx").on(table.requesterHash, table.state),
+    index("edit_jobs_reservation_idx").on(
+      table.artworkId,
+      table.state,
+      table.leaseExpiresAt,
+    ),
   ],
 );
 
-export const queueLocks = sqliteTable("queue_locks", {
+export const commitLocks = sqliteTable("artwork_commit_locks", {
   artworkId: text("artwork_id")
     .primaryKey()
     .references(() => artworks.id),
-  state: text("state", { enum: ["idle", "held"] }).notNull(),
   ownerToken: text("owner_token"),
   fence: integer("fence").notNull().default(0),
   jobId: text("job_id"),
   acquiredAt: integer("acquired_at"),
-  heartbeatAt: integer("heartbeat_at"),
   leaseExpiresAt: integer("lease_expires_at"),
 });
 

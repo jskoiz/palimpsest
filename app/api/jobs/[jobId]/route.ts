@@ -1,5 +1,9 @@
 import { createRequestId, getRuntimeEnv, jsonError } from "@/lib/palimpsest/runtime";
-import { ensurePalimpsest, getPublicJob } from "@/lib/palimpsest/store";
+import {
+  ensurePalimpsest,
+  getActiveRegions,
+  getPublicJob,
+} from "@/lib/palimpsest/store";
 
 export async function GET(
   request: Request,
@@ -11,7 +15,8 @@ export async function GET(
     await ensurePalimpsest(env, request.url);
     const { jobId } = await context.params;
     const job = await getPublicJob(env, jobId);
-    return Response.json({ job }, {
+    const activeRegions = await getActiveRegions(env);
+    return Response.json({ job, activeRegions }, {
       headers: { "Cache-Control": "no-store", "X-Request-Id": requestId },
     });
   } catch (error) {

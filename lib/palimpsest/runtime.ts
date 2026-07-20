@@ -28,6 +28,48 @@ export function createRequestId(): string {
   return crypto.randomUUID();
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object"
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function safeRegionBusyDetails(error: DomainError): Record<string, unknown> | undefined {
+  if (error.code !== "REGION_BUSY") return undefined;
+  const details = asRecord(asRecord(error)?.details);
+  const conflict = asRecord(details?.conflict);
+  const region = asRecord(conflict?.region);
+  if (!conflict || !region) return undefined;
+
+  const numbers = [region.x, region.y, region.width, region.height];
+  if (
+    typeof conflict.jobId !== "string" ||
+    typeof conflict.author !== "string" ||
+    typeof conflict.state !== "string" ||
+    typeof conflict.createdAt !== "string" ||
+    typeof conflict.updatedAt !== "string" ||
+    !numbers.every((value) => typeof value === "number" && Number.isFinite(value))
+  ) {
+    return undefined;
+  }
+
+  return {
+    conflict: {
+      jobId: conflict.jobId,
+      author: conflict.author,
+      state: conflict.state,
+      region: {
+        x: region.x,
+        y: region.y,
+        width: region.width,
+        height: region.height,
+      },
+      createdAt: conflict.createdAt,
+      updatedAt: conflict.updatedAt,
+    },
+  };
+}
+
 export function jsonError(
   error: unknown,
   requestId: string,
@@ -36,7 +78,9 @@ export function jsonError(
   const domainError = error instanceof DomainError ? error : null;
   const code = domainError?.code ?? "INTERNAL_ERROR";
   const status =
-    code === "STALE_BASE_REVISION" || code === "IDEMPOTENCY_CONFLICT"
+    code === "STALE_BASE_REVISION" ||
+    code === "IDEMPOTENCY_CONFLICT" ||
+    code === "REGION_BUSY"
       ? 409
       : code === "RATE_LIMITED"
         ? 429
@@ -52,9 +96,17 @@ export function jsonError(
   const message =
     domainError?.message ??
     "Palimpsest could not complete that request. Nothing was added to history.";
+  const publicDetails = details ?? (domainError ? safeRegionBusyDetails(domainError) : undefined);
 
   return Response.json(
-    { error: { code, message, requestId, ...(details ? { details } : {}) } },
+    {
+      error: {
+        code,
+        message,
+        requestId,
+        ...(publicDetails ? { details: publicDetails } : {}),
+      },
+    },
     { status },
   );
 }

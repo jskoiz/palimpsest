@@ -24,7 +24,6 @@ type EditMeta = {
   displayName?: string;
   prompt?: string;
   executionMode?: "demo" | "openai";
-  tile?: { x?: number; y?: number };
   region?: { x?: number; y?: number; width?: number; height?: number };
   fill?: boolean;
   strokes?: Array<{
@@ -58,13 +57,13 @@ export async function POST(request: Request) {
       throw new DomainError("INVALID_REQUEST", "Edit metadata is required.");
     }
     if (!(sourceValue instanceof File) || !(maskValue instanceof File)) {
-      throw new DomainError("INVALID_MASK", "A source tile and PNG mask are required.");
+      throw new DomainError("INVALID_MASK", "A source context frame and PNG mask are required.");
     }
     if (sourceValue.type !== "image/png" || maskValue.type !== "image/png") {
       throw new DomainError("INVALID_MASK", "Source and mask files must be PNG images.");
     }
     if (sourceValue.size > 8 * 1024 * 1024 || maskValue.size > 2 * 1024 * 1024) {
-      throw new DomainError("PAYLOAD_TOO_LARGE", "The source tile or mask is too large.");
+      throw new DomainError("PAYLOAD_TOO_LARGE", "The source frame or mask is too large.");
     }
 
     let meta: EditMeta;
@@ -91,8 +90,13 @@ export async function POST(request: Request) {
         "Live image editing is not configured. Choose the deterministic demo renderer instead.",
       );
     }
+    if (Object.hasOwn(meta, "tile")) {
+      throw new DomainError(
+        "INVALID_REQUEST",
+        "Edit regions use global artwork coordinates and must not include a tile.",
+      );
+    }
     const validated = validateRegion({
-      tile: meta.tile,
       region: meta.region,
       fill: meta.fill,
       strokes: meta.strokes,
@@ -115,7 +119,6 @@ export async function POST(request: Request) {
       baseRevisionId: meta.baseRevisionId,
       displayName,
       prompt,
-      tile: validated.tile,
       region: validated.region,
       fill: validated.fill,
       strokes: validated.strokes,
