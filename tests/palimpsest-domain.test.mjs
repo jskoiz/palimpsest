@@ -277,6 +277,32 @@ test("live image prompts keep random objects whole without forcing an art style"
   assert.doesNotMatch(prompt, /vermilion|graphite|mixed-media/i);
 });
 
+test("reference-image prompts use the second input without pasting its frame", () => {
+  const prompt = buildOpenAiEditPrompt("Add the flower from my reference.", true);
+  assert.match(prompt, /second supplied image as a direct visual reference/i);
+  assert.match(prompt, /do not paste its rectangular background/i);
+  assert.match(prompt, /Add the flower from my reference\./);
+});
+
+test("reference images stay optional, visible in the patch, and reach live generation", async () => {
+  const [routeSource, clientSource, queueSource, storeSource] = await Promise.all([
+    readFile(new URL("../app/api/edits/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../lib/palimpsest/queue.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/palimpsest/store.ts", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(clientSource, /form\.append\("reference", referenceImage\.blob/);
+  assert.match(clientSource, /mono-reference-on-canvas/);
+  assert.match(clientSource, /image\/png,image\/jpeg,image\/webp/);
+  assert.match(routeSource, /referenceValue instanceof File/);
+  assert.match(routeSource, /referenceBytes/);
+  assert.match(storeSource, /reference_blob_id/);
+  assert.match(storeSource, /'reference'/);
+  assert.match(queueSource, /palimpsest-reference\.png/);
+  assert.match(queueSource, /buildOpenAiEditPrompt\(job\.prompt, Boolean\(reference\)\)/);
+});
+
 test("stale base revisions are rejected without an implicit rebase", () => {
   assert.equal(assertFreshBase("head-7", "head-7"), true);
   expectCode(() => assertFreshBase("head-6", "head-7"), "STALE_BASE_REVISION");

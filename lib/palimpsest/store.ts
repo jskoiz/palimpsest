@@ -482,6 +482,7 @@ type InsertEditInput = {
   requesterHash: string;
   sourceBytes: Uint8Array;
   maskBytes: Uint8Array;
+  referenceBytes?: Uint8Array;
 };
 
 type ExistingIdempotencyRow = {
@@ -537,14 +538,14 @@ export const INSERT_EDIT_RESERVATION_SQL = `WITH candidate(
   job_id, artwork_id, execution_mode, author_id, requester_hash, base_revision_id,
   prompt, region_x, region_y, region_width, region_height,
   frame_x, frame_y, frame_width, frame_height,
-  source_blob_id, mask_blob_id, display_mask_blob_id,
+  source_blob_id, mask_blob_id, display_mask_blob_id, reference_blob_id,
   idempotency_key, request_fingerprint, available_at, lease_expires_at, now_ms
-) AS (VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?))
+) AS (VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?))
 INSERT OR IGNORE INTO edit_jobs (
   id, artwork_id, kind, state, execution_mode, author_id, requester_hash,
   base_revision_id, prompt, region_x, region_y, region_width, region_height,
   frame_x, frame_y, frame_width, frame_height,
-  source_blob_id, mask_blob_id, display_mask_blob_id,
+  source_blob_id, mask_blob_id, display_mask_blob_id, reference_blob_id,
   idempotency_key, request_fingerprint, available_at, lease_expires_at,
   created_at, updated_at
 )
@@ -553,7 +554,7 @@ SELECT
   c.requester_hash, c.base_revision_id, c.prompt,
   c.region_x, c.region_y, c.region_width, c.region_height,
   c.frame_x, c.frame_y, c.frame_width, c.frame_height,
-  c.source_blob_id, c.mask_blob_id, c.display_mask_blob_id,
+  c.source_blob_id, c.mask_blob_id, c.display_mask_blob_id, c.reference_blob_id,
   c.idempotency_key, c.request_fingerprint, c.available_at, c.lease_expires_at,
   c.now_ms, c.now_ms
 FROM candidate c
@@ -660,12 +661,13 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
     strokes: input.strokes,
     generation: "live-ai",
   });
-  const [sourceHash, maskHash] = await Promise.all([
+  const [sourceHash, maskHash, referenceHash] = await Promise.all([
     sha256Hex(input.sourceBytes),
     sha256Hex(input.maskBytes),
+    input.referenceBytes ? sha256Hex(input.referenceBytes) : Promise.resolve(null),
   ]);
   const fingerprint = await sha256Hex(
-    `${normalizedMeta}:${sourceHash}:${maskHash}`,
+    `${normalizedMeta}:${sourceHash}:${maskHash}:${referenceHash ?? "none"}`,
   );
 
   const jobId = crypto.randomUUID();
@@ -673,6 +675,7 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
   const sourceBlobId = crypto.randomUUID();
   const maskBlobId = crypto.randomUUID();
   const displayMaskBlobId = crypto.randomUUID();
+  const referenceBlobId = input.referenceBytes ? crypto.randomUUID() : null;
   const now = Date.now();
   const leaseExpiresAt = now + RESERVATION_LEASE_MS;
   const displayMask = new TextEncoder().encode(
@@ -686,6 +689,9 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
   const sourceKey = `artworks/palimpsest/inputs/${jobId}/source-${sourceHash}.png`;
   const maskKey = `artworks/palimpsest/masks/${jobId}/provider-${maskHash}.png`;
   const displayMaskKey = `artworks/palimpsest/masks/${jobId}/display-${displayMaskHash}.svg`;
+  const referenceKey = referenceHash
+    ? `artworks/palimpsest/inputs/${jobId}/reference-${referenceHash}.png`
+    : null;
 
   const reservation = await env.DB.batch([
     env.DB.prepare(
@@ -758,6 +764,7 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
       sourceBlobId,
       maskBlobId,
       displayMaskBlobId,
+      referenceBlobId,
       input.idempotencyKey,
       fingerprint,
       PREPARING_AVAILABLE_AT,
@@ -823,6 +830,14 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
       customMetadata: { sha256: maskHash, private: "true" },
     }),
   ];
+  if (input.referenceBytes && referenceHash && referenceKey) {
+    blobWrites.push(
+      env.BLOBS.put(referenceKey, input.referenceBytes, {
+        httpMetadata: { contentType: "image/png" },
+        customMetadata: { sha256: referenceHash, private: "true" },
+      }),
+    );
+  }
   blobWrites.push(env.BLOBS.put(displayMaskKey, displayMask, {
     httpMetadata: { contentType: "image/svg+xml" },
     customMetadata: { sha256: displayMaskHash, immutable: "true" },
@@ -852,6 +867,24 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
        VALUES (?, ?, 'mask', ?, 'image/png', ?, ?, 1024, 1024, ?)`,
     ).bind(maskBlobId, ARTWORK_ID, maskKey, input.maskBytes.byteLength, maskHash, now),
   ];
+  if (input.referenceBytes && referenceBlobId && referenceHash && referenceKey) {
+    statements.push(
+      env.DB
+        .prepare(
+          `INSERT INTO blobs
+           (id, artwork_id, kind, r2_key, content_type, byte_length, sha256, width, height, created_at)
+           VALUES (?, ?, 'reference', ?, 'image/png', ?, ?, 1024, 1024, ?)`,
+        )
+        .bind(
+          referenceBlobId,
+          ARTWORK_ID,
+          referenceKey,
+          input.referenceBytes.byteLength,
+          referenceHash,
+          now,
+        ),
+    );
+  }
   statements.push(
     env.DB
       .prepare(

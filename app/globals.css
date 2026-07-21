@@ -415,9 +415,40 @@ body {
   pointer-events: none;
 }
 
+.mono-reference-on-canvas {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  background: rgba(var(--ink), 0.26);
+  pointer-events: none;
+}
+
+.mono-reference-on-canvas > img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+  opacity: 0.88;
+}
+
+.mono-reference-on-canvas > span {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  padding: 2px 5px;
+  background: rgba(var(--ink), 0.72);
+  color: #fff;
+  font-family: var(--font-mono);
+  font-size: 7px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
 .mono-mask-canvas {
   position: absolute;
   inset: 0;
+  z-index: 1;
   width: 100%;
   height: 100%;
   background: rgba(224, 118, 95, 0.04);
@@ -908,6 +939,74 @@ body {
   font-size: 10px;
 }
 
+.mono-reference-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.mono-reference-control {
+  display: flex;
+  align-items: center;
+  flex: 0 1 148px;
+  min-width: 108px;
+  height: 29px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.25);
+}
+
+.mono-reference-control:focus-within {
+  border-bottom-color: rgba(255, 255, 255, 0.8);
+}
+
+.mono-reference-trigger {
+  display: flex !important;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  height: 100%;
+  color: rgba(255, 255, 255, 0.64) !important;
+  font-family: var(--font-mono) !important;
+  font-size: 9px !important;
+  text-align: left;
+}
+
+.mono-reference-trigger:disabled,
+.mono-reference-remove:disabled {
+  opacity: 0.45;
+}
+
+.mono-reference-trigger > img {
+  width: 23px;
+  height: 23px;
+  flex: 0 0 23px;
+  border: 1px solid rgba(255, 255, 255, 0.36);
+  background: rgba(var(--ink), 0.35);
+  object-fit: cover;
+}
+
+.mono-reference-trigger > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mono-reference-control.has-image .mono-reference-trigger {
+  flex: 1;
+}
+
+.mono-reference-remove {
+  width: 22px;
+  height: 100%;
+  flex: 0 0 22px;
+  color: var(--accent) !important;
+  font-family: var(--font-mono) !important;
+  font-size: 13px !important;
+}
+
 .mono-input {
   flex: 1;
   min-width: 120px;
@@ -1323,6 +1422,14 @@ body {
 
   .mono-edit-form {
     flex-wrap: wrap;
+  }
+
+  .mono-reference-control {
+    flex: 1 1 148px;
+  }
+
+  .mono-edit-form > .mono-input:not(.is-name) {
+    flex: 1 1 220px;
   }
 
   .mono-edit-row {

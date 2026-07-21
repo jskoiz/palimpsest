@@ -28,16 +28,18 @@ function applyMigration(db, sql) {
 async function migratedDatabase() {
   const db = new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
-  const [initial, parallel, liveOnly, whiteCanvasReset] = await Promise.all([
+  const [initial, parallel, liveOnly, whiteCanvasReset, referenceImages] = await Promise.all([
     readFile(new URL("drizzle/0000_slow_gambit.sql", root), "utf8"),
     readFile(new URL("drizzle/0001_parallel_regions.sql", root), "utf8"),
     readFile(new URL("drizzle/0002_live_ai_only.sql", root), "utf8"),
     readFile(new URL("drizzle/0003_white_canvas_reset.sql", root), "utf8"),
+    readFile(new URL("drizzle/0004_reference_images.sql", root), "utf8"),
   ]);
   applyMigration(db, initial);
   applyMigration(db, parallel);
   applyMigration(db, liveOnly);
   applyMigration(db, whiteCanvasReset);
+  applyMigration(db, referenceImages);
   return db;
 }
 
@@ -68,6 +70,7 @@ function reservationValues({
   now,
   baseRevisionId = "r0",
   requesterHash = "shared-nat",
+  referenceBlobId = null,
 }) {
   return [
     jobId,
@@ -88,6 +91,7 @@ function reservationValues({
     `source-${jobId}`,
     `mask-${jobId}`,
     `display-${jobId}`,
+    referenceBlobId,
     `idem-${jobId}`,
     `fingerprint-${jobId}`,
     now,
@@ -95,6 +99,13 @@ function reservationValues({
     now,
   ];
 }
+
+test("reference image migration adds an optional private input pointer", async () => {
+  const db = await migratedDatabase();
+  const columns = db.prepare("PRAGMA table_info(edit_jobs)").all();
+  assert.equal(columns.some((column) => column.name === "reference_blob_id"), true);
+  db.close();
+});
 
 function insertCommittingJob(db, {
   id,
@@ -408,8 +419,14 @@ test("atomic spatial reservations reject overlap, allow touching, and expire cle
       authorId: "author-a",
       region: { x: 0, y: 0, width: 100, height: 100 },
       now,
+      referenceBlobId: "reference-job-a",
     })).changes,
     1,
+  );
+  assert.equal(
+    db.prepare("SELECT reference_blob_id FROM edit_jobs WHERE id = 'job-a'").get()
+      .reference_blob_id,
+    "reference-job-a",
   );
   assert.equal(
     insert.run(...reservationValues({
@@ -464,8 +481,8 @@ test("expired input preparation becomes terminal instead of remaining queued", a
     region: { x: 0, y: 0, width: 100, height: 100 },
     now,
   });
-  values[20] = Number.MAX_SAFE_INTEGER;
-  values[21] = now - 1;
+  values[21] = Number.MAX_SAFE_INTEGER;
+  values[22] = now - 1;
   assert.equal(db.prepare(insertSql).run(...values).changes, 1);
 
   assert.equal(
@@ -511,7 +528,7 @@ test("expired ready reservations become terminal and cannot be claimed", async (
     region: { x: 0, y: 0, width: 100, height: 100 },
     now,
   });
-  values[21] = now - 1;
+  values[22] = now - 1;
   assert.equal(db.prepare(insertSql).run(...values).changes, 1);
 
   assert.equal(
@@ -577,7 +594,7 @@ test("expired active work cannot be revived over a newer reservation", async () 
     region: { x: 0, y: 0, width: 100, height: 100 },
     now: now - 100,
   });
-  expired[21] = now - 1;
+  expired[22] = now - 1;
   assert.equal(insert.run(...expired).changes, 1);
   db.prepare(
     `UPDATE edit_jobs
@@ -715,6 +732,7 @@ test("queue retires non-live jobs before claiming independent live work", async 
     authorId: "author-a",
     region: { x: 0, y: 0, width: 100, height: 100 },
     now,
+    referenceBlobId: "reference-claim-a",
   }));
   insert.run(...reservationValues({
     jobId: "claim-b",
@@ -754,6 +772,7 @@ test("queue retires non-live jobs before claiming independent live work", async 
     now + 2,
   );
   assert.deepEqual(new Set([first.id, second.id]), new Set(["claim-a", "claim-b"]));
+  assert.equal(first.referenceBlobId, "reference-claim-a");
   assert.equal(first.state, "moderating");
   assert.equal(second.state, "moderating");
   assert.notEqual(first.workerToken, second.workerToken);

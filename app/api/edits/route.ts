@@ -43,7 +43,7 @@ export async function POST(request: Request) {
       );
     }
     const contentLength = Number(request.headers.get("Content-Length") ?? 0);
-    if (contentLength > 12 * 1024 * 1024) {
+    if (contentLength > 18 * 1024 * 1024) {
       throw new DomainError("PAYLOAD_TOO_LARGE", "The edit upload is too large.");
     }
     if (!request.headers.get("Content-Type")?.includes("multipart/form-data")) {
@@ -58,6 +58,7 @@ export async function POST(request: Request) {
     const metaValue = form.get("meta");
     const sourceValue = form.get("source");
     const maskValue = form.get("mask");
+    const referenceValue = form.get("reference");
     if (typeof metaValue !== "string") {
       throw new DomainError("INVALID_REQUEST", "Edit metadata is required.");
     }
@@ -67,8 +68,17 @@ export async function POST(request: Request) {
     if (sourceValue.type !== "image/png" || maskValue.type !== "image/png") {
       throw new DomainError("INVALID_MASK", "Source and mask files must be PNG images.");
     }
+    if (referenceValue !== null && !(referenceValue instanceof File)) {
+      throw new DomainError("INVALID_REQUEST", "The reference image upload is invalid.");
+    }
+    if (referenceValue instanceof File && referenceValue.type !== "image/png") {
+      throw new DomainError("INVALID_REQUEST", "The reference image must be a PNG file.");
+    }
     if (sourceValue.size > 8 * 1024 * 1024 || maskValue.size > 2 * 1024 * 1024) {
       throw new DomainError("PAYLOAD_TOO_LARGE", "The source frame or mask is too large.");
+    }
+    if (referenceValue instanceof File && referenceValue.size > 6 * 1024 * 1024) {
+      throw new DomainError("PAYLOAD_TOO_LARGE", "The reference image is too large.");
     }
 
     let meta: EditMeta;
@@ -105,14 +115,26 @@ export async function POST(request: Request) {
       fill: meta.fill,
       strokes: meta.strokes,
     });
-    const [sourceBytes, maskBytes] = await Promise.all([
+    const [sourceBytes, maskBytes, referenceBytes] = await Promise.all([
       sourceValue.arrayBuffer().then((value) => new Uint8Array(value)),
       maskValue.arrayBuffer().then((value) => new Uint8Array(value)),
+      referenceValue instanceof File
+        ? referenceValue.arrayBuffer().then((value) => new Uint8Array(value))
+        : Promise.resolve(undefined),
     ]);
     for (const bytes of [sourceBytes, maskBytes]) {
       const dimensions = readPngDimensions(bytes);
       if (dimensions.width !== 1024 || dimensions.height !== 1024) {
         throw new DomainError("INVALID_MASK", "Source and mask images must be exactly 1024 by 1024 pixels.");
+      }
+    }
+    if (referenceBytes) {
+      const dimensions = readPngDimensions(referenceBytes);
+      if (dimensions.width !== 1024 || dimensions.height !== 1024) {
+        throw new DomainError(
+          "INVALID_REQUEST",
+          "The reference image must be exactly 1024 by 1024 pixels.",
+        );
       }
     }
 
@@ -130,6 +152,7 @@ export async function POST(request: Request) {
       requesterHash: hash,
       sourceBytes,
       maskBytes,
+      referenceBytes,
     });
     return Response.json(
       { job },

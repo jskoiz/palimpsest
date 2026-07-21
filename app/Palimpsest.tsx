@@ -3,6 +3,7 @@
 /* eslint-disable @next/next/no-img-element -- Immutable R2 tile layers must remain raw pixels for exact canvas compositing. */
 
 import type {
+  ChangeEvent as ReactChangeEvent,
   CSSProperties,
   KeyboardEvent as ReactKeyboardEvent,
   PointerEvent as ReactPointerEvent,
@@ -132,6 +133,12 @@ type Stroke = {
   points: Array<{ x: number; y: number }>;
 };
 
+type ReferenceImage = {
+  blob: Blob;
+  fileName: string;
+  previewUrl: string;
+};
+
 const terminalJobStates = new Set(["succeeded", "stale", "rejected", "failed"]);
 
 const AUTO_HIDE = true;
@@ -142,6 +149,9 @@ const COLLAB_POLL_MS = 3000;
 const HIDDEN_COLLAB_POLL_MS = 8000;
 const DEFAULT_REGION = { x: 832, y: 864, width: 384, height: 320 };
 const WELCOME_STORAGE_KEY = "palimpsest:welcome:v1";
+const REFERENCE_IMAGE_SIZE = 1024;
+const MAX_REFERENCE_UPLOAD_BYTES = 10 * 1024 * 1024;
+const REFERENCE_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 
 const EMPTY_ACTIVITY: ActivityPayload = {
   queue: { queued: 0, active: 0 },
@@ -512,7 +522,8 @@ function WelcomeDrawer({
                 <h2>Contribute</h2>
                 <p>
                   Place the patch anywhere, paint what may change, and describe the
-                  edit. Live outlines mark active work; every other spot stays open.
+                  edit. Add a reference image when useful. Live outlines mark active
+                  work; every other spot stays open.
                 </p>
               </section>
             </div>
@@ -571,6 +582,41 @@ function canvasBlob(canvas: HTMLCanvasElement, message: string): Promise<Blob> {
   return new Promise((resolve, reject) => {
     canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error(message))), "image/png");
   });
+}
+
+async function normalizeReferenceImage(file: File): Promise<Blob> {
+  let image: ImageBitmap;
+  try {
+    image = await createImageBitmap(file);
+  } catch {
+    throw new Error("That reference image could not be opened. Use a PNG, JPEG, or WebP file.");
+  }
+  try {
+    if (image.width < 1 || image.height < 1) {
+      throw new Error("That reference image has no visible pixels.");
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = REFERENCE_IMAGE_SIZE;
+    canvas.height = REFERENCE_IMAGE_SIZE;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("This browser cannot prepare reference images.");
+    const scale = Math.min(
+      REFERENCE_IMAGE_SIZE / image.width,
+      REFERENCE_IMAGE_SIZE / image.height,
+    );
+    const width = Math.max(1, Math.round(image.width * scale));
+    const height = Math.max(1, Math.round(image.height * scale));
+    context.drawImage(
+      image,
+      Math.round((REFERENCE_IMAGE_SIZE - width) / 2),
+      Math.round((REFERENCE_IMAGE_SIZE - height) / 2),
+      width,
+      height,
+    );
+    return canvasBlob(canvas, "The reference image could not be encoded.");
+  } finally {
+    image.close();
+  }
 }
 
 async function flattenArtworkFrame(state: ArtworkState, frame: Region): Promise<Blob> {
@@ -723,6 +769,7 @@ export default function Palimpsest() {
   const [strokes, setStrokes] = useState<Stroke[]>([]);
   const [fillMask, setFillMask] = useState(false);
   const [prompt, setPrompt] = useState("");
+  const [referenceImage, setReferenceImage] = useState<ReferenceImage | null>(null);
   const [displayName, setDisplayName] = useState("anonymous visitor");
   const [submitted, setSubmitted] = useState(false);
   const [isPreparing, setIsPreparing] = useState(false);
@@ -745,6 +792,8 @@ export default function Palimpsest() {
   const maskPointer = useRef<number | null>(null);
   const overlayCoverRef = useRef<HTMLDivElement>(null);
   const maskCanvasRef = useRef<HTMLCanvasElement>(null);
+  const referenceInputRef = useRef<HTMLInputElement>(null);
+  const referencePreviewUrlRef = useRef<string | null>(null);
 
   const revisions = history?.revisions ?? EMPTY_REVISIONS;
   const selectedRevision = revisions[selectedIndex] ?? null;
@@ -865,6 +914,15 @@ export default function Palimpsest() {
     toastTimer.current = window.setTimeout(() => setToast(null), 4200);
   }, []);
 
+  const clearReferenceImage = useCallback(() => {
+    if (referencePreviewUrlRef.current) {
+      URL.revokeObjectURL(referencePreviewUrlRef.current);
+      referencePreviewUrlRef.current = null;
+    }
+    if (referenceInputRef.current) referenceInputRef.current.value = "";
+    setReferenceImage(null);
+  }, []);
+
   const loadState = useCallback(async (revisionId: string) => {
     const cached = stateCache.current.get(revisionId);
     if (cached) return cached;
@@ -965,6 +1023,15 @@ export default function Palimpsest() {
       }
     };
   }, [armIdleTimers]);
+
+  useEffect(
+    () => () => {
+      if (referencePreviewUrlRef.current) {
+        URL.revokeObjectURL(referencePreviewUrlRef.current);
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     if (!selectedRevision) return;
@@ -1098,6 +1165,7 @@ export default function Palimpsest() {
           setPrompt("");
           setStrokes([]);
           setFillMask(false);
+          clearReferenceImage();
         } else {
           showToast(payload.job.message ?? payload.job.error?.message ?? "nothing was added to the work");
         }
@@ -1109,7 +1177,7 @@ export default function Palimpsest() {
       }
     }, 1200);
     return () => window.clearTimeout(timer);
-  }, [job, refreshActivity, refreshHistory, requestQueueDrain, showToast]);
+  }, [clearReferenceImage, job, refreshActivity, refreshHistory, requestQueueDrain, showToast]);
 
   useEffect(() => {
     if (!compareOn || selectedIndex <= 0) return;
@@ -1217,8 +1285,9 @@ export default function Palimpsest() {
     setCompareOn(false);
     setSubmitted(false);
     setConfirmRestore(false);
+    clearReferenceImage();
     wake();
-  }, [wake]);
+  }, [clearReferenceImage, wake]);
 
   const openEditor = useCallback(async () => {
     const initial = latest.current;
@@ -1252,21 +1321,23 @@ export default function Palimpsest() {
     setStrokes([]);
     setFillMask(false);
     setPrompt("");
+    clearReferenceImage();
     setSubmitted(false);
     setSubmitError(null);
     setConfirmRestore(false);
     setView({ zoom: 1, x: 0, y: 0 });
     if (closeTimer.current) window.clearTimeout(closeTimer.current);
     wake();
-  }, [refreshActivity, showToast, wake]);
+  }, [clearReferenceImage, refreshActivity, showToast, wake]);
 
   const closeEditor = useCallback(() => {
     setEditOpen(false);
     setEditBase(null);
     setSubmitted(false);
+    clearReferenceImage();
     if (closeTimer.current) window.clearTimeout(closeTimer.current);
     wake();
-  }, [wake]);
+  }, [clearReferenceImage, wake]);
 
   const closeAll = useCallback(() => {
     setEditOpen(false);
@@ -1278,10 +1349,11 @@ export default function Palimpsest() {
     setSubmitted(false);
     setConfirmRestore(false);
     setHoverIdx(-1);
+    clearReferenceImage();
     setView({ zoom: 1, x: 0, y: 0 });
     if (closeTimer.current) window.clearTimeout(closeTimer.current);
     wake();
-  }, [wake]);
+  }, [clearReferenceImage, wake]);
 
   const returnToCurrent = useCallback(() => {
     if (!latest.current.revLen) return;
@@ -1622,6 +1694,39 @@ export default function Palimpsest() {
     return name.length >= 2 ? name : "";
   };
 
+  const selectReferenceImage = async (event: ReactChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0];
+    if (!file) return;
+    if (!REFERENCE_IMAGE_TYPES.has(file.type)) {
+      event.currentTarget.value = "";
+      setSubmitError("Use a PNG, JPEG, or WebP reference image.");
+      return;
+    }
+    if (file.size > MAX_REFERENCE_UPLOAD_BYTES) {
+      event.currentTarget.value = "";
+      setSubmitError("Reference images must be 10 MB or smaller.");
+      return;
+    }
+    setSubmitError(null);
+    setIsPreparing(true);
+    try {
+      const blob = await normalizeReferenceImage(file);
+      if (referencePreviewUrlRef.current) {
+        URL.revokeObjectURL(referencePreviewUrlRef.current);
+      }
+      const previewUrl = URL.createObjectURL(blob);
+      referencePreviewUrlRef.current = previewUrl;
+      setReferenceImage({ blob, fileName: file.name, previewUrl });
+    } catch (error) {
+      event.currentTarget.value = "";
+      setSubmitError(
+        error instanceof Error ? error.message : "The reference image could not be prepared.",
+      );
+    } finally {
+      setIsPreparing(false);
+    }
+  };
+
   const canSubmit =
     !isPreparing &&
     !submitted &&
@@ -1658,6 +1763,9 @@ export default function Palimpsest() {
       );
       form.append("source", source, "source.png");
       form.append("mask", mask, "mask.png");
+      if (referenceImage) {
+        form.append("reference", referenceImage.blob, "reference.png");
+      }
       const payload = await fetchJson<{ job: Job }>("/api/edits", {
         method: "POST",
         headers: { "Idempotency-Key": crypto.randomUUID() },
@@ -1677,6 +1785,7 @@ export default function Palimpsest() {
       closeTimer.current = window.setTimeout(() => {
         setEditOpen(false);
         setSubmitted(false);
+        clearReferenceImage();
       }, 2400);
     } catch (error) {
       setSubmitError(error instanceof Error ? error.message : "The edit could not be submitted.");
@@ -1895,6 +2004,12 @@ export default function Palimpsest() {
               >
                 {step === 1 && !submitted ? (
                   <span className="mono-patch-label">drag patch</span>
+                ) : null}
+                {referenceImage && step === 3 && !submitted ? (
+                  <div className="mono-reference-on-canvas" aria-hidden="true">
+                    <img src={referenceImage.previewUrl} alt="" />
+                    <span>reference</span>
+                  </div>
                 ) : null}
                 {step >= 2 && !submitted ? (
                   <canvas
@@ -2306,10 +2421,62 @@ export default function Palimpsest() {
           {step === 3 ? (
             <div className="mono-edit-form">
               <input
+                ref={referenceInputRef}
+                className="mono-reference-input"
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                aria-hidden="true"
+                tabIndex={-1}
+                disabled={submitted || isPreparing}
+                onChange={(event) => void selectReferenceImage(event)}
+              />
+              <div className={`mono-reference-control${referenceImage ? " has-image" : ""}`}>
+                <button
+                  type="button"
+                  className="mono-reference-trigger"
+                  aria-label={
+                    referenceImage
+                      ? `Replace reference image ${referenceImage.fileName}`
+                      : "Add an optional reference image"
+                  }
+                  title={referenceImage?.fileName}
+                  disabled={submitted || isPreparing}
+                  onClick={() => {
+                    if (!referenceInputRef.current) return;
+                    referenceInputRef.current.value = "";
+                    referenceInputRef.current.click();
+                  }}
+                >
+                  {referenceImage ? (
+                    <>
+                      <img src={referenceImage.previewUrl} alt="" />
+                      <span>{referenceImage.fileName}</span>
+                    </>
+                  ) : (
+                    <span>[+] reference</span>
+                  )}
+                </button>
+                {referenceImage ? (
+                  <button
+                    type="button"
+                    className="mono-reference-remove"
+                    aria-label={`Remove reference image ${referenceImage.fileName}`}
+                    disabled={submitted || isPreparing}
+                    onClick={clearReferenceImage}
+                  >
+                    ×
+                  </button>
+                ) : null}
+              </div>
+              <input
                 className="mono-input"
                 value={prompt}
                 maxLength={500}
-                placeholder="describe the change…"
+                placeholder={
+                  referenceImage
+                    ? "describe how to use the reference…"
+                    : "describe the change…"
+                }
                 aria-label="Describe the change"
                 disabled={submitted}
                 onChange={(event) => setPrompt(event.target.value)}

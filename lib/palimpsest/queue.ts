@@ -32,6 +32,7 @@ type QueueJob = {
   sourceBlobId: string | null;
   maskBlobId: string | null;
   displayMaskBlobId: string | null;
+  referenceBlobId: string | null;
   attemptCount: number;
   leaseFence: number;
   workerToken: string;
@@ -168,6 +169,7 @@ RETURNING
   source_blob_id AS sourceBlobId,
   mask_blob_id AS maskBlobId,
   display_mask_blob_id AS displayMaskBlobId,
+  reference_blob_id AS referenceBlobId,
   attempt_count AS attemptCount,
   lease_fence AS leaseFence,
   worker_token AS workerToken,
@@ -466,19 +468,27 @@ async function generateOpenAiPatch(
   if (!job.sourceBlobId || !job.maskBlobId) {
     throw new DomainError("INTERNAL_ERROR", "The image-edit inputs are missing.");
   }
-  const [sourceRecord, maskRecord] = await Promise.all([
+  const [sourceRecord, maskRecord, referenceRecord] = await Promise.all([
     getBlobRecord(env, job.sourceBlobId),
     getBlobRecord(env, job.maskBlobId),
+    job.referenceBlobId ? getBlobRecord(env, job.referenceBlobId) : Promise.resolve(null),
   ]);
   if (!sourceRecord || !maskRecord) {
     throw new DomainError("INTERNAL_ERROR", "The image-edit inputs could not be resolved.");
   }
-  const [source, mask] = await Promise.all([
+  if (job.referenceBlobId && !referenceRecord) {
+    throw new DomainError("INTERNAL_ERROR", "The reference image could not be resolved.");
+  }
+  const [source, mask, reference] = await Promise.all([
     env.BLOBS.get(sourceRecord.r2Key),
     env.BLOBS.get(maskRecord.r2Key),
+    referenceRecord ? env.BLOBS.get(referenceRecord.r2Key) : Promise.resolve(null),
   ]);
   if (!source || !mask) {
     throw new DomainError("INTERNAL_ERROR", "The image-edit inputs are no longer available.");
+  }
+  if (referenceRecord && !reference) {
+    throw new DomainError("INTERNAL_ERROR", "The reference image is no longer available.");
   }
 
   const form = new FormData();
@@ -495,7 +505,15 @@ async function generateOpenAiPatch(
       type: "image/png",
     }),
   );
-  form.append("prompt", buildOpenAiEditPrompt(job.prompt));
+  if (reference) {
+    form.append(
+      "image[]",
+      new File([await reference.arrayBuffer()], "palimpsest-reference.png", {
+        type: "image/png",
+      }),
+    );
+  }
+  form.append("prompt", buildOpenAiEditPrompt(job.prompt, Boolean(reference)));
   form.append("size", "1024x1024");
   form.append("quality", "medium");
   form.append("output_format", "png");

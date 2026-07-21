@@ -29,6 +29,13 @@
       "when": 1784666426000,
       "tag": "0003_white_canvas_reset",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1784670000000,
+      "tag": "0004_reference_images",
+      "breakpoints": true
     }
   ]
 }
