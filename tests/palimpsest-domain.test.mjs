@@ -193,6 +193,28 @@ test("request handlers rely on packaged migrations instead of runtime schema DDL
   assert.doesNotMatch(storeSource, /CREATE\s+(?:TABLE|INDEX|TRIGGER)/i);
 });
 
+test("new contributions expose only the live AI generation path", async () => {
+  const [routeSource, clientSource, queueSource, storeSource, readme] =
+    await Promise.all([
+      readFile(new URL("../app/api/edits/route.ts", import.meta.url), "utf8"),
+      readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8"),
+      readFile(new URL("../lib/palimpsest/queue.ts", import.meta.url), "utf8"),
+      readFile(new URL("../lib/palimpsest/store.ts", import.meta.url), "utf8"),
+      readFile(new URL("../README.md", import.meta.url), "utf8"),
+    ]);
+
+  assert.match(routeSource, /Generation mode is server-controlled/);
+  assert.match(routeSource, /OPENAI_API_KEY\?\.trim\(\)/);
+  assert.doesNotMatch(routeSource, /Deterministic demo|executionMode ===/);
+  assert.doesNotMatch(clientSource, /setExecutionMode|\[x\] live ai edit/);
+  assert.match(clientSource, /disabled=\{jobActive \|\| !liveEditingAvailable\}/);
+  assert.match(clientSource, /"generate live →"/);
+  assert.doesNotMatch(queueSource, /makeDemoPatchSvg|image\/svg\+xml/);
+  assert.match(storeSource, /"openai",\s*authorId/);
+  assert.match(storeSource, /available: Boolean\(env\.OPENAI_API_KEY\?\.trim\(\)\)/);
+  assert.doesNotMatch(readme, /demo renderer/i);
+});
+
 test("live image prompts keep random objects whole without forcing an art style", () => {
   const prompt = buildOpenAiEditPrompt("Add a bright plastic toy truck.");
   assert.match(prompt, /entire subject comfortably inside the editable area/i);

@@ -4,7 +4,6 @@ import {
   DomainError,
   createDisplayMaskSvg,
   displayMaskForLayer,
-  escapeXml,
   resolveLayerStack,
   serializeHistory,
   serializeRevision,
@@ -319,9 +318,7 @@ export async function listHistory(env: AppEnv, requestUrl: string) {
     revisions,
     headRevisionId: head?.id ?? null,
     editing: {
-      openaiAvailable: Boolean(env.OPENAI_API_KEY),
-      defaultMode: "demo",
-      demoNotice: "Deterministic demo edits are active; choose live AI editing when available.",
+      available: Boolean(env.OPENAI_API_KEY?.trim()),
     },
   };
 }
@@ -581,7 +578,6 @@ type InsertEditInput = {
   region: GlobalRegion;
   fill: boolean;
   strokes: Array<{ width: number; points: Array<{ x: number; y: number }> }>;
-  executionMode: "demo" | "openai";
   idempotencyKey: string;
   requesterHash: string;
   sourceBytes: Uint8Array;
@@ -762,7 +758,7 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
     frame,
     fill: input.fill,
     strokes: input.strokes,
-    executionMode: input.executionMode,
+    generation: "live-ai",
   });
   const [sourceHash, maskHash] = await Promise.all([
     sha256Hex(input.sourceBytes),
@@ -846,7 +842,7 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
     env.DB.prepare(INSERT_EDIT_RESERVATION_SQL).bind(
       jobId,
       ARTWORK_ID,
-      input.executionMode,
+      "openai",
       authorId,
       input.requesterHash,
       input.baseRevisionId,
@@ -1160,7 +1156,6 @@ export async function getPublicJob(env: AppEnv, jobId: string) {
   const row = await env.DB.prepare(
     `SELECT
        j.id AS id, j.kind AS kind, j.state AS state,
-       j.execution_mode AS executionMode,
        result_revision_id AS resultRevisionId,
        error_code AS errorCode,
        public_error_message AS publicErrorMessage,
@@ -1181,7 +1176,6 @@ export async function getPublicJob(env: AppEnv, jobId: string) {
       id: string;
       kind: string;
       state: string;
-      executionMode: string;
       resultRevisionId: string | null;
       errorCode: string | null;
       publicErrorMessage: string | null;
@@ -1213,7 +1207,6 @@ export async function getPublicJob(env: AppEnv, jobId: string) {
     id: row.id,
     kind: row.kind,
     state: row.state,
-    executionMode: row.executionMode,
     author: row.author,
     region:
       row.regionX == null
@@ -1237,27 +1230,4 @@ export async function getPublicJob(env: AppEnv, jobId: string) {
     submittedAt: new Date(Number(row.createdAt)).toISOString(),
     updatedAt: new Date(Number(row.updatedAt)).toISOString(),
   };
-}
-
-export function makeDemoPatchSvg(
-  prompt: string,
-  region: { x: number; y: number; width: number; height: number },
-  seed: string,
-) {
-  const numeric = Number.parseInt(seed.slice(0, 8), 16);
-  const colors = ["#a63b29", "#8b633d", "#30322f", "#b06b43"];
-  const primary = colors[numeric % colors.length];
-  const secondary = colors[(numeric + 2) % colors.length];
-  const lines = Array.from({ length: 9 }, (_, index) => {
-    const y = region.y + 18 + ((index * 37 + numeric) % Math.max(24, region.height - 36));
-    const bow = 18 + ((numeric >> (index % 12)) % 44);
-    return `<path d="M ${region.x - 24} ${y} Q ${region.x + region.width / 2} ${y - bow} ${region.x + region.width + 24} ${y + 8}"/>`;
-  }).join("");
-  const safePrompt = escapeXml(prompt.slice(0, 80));
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" aria-label="Deterministic demo patch: ${safePrompt}">
-    <defs><filter id="grain"><feTurbulence type="fractalNoise" baseFrequency=".045" numOctaves="3" seed="${numeric % 97}"/><feColorMatrix values="0 0 0 0 .35 0 0 0 0 .22 0 0 0 0 .14 0 0 0 .25 0"/></filter></defs>
-    <rect x="${region.x}" y="${region.y}" width="${region.width}" height="${region.height}" fill="${primary}" opacity=".18" filter="url(#grain)"/>
-    <g fill="none" stroke="${secondary}" stroke-width="4" opacity=".52">${lines}</g>
-    <g fill="${primary}" opacity=".42"><circle cx="${region.x + region.width * 0.28}" cy="${region.y + region.height * 0.36}" r="9"/><circle cx="${region.x + region.width * 0.7}" cy="${region.y + region.height * 0.66}" r="6"/></g>
-  </svg>`;
 }

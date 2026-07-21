@@ -28,12 +28,14 @@ function applyMigration(db, sql) {
 async function migratedDatabase() {
   const db = new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
-  const [initial, parallel] = await Promise.all([
+  const [initial, parallel, liveOnly] = await Promise.all([
     readFile(new URL("drizzle/0000_slow_gambit.sql", root), "utf8"),
     readFile(new URL("drizzle/0001_parallel_regions.sql", root), "utf8"),
+    readFile(new URL("drizzle/0002_live_ai_only.sql", root), "utf8"),
   ]);
   applyMigration(db, initial);
   applyMigration(db, parallel);
+  applyMigration(db, liveOnly);
   return db;
 }
 
@@ -68,7 +70,7 @@ function reservationValues({
   return [
     jobId,
     "palimpsest",
-    "demo",
+    "openai",
     authorId,
     requesterHash,
     baseRevisionId,
@@ -107,7 +109,7 @@ function insertCommittingJob(db, {
       frame_x, frame_y, frame_width, frame_height, display_mask_blob_id,
       idempotency_key, request_fingerprint, available_at, worker_token,
       lease_fence, lease_expires_at, created_at, updated_at
-    ) VALUES (?, 'palimpsest', 'edit', 'committing', 'demo', 'author-a', 'shared-nat',
+    ) VALUES (?, 'palimpsest', 'edit', 'committing', 'openai', 'author-a', 'shared-nat',
       ?, 'Commit patch', ?, ?, ?, ?, 0, 0, 1024, 1024, 'display-mask',
       ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
@@ -242,6 +244,67 @@ test("migration converts tile-local data and releases obsolete queue leases", as
   const patchColumns = db.prepare("PRAGMA table_info(revision_patches)").all();
   assert.equal(patchColumns.some((column) => column.name === "frame_x"), true);
   assert.throws(() => db.exec("UPDATE revisions SET prompt = 'mutated' WHERE id = 'r1'"));
+  db.close();
+});
+
+test("live-only migration retires non-live work without rewriting history", async () => {
+  const db = new DatabaseSync(":memory:");
+  db.exec("PRAGMA foreign_keys = ON");
+  const [initial, parallel, liveOnly] = await Promise.all([
+    readFile(new URL("drizzle/0000_slow_gambit.sql", root), "utf8"),
+    readFile(new URL("drizzle/0001_parallel_regions.sql", root), "utf8"),
+    readFile(new URL("drizzle/0002_live_ai_only.sql", root), "utf8"),
+  ]);
+  applyMigration(db, initial);
+  applyMigration(db, parallel);
+  seedArtwork(db);
+  db.exec(`
+    INSERT INTO revisions (
+      id, artwork_id, sequence, parent_revision_id, origin, status,
+      author_id, prompt, created_at
+    ) VALUES ('historical-demo', 'palimpsest', 1, 'r0', 'demo', 'accepted',
+      'author-a', 'Historical demo revision', 2);
+    INSERT INTO edit_jobs (
+      id, artwork_id, kind, state, execution_mode, author_id, requester_hash,
+      base_revision_id, prompt, region_x, region_y, region_width, region_height,
+      idempotency_key, request_fingerprint, available_at, worker_token,
+      lease_expires_at, created_at, updated_at
+    ) VALUES
+      ('retired-demo', 'palimpsest', 'edit', 'generating', 'demo', 'author-a',
+        'shared', 'r0', 'Retired demo', 0, 0, 100, 100, 'idem-demo',
+        'fingerprint-demo', 10, 'demo-worker', 60000, 10, 10),
+      ('live-openai', 'palimpsest', 'edit', 'queued', 'openai', 'author-b',
+        'shared', 'r0', 'Live edit', 300, 300, 100, 100, 'idem-live',
+        'fingerprint-live', 10, NULL, 60000, 10, 10);
+  `);
+
+  applyMigration(db, liveOnly);
+
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        "SELECT state, error_code, worker_token, lease_expires_at FROM edit_jobs WHERE id = 'retired-demo'",
+      ).get(),
+    },
+    {
+      state: "failed",
+      error_code: "NON_LIVE_MODE_REMOVED",
+      worker_token: null,
+      lease_expires_at: null,
+    },
+  );
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        "SELECT state, execution_mode FROM edit_jobs WHERE id = 'live-openai'",
+      ).get(),
+    },
+    { state: "queued", execution_mode: "openai" },
+  );
+  assert.equal(
+    db.prepare("SELECT origin FROM revisions WHERE id = 'historical-demo'").get().origin,
+    "demo",
+  );
   db.close();
 });
 
@@ -545,15 +608,24 @@ test("full-artwork reverts wait for every active reservation", async () => {
   db.close();
 });
 
-test("queue claims independent jobs without a requester or artwork-wide generation lock", async () => {
+test("queue retires non-live jobs before claiming independent live work", async () => {
   const db = await migratedDatabase();
   seedArtwork(db);
-  const [insertSql, claimSql] = await Promise.all([
+  const [insertSql, claimSql, retireSql] = await Promise.all([
     readSqlConstant("lib/palimpsest/store.ts", "INSERT_EDIT_RESERVATION_SQL"),
     readSqlConstant("lib/palimpsest/queue.ts", "CLAIM_NEXT_JOB_SQL"),
+    readSqlConstant("lib/palimpsest/queue.ts", "RETIRE_NON_LIVE_EDIT_JOBS_SQL"),
   ]);
   const now = 30_000;
   const insert = db.prepare(insertSql);
+  const retiredValues = reservationValues({
+    jobId: "claim-retired",
+    authorId: "author-c",
+    region: { x: 1000, y: 1000, width: 100, height: 100 },
+    now: now - 1,
+  });
+  retiredValues[2] = "demo";
+  insert.run(...retiredValues);
   insert.run(...reservationValues({
     jobId: "claim-a",
     authorId: "author-a",
@@ -566,6 +638,11 @@ test("queue claims independent jobs without a requester or artwork-wide generati
     region: { x: 500, y: 500, width: 100, height: 100 },
     now: now + 1,
   }));
+
+  assert.equal(
+    db.prepare(retireSql).run(now + 2, now + 2, "palimpsest").changes,
+    1,
+  );
 
   const claim = db.prepare(claimSql);
   const first = claim.get(
@@ -593,9 +670,17 @@ test("queue claims independent jobs without a requester or artwork-wide generati
     now + 2,
   );
   assert.deepEqual(new Set([first.id, second.id]), new Set(["claim-a", "claim-b"]));
-  assert.equal(first.state, "generating");
-  assert.equal(second.state, "generating");
+  assert.equal(first.state, "moderating");
+  assert.equal(second.state, "moderating");
   assert.notEqual(first.workerToken, second.workerToken);
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        "SELECT state, error_code FROM edit_jobs WHERE id = 'claim-retired'",
+      ).get(),
+    },
+    { state: "failed", error_code: "NON_LIVE_MODE_REMOVED" },
+  );
   db.close();
 });
 
@@ -624,7 +709,7 @@ async function setupStaleCommit({ jobRegion, acceptedRegion, activeRegion = null
         base_revision_id, prompt, region_x, region_y, region_width, region_height,
         idempotency_key, request_fingerprint, available_at, lease_expires_at,
         created_at, updated_at
-      ) VALUES ('active-overlap', 'palimpsest', 'edit', 'queued', 'demo',
+      ) VALUES ('active-overlap', 'palimpsest', 'edit', 'queued', 'openai',
         'author-c', 'other', 'r1', 'Active', ?, ?, ?, ?, 'active-idem',
         'active-fingerprint', ?, ?, ?, ?)
     `).run(

@@ -2,16 +2,13 @@ import {
   ARTWORK_ID,
   DomainError,
   buildOpenAiEditPrompt,
-  displayMaskForLayer,
 } from "./domain.mjs";
-import { regionRelativeToFrame } from "./geometry.mjs";
 import type { AppEnv } from "./runtime";
 import { readPngDimensions, sha256Hex } from "./runtime";
 import {
   PREPARING_AVAILABLE_AT,
   RESERVATION_LEASE_MS,
   getBlobRecord,
-  makeDemoPatchSvg,
   type GenerationFrame,
   type GlobalRegion,
 } from "./store";
@@ -20,7 +17,6 @@ type QueueJob = {
   id: string;
   kind: "edit" | "revert";
   state: "moderating" | "generating" | "committing";
-  executionMode: "demo" | "openai" | "none";
   authorId: string;
   baseRevisionId: string;
   targetRevisionId: string | null;
@@ -121,8 +117,7 @@ export async function processQueue(
 export const CLAIM_NEXT_JOB_SQL = `UPDATE edit_jobs
 SET state = CASE
       WHEN kind = 'revert' THEN 'committing'
-      WHEN execution_mode = 'openai' THEN 'moderating'
-      ELSE 'generating'
+      ELSE 'moderating'
     END,
     worker_token = ?,
     lease_fence = lease_fence + 1,
@@ -136,6 +131,7 @@ WHERE id = (
     AND candidate.state = 'queued'
     AND candidate.available_at <= ?
     AND candidate.lease_expires_at > ?
+    AND (candidate.kind = 'revert' OR candidate.execution_mode = 'openai')
     AND NOT EXISTS (
       SELECT 1 FROM edit_jobs active
       WHERE active.artwork_id = candidate.artwork_id
@@ -157,7 +153,6 @@ RETURNING
   id,
   kind,
   state,
-  execution_mode AS executionMode,
   author_id AS authorId,
   base_revision_id AS baseRevisionId,
   target_revision_id AS targetRevisionId,
@@ -225,6 +220,19 @@ WHERE artwork_id = ?
   AND worker_token IS NULL
   AND (lease_expires_at IS NULL OR lease_expires_at <= ?)`;
 
+export const RETIRE_NON_LIVE_EDIT_JOBS_SQL = `UPDATE edit_jobs
+SET state = 'failed',
+    error_code = 'NON_LIVE_MODE_REMOVED',
+    public_error_message = 'This queued edit used a retired non-live renderer. Submit it again for live AI generation.',
+    worker_token = NULL,
+    lease_expires_at = NULL,
+    updated_at = ?,
+    completed_at = ?
+WHERE artwork_id = ?
+  AND kind = 'edit'
+  AND execution_mode <> 'openai'
+  AND state IN ('queued', 'moderating', 'generating', 'committing')`;
+
 export const SUPERSEDE_EXPIRED_ACTIVE_RESERVATION_SQL = `UPDATE edit_jobs
 SET state = 'failed',
     error_code = 'QUEUE_RESERVATION_SUPERSEDED',
@@ -273,6 +281,11 @@ WHERE artwork_id = ?
 
 async function recoverExpiredJobs(env: AppEnv, now: number) {
   await env.DB.batch([
+    env.DB.prepare(RETIRE_NON_LIVE_EDIT_JOBS_SQL).bind(
+      now,
+      now,
+      ARTWORK_ID,
+    ),
     env.DB.prepare(EXPIRE_PREPARING_RESERVATION_SQL).bind(
       now,
       now,
@@ -327,42 +340,22 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
       return;
     }
 
-    const region = jobRegion(job);
-    const frame = jobFrame(job);
+    jobRegion(job);
+    jobFrame(job);
     if (!job.displayMaskBlobId) {
       throw new DomainError("INTERNAL_ERROR", "The generated layer mask is missing.");
     }
 
-    let patch: {
-      bytes: Uint8Array;
-      contentType: string;
-      providerRequestId?: string;
-    };
-    if (job.executionMode === "openai") {
-      if (!env.OPENAI_API_KEY) {
-        throw new DomainError(
-          "AI_CONFIGURATION_ERROR",
-          "Live image editing is not configured. Nothing was added to history.",
-        );
-      }
-      await moderatePrompt(env.OPENAI_API_KEY, job.prompt);
-      await updateStage(env, job, "moderating", "generating");
-      patch = await generateOpenAiPatch(env, job, env.OPENAI_API_KEY);
-    } else {
-      const maskRecord = await getBlobRecord(env, job.displayMaskBlobId);
-      const seed = await sha256Hex(
-        `${ARTWORK_ID}:${job.baseRevisionId}:${job.prompt}:${maskRecord?.sha256 ?? "mask"}`,
+    const apiKey = env.OPENAI_API_KEY?.trim();
+    if (!apiKey) {
+      throw new DomainError(
+        "AI_CONFIGURATION_ERROR",
+        "Live AI editing is not configured. Nothing was added to history.",
       );
-      const svg = makeDemoPatchSvg(
-        job.prompt,
-        regionRelativeToFrame(region, frame),
-        seed,
-      );
-      patch = {
-        bytes: new TextEncoder().encode(svg),
-        contentType: "image/svg+xml",
-      };
     }
+    await moderatePrompt(apiKey, job.prompt);
+    await updateStage(env, job, "moderating", "generating");
+    const patch = await generateOpenAiPatch(env, job, apiKey);
 
     await updateStage(env, job, "generating", "committing");
     await commitPatch(env, job, patch);
@@ -738,6 +731,8 @@ JOIN revisions base
 JOIN artwork_commit_locks commit_lock
   ON commit_lock.artwork_id = job.artwork_id
 WHERE job.state = 'committing'
+  AND job.kind = 'edit'
+  AND job.execution_mode = 'openai'
   AND job.worker_token = c.worker_token
   AND job.lease_fence = c.lease_fence
   AND job.lease_expires_at > c.now_ms
@@ -773,10 +768,7 @@ async function commitPatch(
   patch: { bytes: Uint8Array; contentType: string; providerRequestId?: string },
 ) {
   const frame = jobFrame(job);
-  const displayMaskBlobId = displayMaskForLayer(
-    job.executionMode,
-    job.displayMaskBlobId,
-  );
+  const displayMaskBlobId = job.displayMaskBlobId;
   if (!displayMaskBlobId) {
     throw new DomainError("INTERNAL_ERROR", "The generated layer mask is missing.");
   }
@@ -784,8 +776,7 @@ async function commitPatch(
   const revisionId = crypto.randomUUID();
   const blobId = crypto.randomUUID();
   const hash = await sha256Hex(patch.bytes);
-  const extension = patch.contentType === "image/png" ? "png" : "svg";
-  const key = `artworks/palimpsest/patches/${revisionId}/frame-${frame.x}-${frame.y}-${hash}.${extension}`;
+  const key = `artworks/palimpsest/patches/${revisionId}/frame-${frame.x}-${frame.y}-${hash}.png`;
   await env.BLOBS.put(key, patch.bytes, {
     httpMetadata: { contentType: patch.contentType },
     customMetadata: { sha256: hash, immutable: "true" },

@@ -15,6 +15,13 @@
       "when": 1784587029866,
       "tag": "0001_parallel_regions",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1784666018076,
+      "tag": "0002_live_ai_only",
+      "breakpoints": true
     }
   ]
 }

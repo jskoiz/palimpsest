@@ -82,9 +82,7 @@ type HistoryPayload = {
   revisions: Revision[];
   headRevisionId: string;
   editing: {
-    openaiAvailable: boolean;
-    defaultMode: "demo";
-    demoNotice: string;
+    available: boolean;
   };
 };
 
@@ -114,7 +112,6 @@ type Job = {
     | "stale"
     | "rejected"
     | "failed";
-  executionMode: "demo" | "openai" | "none";
   position: number | null;
   resultRevisionId: string | null;
   message: string | null;
@@ -513,8 +510,8 @@ function WelcomeDrawer({
               <span>03</span>
               <h2>Contribute</h2>
               <p>
-                Place the patch anywhere. Live outlines show where others are working;
-                every other spot stays open.
+                Place the patch anywhere, paint what may change, and describe it. Live
+                AI makes the edit; outlined regions stay locked while others generate.
               </p>
             </section>
           </div>
@@ -723,7 +720,6 @@ export default function Palimpsest() {
   const [fillMask, setFillMask] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [displayName, setDisplayName] = useState("anonymous visitor");
-  const [executionMode, setExecutionMode] = useState<"demo" | "openai">("demo");
   const [submitted, setSubmitted] = useState(false);
   const [isPreparing, setIsPreparing] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -759,7 +755,7 @@ export default function Palimpsest() {
   const jobActive = Boolean(job && !terminalJobStates.has(job.state));
   const queueTotal = activity.queue.queued + activity.queue.active;
   const queueBusy = activity.queue.active > 0 || jobActive;
-  const openaiAvailable = Boolean(history?.editing.openaiAvailable);
+  const liveEditingAvailable = Boolean(history?.editing.available);
   const canPanCanvas = canvasViewCanPan(view, viewport.width, viewport.height);
   const otherActiveRegions = activity.activeRegions.filter(
     (active) => active.jobId !== pendingEdit?.jobId,
@@ -1221,6 +1217,10 @@ export default function Palimpsest() {
   const openEditor = useCallback(async () => {
     const initial = latest.current;
     if (!initial.history || !initial.currentState || initial.jobActive) return;
+    if (!initial.history.editing.available) {
+      showToast("live AI editing is temporarily unavailable");
+      return;
+    }
     let activeRegions = initial.activeRegions;
     try {
       activeRegions = (await refreshActivity()).activeRegions;
@@ -1252,7 +1252,7 @@ export default function Palimpsest() {
     setView({ zoom: 1, x: 0, y: 0 });
     if (closeTimer.current) window.clearTimeout(closeTimer.current);
     wake();
-  }, [refreshActivity, wake]);
+  }, [refreshActivity, showToast, wake]);
 
   const closeEditor = useCallback(() => {
     setEditOpen(false);
@@ -1620,6 +1620,7 @@ export default function Palimpsest() {
     !isPreparing &&
     !submitted &&
     !jobActive &&
+    liveEditingAvailable &&
     !conflictingRegion &&
     prompt.trim().length >= 3 &&
     validMask &&
@@ -1643,7 +1644,6 @@ export default function Palimpsest() {
           baseRevisionId: editBase.revisionId,
           displayName: cleanDisplayName(),
           prompt: prompt.trim(),
-          executionMode,
           region: editRegion,
           frame,
           fill: fillMask,
@@ -1652,7 +1652,7 @@ export default function Palimpsest() {
       );
       form.append("source", source, "source.png");
       form.append("mask", mask, "mask.png");
-      const payload = await fetchJson<{ job: Job; notice: string }>("/api/edits", {
+      const payload = await fetchJson<{ job: Job }>("/api/edits", {
         method: "POST",
         headers: { "Idempotency-Key": crypto.randomUUID() },
         body: form,
@@ -1767,7 +1767,9 @@ export default function Palimpsest() {
       ? "preparing…"
       : jobActive
         ? "your edit is making…"
-        : "add to the work →";
+        : !liveEditingAvailable
+          ? "live AI unavailable"
+          : "generate live →";
 
   return (
     <main
@@ -1986,8 +1988,14 @@ export default function Palimpsest() {
         <button
           type="button"
           className="mono-contribute"
-          aria-label={jobActive ? "Your contribution is still being made" : "Contribute"}
-          disabled={jobActive}
+          aria-label={
+            jobActive
+              ? "Your contribution is still being made"
+              : liveEditingAvailable
+                ? "Contribute with live AI"
+                : "Live AI editing is temporarily unavailable"
+          }
+          disabled={jobActive || !liveEditingAvailable}
           onClick={openEditor}
         >
           contribute
@@ -2308,19 +2316,6 @@ export default function Palimpsest() {
                 disabled={submitted}
                 onChange={(event) => setDisplayName(event.target.value)}
               />
-              {openaiAvailable ? (
-                <button
-                  type="button"
-                  className={`mono-action${executionMode === "openai" ? " is-accent" : ""}`}
-                  aria-pressed={executionMode === "openai"}
-                  disabled={submitted}
-                  onClick={() =>
-                    setExecutionMode((mode) => (mode === "openai" ? "demo" : "openai"))
-                  }
-                >
-                  {executionMode === "openai" ? "[x] live ai edit" : "[ ] live ai edit"}
-                </button>
-              ) : null}
               <button
                 type="button"
                 className={`mono-action${canSubmit || submitted ? " is-accent" : ""}`}

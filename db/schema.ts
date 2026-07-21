@@ -174,7 +174,7 @@ export const editJobs = sqliteTable(
       ],
     }).notNull(),
     executionMode: text("execution_mode", {
-      enum: ["demo", "openai", "none"],
+      enum: ["openai", "none"],
     }).notNull(),
     authorId: text("author_id")
       .notNull()

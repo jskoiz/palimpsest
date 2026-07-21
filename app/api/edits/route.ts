@@ -23,7 +23,6 @@ type EditMeta = {
   baseRevisionId?: string;
   displayName?: string;
   prompt?: string;
-  executionMode?: "demo" | "openai";
   region?: { x?: number; y?: number; width?: number; height?: number };
   fill?: boolean;
   strokes?: Array<{
@@ -37,6 +36,12 @@ export async function POST(request: Request) {
   try {
     const env = getRuntimeEnv();
     await ensurePalimpsest(env, request.url);
+    if (!env.OPENAI_API_KEY?.trim()) {
+      throw new DomainError(
+        "AI_NOT_CONFIGURED",
+        "Live AI editing is temporarily unavailable.",
+      );
+    }
     const contentLength = Number(request.headers.get("Content-Length") ?? 0);
     if (contentLength > 12 * 1024 * 1024) {
       throw new DomainError("PAYLOAD_TOO_LARGE", "The edit upload is too large.");
@@ -75,19 +80,18 @@ export async function POST(request: Request) {
     if (meta.artworkId !== "palimpsest" || typeof meta.baseRevisionId !== "string") {
       throw new DomainError("INVALID_REQUEST", "The artwork and base revision are required.");
     }
+    if (Object.hasOwn(meta, "executionMode")) {
+      throw new DomainError(
+        "INVALID_REQUEST",
+        "Generation mode is server-controlled and must not be included.",
+      );
+    }
     const prompt = normalizePrompt(meta.prompt);
     const displayName = normalizeDisplayName(meta.displayName);
     if (hasUnsafePromptSignals(prompt)) {
       throw new DomainError(
         "CONTENT_POLICY",
         "This prompt cannot be submitted. Describe a safe visual change without personal information.",
-      );
-    }
-    const executionMode = meta.executionMode === "openai" ? "openai" : "demo";
-    if (executionMode === "openai" && !env.OPENAI_API_KEY) {
-      throw new DomainError(
-        "AI_NOT_CONFIGURED",
-        "Live image editing is not configured. Choose the deterministic demo renderer instead.",
       );
     }
     if (Object.hasOwn(meta, "tile")) {
@@ -122,20 +126,13 @@ export async function POST(request: Request) {
       region: validated.region,
       fill: validated.fill,
       strokes: validated.strokes,
-      executionMode,
       idempotencyKey,
       requesterHash: hash,
       sourceBytes,
       maskBytes,
     });
     return Response.json(
-      {
-        job,
-        notice:
-          executionMode === "demo"
-            ? "Deterministic demo edit queued. This revision will be labeled as a demo render."
-            : "Live OpenAI image edit queued.",
-      },
+      { job },
       { status: 202, headers: { "Cache-Control": "no-store", "X-Request-Id": requestId } },
     );
   } catch (error) {

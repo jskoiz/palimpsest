@@ -12,7 +12,7 @@ Palimpsest is one canonical communal image with an immutable, linear memory of e
 - Parallel moderation and generation with a short fenced commit lock that preserves immutable linear history
 - Region-aware rebasing lets non-overlapping jobs commit after the head advances
 - Every generated 1024×1024 context frame retains a display mask, so only its reserved region can alter the artwork
-- Deterministic demo renderer, plus an explicit OpenAI image-edit path when `OPENAI_API_KEY` is configured
+- Live OpenAI image editing only; generation fails closed when `OPENAI_API_KEY` is unavailable
 - Append-only database triggers; restoring an earlier state creates a new revision
 
 Bindings are declared in `.openai/hosting.json`. Generated D1 migrations live in `drizzle/`.
@@ -26,13 +26,13 @@ npm install
 npm run dev
 ```
 
-To enable live image edits locally, create an uncommitted `.env.local`:
+Live image editing is required. For local development, create an uncommitted `.env.local`:
 
 ```text
 OPENAI_API_KEY=your_key_here
 ```
 
-Without the key, every product flow remains usable through the clearly labeled deterministic demo renderer.
+Without the key, the archive remains viewable but new contributions are disabled. Production must configure `OPENAI_API_KEY` as a secret before deployment.
 
 ## Validation
 
