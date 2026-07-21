@@ -510,6 +510,13 @@ body {
   height: 150px;
 }
 
+/* A blank revision is its own contrast surface. Keep it genuinely white instead
+   of muddying it with the image-oriented edge scrims. */
+.mono-stage.is-blank-canvas .mono-scrim-top,
+.mono-stage.is-blank-canvas .mono-scrim-bottom:not(.is-raised) {
+  opacity: 0;
+}
+
 /* Floating chrome */
 
 .mono-chrome {
@@ -595,6 +602,32 @@ body {
   gap: 14px;
   font-size: 10px;
   color: rgba(255, 255, 255, 0.8);
+}
+
+.mono-stage.is-blank-canvas .mono-chrome {
+  color: rgba(var(--ink), 0.78);
+  text-shadow: none;
+}
+
+.mono-stage.is-blank-canvas .mono-guide-toggle {
+  color: rgba(var(--ink), 0.62);
+}
+
+.mono-stage.is-blank-canvas .mono-contribute {
+  color: var(--accent);
+}
+
+.mono-stage.is-blank-canvas .mono-contribute:disabled {
+  color: rgba(var(--ink), 0.34);
+}
+
+.mono-stage.is-blank-canvas .mono-revlabel,
+.mono-stage.is-blank-canvas .mono-hints {
+  color: rgba(var(--ink), 0.64);
+}
+
+.mono-stage.is-blank-canvas :focus-visible {
+  outline-color: rgba(var(--ink), 0.78);
 }
 
 .mono-hint-text {
