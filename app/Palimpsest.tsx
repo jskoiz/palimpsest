@@ -487,65 +487,69 @@ function WelcomeDrawer({
             </button>
           </div>
 
-          <p id="welcome-description" className="mono-welcome-summary">
-            Palimpsest is a shared artwork. Each accepted edit creates the next
-            revision. Earlier revisions stay available.
-          </p>
+          <div className="mono-welcome-guide">
+            <p id="welcome-description" className="mono-welcome-summary">
+              One shared canvas. Every accepted edit becomes the next revision; earlier
+              versions stay available.
+            </p>
 
-          <div className="mono-welcome-path">
-            <section>
-              <span>01</span>
-              <h2>Move</h2>
-              <p>
-                Drag when the artwork extends past the window. Scroll or use [−] [+] to
-                zoom.
-              </p>
-            </section>
-            <section>
-              <span>02</span>
-              <h2>History</h2>
-              <p>Open the timeline at the bottom. Drag to inspect any revision.</p>
-            </section>
-            <section>
-              <span>03</span>
-              <h2>Contribute</h2>
-              <p>
-                Place the patch anywhere, paint what may change, and describe it. Live
-                AI makes the edit; outlined regions stay locked while others generate.
-              </p>
-            </section>
+            <div className="mono-welcome-path">
+              <section>
+                <span>01</span>
+                <h2>Move</h2>
+                <p>
+                  Drag when the artwork extends past the window. Scroll or use [−] [+]
+                  to zoom.
+                </p>
+              </section>
+              <section>
+                <span>02</span>
+                <h2>History</h2>
+                <p>Open the bottom timeline and drag to inspect any revision.</p>
+              </section>
+              <section>
+                <span>03</span>
+                <h2>Contribute</h2>
+                <p>
+                  Place the patch anywhere, paint what may change, and describe the
+                  edit. Live outlines mark active work; every other spot stays open.
+                </p>
+              </section>
+            </div>
           </div>
 
-          <div className="mono-welcome-controls" aria-label="Quick controls">
-            <span className="mono-welcome-controls-label">quick controls</span>
-            <dl>
-              <div>
-                <dt><kbd>drag</kbd></dt>
-                <dd>move</dd>
-              </div>
-              <div>
-                <dt><kbd>←</kbd> <kbd>→</kbd></dt>
-                <dd>history</dd>
-              </div>
-              <div>
-                <dt><kbd>space</kbd></dt>
-                <dd>play</dd>
-              </div>
-              <div>
-                <dt><kbd>C</kbd></dt>
-                <dd>contribute</dd>
-              </div>
-              <div>
-                <dt><kbd>Q</kbd></dt>
-                <dd>queue</dd>
-              </div>
-            </dl>
-          </div>
+          <div className="mono-welcome-footer">
+            <div className="mono-welcome-controls" aria-label="Quick controls">
+              <span className="mono-welcome-controls-label">quick controls</span>
+              <dl>
+                <div>
+                  <dt><kbd>drag</kbd></dt>
+                  <dd>move</dd>
+                </div>
+                <div>
+                  <dt><kbd>←</kbd> <kbd>→</kbd></dt>
+                  <dd>history</dd>
+                </div>
+                <div>
+                  <dt><kbd>space</kbd></dt>
+                  <dd>play</dd>
+                </div>
+                <div>
+                  <dt><kbd>C</kbd></dt>
+                  <dd>contribute</dd>
+                </div>
+                <div>
+                  <dt><kbd>Q</kbd></dt>
+                  <dd>queue</dd>
+                </div>
+              </dl>
+            </div>
 
-          <div className="mono-welcome-foot">
-            <button type="button" className="mono-welcome-enter" onClick={requestClose}>
-              done →
-            </button>
+            <div className="mono-welcome-foot">
+              <button type="button" className="mono-welcome-enter" onClick={requestClose}>
+                done →
+              </button>
+            </div>
           </div>
         </div>
       </div>

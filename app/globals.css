@@ -1023,10 +1023,10 @@ body {
   position: fixed;
   inset: auto 0 0;
   width: 100%;
-  height: 52dvh;
-  min-height: 420px;
+  height: 43dvh;
+  min-height: 330px;
   max-width: none;
-  max-height: min(600px, calc(100dvh - 24px));
+  max-height: min(430px, calc(100dvh - 24px));
   margin: 0;
   overflow: hidden;
   border: 0;
@@ -1076,7 +1076,7 @@ body {
 
 .mono-welcome-grab {
   display: grid;
-  min-height: 44px;
+  min-height: 36px;
   place-items: center;
   flex: 0 0 auto;
   border-bottom: 1px solid rgba(255, 255, 255, 0.12);
@@ -1099,8 +1099,9 @@ body {
 }
 
 .mono-welcome-inner {
-  width: 100%;
-  padding: 0 clamp(26px, 4vw, 58px) calc(24px + env(safe-area-inset-bottom, 0px));
+  width: min(920px, 100%);
+  margin: 0 auto;
+  padding: 0 clamp(22px, 3vw, 32px);
 }
 
 .mono-welcome-head {
@@ -1111,7 +1112,7 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 20px;
-  min-height: 48px;
+  min-height: 42px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.12);
   background: transparent;
 }
@@ -1131,37 +1132,47 @@ body {
 
 .mono-welcome-close {
   display: grid;
-  width: 44px;
-  height: 44px;
+  width: 40px;
+  height: 40px;
   place-items: center;
   flex: 0 0 auto;
   font-size: 18px;
   line-height: 1;
 }
 
+.mono-welcome-guide {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.72fr) minmax(460px, 1.45fr);
+  gap: clamp(32px, 4vw, 56px);
+  padding: 18px 0 20px;
+}
+
 .mono-welcome-summary {
-  max-width: 72ch;
-  margin: 16px 0;
-  color: rgba(255, 255, 255, 0.74);
-  font-size: 13px;
-  line-height: 1.5;
+  max-width: 29ch;
+  margin: 0;
+  color: rgba(255, 255, 255, 0.84);
+  font-size: 16px;
+  line-height: 1.52;
 }
 
 .mono-welcome-path {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  border-top: 1px solid rgba(255, 255, 255, 0.2);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+  align-content: center;
+  border-left: 1px solid rgba(255, 255, 255, 0.2);
+  padding-left: clamp(24px, 3vw, 38px);
 }
 
 .mono-welcome-path > section {
+  display: grid;
+  grid-template-columns: 24px 96px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
   min-width: 0;
-  padding: 18px 22px 19px 0;
+  padding: 11px 0;
 }
 
 .mono-welcome-path > section + section {
-  border-left: 1px solid rgba(255, 255, 255, 0.16);
-  padding-left: 20px;
+  border-top: 1px solid rgba(255, 255, 255, 0.16);
 }
 
 .mono-welcome-path > section > span {
@@ -1171,16 +1182,16 @@ body {
 }
 
 .mono-welcome-path h2 {
-  margin: 9px 0 8px;
-  font-size: 14px;
+  margin: 0;
+  font-size: 13px;
   font-weight: 600;
 }
 
 .mono-welcome-path p {
   margin: 0;
   color: rgba(255, 255, 255, 0.63);
-  font-size: 11px;
-  line-height: 1.55;
+  font-size: 11.5px;
+  line-height: 1.45;
 }
 
 .mono-welcome-path strong,
@@ -1189,17 +1200,23 @@ body {
   font-weight: 500;
 }
 
+.mono-welcome-footer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 26px;
+  align-items: stretch;
+  border-top: 1px solid rgba(255, 255, 255, 0.2);
+}
+
 .mono-welcome-controls {
   display: grid;
-  grid-template-columns: 110px 1fr;
-  gap: 18px;
-  align-items: start;
-  padding: 18px 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 28px;
+  align-items: center;
+  padding: 14px 0 calc(14px + env(safe-area-inset-bottom, 0px));
 }
 
 .mono-welcome-controls-label {
-  padding-top: 3px;
   color: rgba(255, 255, 255, 0.48);
   font-size: 8px;
   letter-spacing: 0.05em;
@@ -1207,12 +1224,14 @@ body {
 
 .mono-welcome-controls dl {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
-  gap: 14px;
+  grid-template-columns: repeat(5, minmax(64px, 1fr));
+  gap: 16px;
   margin: 0;
 }
 
 .mono-welcome-controls dl > div {
+  display: grid;
+  gap: 4px;
   min-width: 0;
 }
 
@@ -1245,7 +1264,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  padding-top: 16px;
+  padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
 .mono-welcome-enter {
@@ -1309,18 +1328,37 @@ body {
     padding-left: 22px;
   }
 
-  .mono-welcome-path {
+  .mono-welcome-guide {
     grid-template-columns: 1fr;
+    gap: 16px;
+    padding-top: 14px;
+    padding-bottom: 16px;
+  }
+
+  .mono-welcome-summary {
+    max-width: 48ch;
+    font-size: 14px;
+  }
+
+  .mono-welcome-path {
+    border-top: 1px solid rgba(255, 255, 255, 0.2);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+    border-left: 0;
+    padding-left: 0;
   }
 
   .mono-welcome-path > section {
-    padding: 16px 0;
+    grid-template-columns: 24px 88px minmax(0, 1fr);
+    padding: 12px 0;
   }
 
   .mono-welcome-path > section + section {
     border-top: 1px solid rgba(255, 255, 255, 0.16);
-    border-left: 0;
-    padding-left: 0;
+  }
+
+  .mono-welcome-footer {
+    grid-template-columns: 1fr;
+    gap: 0;
   }
 
   .mono-welcome-controls {
@@ -1356,19 +1394,8 @@ body {
   }
 
   .mono-welcome-foot {
-    position: sticky;
-    bottom: 0;
-    align-items: flex-end;
-    flex-direction: column;
-    gap: 15px;
-    margin: 0 -22px;
-    padding: 15px 22px calc(16px + env(safe-area-inset-bottom, 0px));
-    border-top: 1px solid rgba(255, 255, 255, 0.16);
-    background: linear-gradient(
-      to bottom,
-      rgba(var(--ink), 0.74),
-      rgba(var(--ink), 0.92)
-    );
+    min-height: 48px;
+    padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
   }
 
   .mono-welcome-enter {
