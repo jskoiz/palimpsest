@@ -14,8 +14,8 @@ import {
   canvasViewCanPan,
   constrainCanvasView,
   generationFrameForRegion,
-  nudgeEditRegion,
   positionEditRegion,
+  positionEditRegionAvoidingRegions,
   regionRelativeToFrame,
   regionsOverlap,
   timelineIndexAtPosition,
@@ -199,7 +199,12 @@ function findOpenRegion(sequence: number, activeRegions: ActiveRegion[]) {
       return candidate;
     }
   }
-  return centered;
+  return positionEditRegionAvoidingRegions(
+    centered,
+    centered.x,
+    centered.y,
+    activeRegions.map((active) => active.region),
+  );
 }
 
 function activitySignature(activity: ActivityPayload) {
@@ -229,15 +234,15 @@ function activeStateLabel(state: ActiveRegion["state"]) {
 
 function overlapMessage(active: ActiveRegion) {
   if (active.state === "queued") {
-    return `${active.author} reserved this area — move your patch into open space.`;
+    return `${active.author} reserved this area — it stays locked until the edit finishes.`;
   }
   if (active.state === "moderating") {
-    return `${active.author} is preparing an edit here — move your patch into open space.`;
+    return `${active.author} is preparing an edit here — this area is locked.`;
   }
   if (active.state === "committing") {
-    return `${active.author} is finishing an edit here — move your patch into open space.`;
+    return `${active.author} is finishing an edit here — this area is locked.`;
   }
-  return `${active.author} is generating here — move your patch into open space.`;
+  return `${active.author} is generating here — this area is locked.`;
 }
 
 async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
@@ -762,6 +767,7 @@ export default function Palimpsest() {
   const conflictingRegion = otherActiveRegions.find((active) =>
     regionsOverlap(editRegion, active.region),
   );
+  const conflictingJobId = conflictingRegion?.jobId ?? null;
 
   const latest = useRef({
     panelOpen,
@@ -991,6 +997,18 @@ export default function Palimpsest() {
   }, [playing, revisions.length]);
 
   useEffect(() => {
+    const refreshWhenVisible = () => {
+      if (!document.hidden) void refreshActivity().catch(() => undefined);
+    };
+    window.addEventListener("focus", refreshWhenVisible);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      window.removeEventListener("focus", refreshWhenVisible);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+  }, [refreshActivity]);
+
+  useEffect(() => {
     let cancelled = false;
     let timer: number | null = null;
     const poll = async () => {
@@ -1027,6 +1045,28 @@ export default function Palimpsest() {
       if (timer !== null) window.clearTimeout(timer);
     };
   }, [refreshActivity, refreshHistory]);
+
+  useEffect(() => {
+    if (!editOpen || submitted || !conflictingJobId) return;
+    const active = latest.current.activeRegions.find(
+      (region) => region.jobId === conflictingJobId,
+    );
+    if (!active) return;
+    maskPointer.current = null;
+    setEditRegion((region) =>
+      positionEditRegionAvoidingRegions(
+        region,
+        region.x,
+        region.y,
+        latest.current.activeRegions.map((entry) => entry.region),
+      ),
+    );
+    setStep(1);
+    setStrokes([]);
+    setFillMask(false);
+    setSubmitError(null);
+    showToast(`${active.author} locked that area — your patch moved to open space.`);
+  }, [conflictingJobId, editOpen, showToast, submitted]);
 
   useEffect(() => {
     if (!job || terminalJobStates.has(job.state)) return;
@@ -1178,11 +1218,19 @@ export default function Palimpsest() {
     wake();
   }, [wake]);
 
-  const openEditor = useCallback(() => {
+  const openEditor = useCallback(async () => {
+    const initial = latest.current;
+    if (!initial.history || !initial.currentState || initial.jobActive) return;
+    let activeRegions = initial.activeRegions;
+    try {
+      activeRegions = (await refreshActivity()).activeRegions;
+    } catch {
+      // The atomic server reservation remains authoritative if this refresh fails.
+    }
     const current = latest.current;
     if (!current.history || !current.currentState || current.jobActive) return;
     setEditRegion(
-      findOpenRegion(current.currentState.revision.sequence, current.activeRegions),
+      findOpenRegion(current.currentState.revision.sequence, activeRegions),
     );
     setEditBase({
       revisionId: current.currentState.revision.id,
@@ -1204,7 +1252,7 @@ export default function Palimpsest() {
     setView({ zoom: 1, x: 0, y: 0 });
     if (closeTimer.current) window.clearTimeout(closeTimer.current);
     wake();
-  }, [wake]);
+  }, [refreshActivity, wake]);
 
   const closeEditor = useCallback(() => {
     setEditOpen(false);
@@ -1239,7 +1287,14 @@ export default function Palimpsest() {
   }, [wake]);
 
   const nudgePatch = useCallback((deltaX: number, deltaY: number) => {
-    setEditRegion((region) => nudgeEditRegion(region, deltaX, deltaY));
+    setEditRegion((region) =>
+      positionEditRegionAvoidingRegions(
+        region,
+        region.x + deltaX,
+        region.y + deltaY,
+        latest.current.activeRegions.map((active) => active.region),
+      ),
+    );
   }, []);
 
   useEffect(() => {
@@ -1499,7 +1554,12 @@ export default function Palimpsest() {
     if (!point) return;
     const offset = patchDrag.current;
     setEditRegion((region) =>
-      positionEditRegion(region, point.x - offset.x, point.y - offset.y),
+      positionEditRegionAvoidingRegions(
+        region,
+        point.x - offset.x,
+        point.y - offset.y,
+        latest.current.activeRegions.map((active) => active.region),
+      ),
     );
   };
 
@@ -1521,7 +1581,7 @@ export default function Palimpsest() {
   };
 
   const maskDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (step !== 2 || submitted) return;
+    if (step !== 2 || submitted || conflictingRegion) return;
     if (event.pointerType === "mouse" && event.button !== 0) return;
     event.currentTarget.setPointerCapture(event.pointerId);
     maskPointer.current = event.pointerId;
@@ -1532,7 +1592,11 @@ export default function Palimpsest() {
   };
 
   const maskMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (maskPointer.current !== event.pointerId || event.buttons === 0) return;
+    if (
+      conflictingRegion ||
+      maskPointer.current !== event.pointerId ||
+      event.buttons === 0
+    ) return;
     const point = maskPoint(event);
     setStrokes((current) => {
       const last = current.at(-1);
@@ -1610,6 +1674,11 @@ export default function Palimpsest() {
       }, 2400);
     } catch (error) {
       setSubmitError(error instanceof Error ? error.message : "The edit could not be submitted.");
+      try {
+        await refreshActivity();
+      } catch {
+        // The next collaboration poll retries if the activity refresh also fails.
+      }
     } finally {
       setIsPreparing(false);
     }
@@ -1809,7 +1878,7 @@ export default function Palimpsest() {
                 data-testid="edit-patch"
                 role="group"
                 tabIndex={step === 1 && !submitted ? 0 : -1}
-                aria-label="Selected edit patch. Drag to move it anywhere on the artwork, including across seams. Use the arrow keys to nudge it."
+                aria-label="Selected edit patch. Drag anywhere outside live reserved outlines, including across seams. Use the arrow keys to nudge it."
                 aria-describedby={conflictingRegion ? "overlap-note" : undefined}
                 onPointerDown={patchDown}
                 onPointerMove={patchMove}
@@ -1822,10 +1891,11 @@ export default function Palimpsest() {
                 {step >= 2 && !submitted ? (
                   <canvas
                     ref={maskCanvasRef}
-                    className={`mono-mask-canvas${step !== 2 ? " is-locked" : ""}`}
+                    className={`mono-mask-canvas${step !== 2 ? " is-locked" : ""}${conflictingRegion ? " is-blocked" : ""}`}
                     width={editRegion.width}
                     height={editRegion.height}
                     aria-label="Drag to paint the part of this patch that may change. Use the entire patch button for a keyboard-accessible alternative."
+                    aria-disabled={Boolean(conflictingRegion)}
                     onPointerDown={maskDown}
                     onPointerMove={maskMove}
                     onPointerUp={maskUp}
@@ -2153,7 +2223,7 @@ export default function Palimpsest() {
           {step === 1 ? (
             <div className="mono-edit-row">
               <span className="mono-edit-hint">
-                drag anywhere on the full artwork · seams are open · arrow keys nudge
+                live outlines are locked · drag anywhere else · arrow keys nudge
               </span>
               <button
                 type="button"
@@ -2196,6 +2266,7 @@ export default function Palimpsest() {
                 type="button"
                 className={`mono-action${fillMask ? " is-accent" : ""}`}
                 aria-pressed={fillMask}
+                disabled={Boolean(conflictingRegion)}
                 onClick={() => {
                   setFillMask((value) => {
                     if (!value) setStrokes([]);
@@ -2208,7 +2279,7 @@ export default function Palimpsest() {
               <button
                 type="button"
                 className={`mono-action${validMask ? " is-accent" : ""}`}
-                disabled={!validMask}
+                disabled={!validMask || Boolean(conflictingRegion)}
                 onClick={() => {
                   setStep(3);
                   wake();

@@ -346,6 +346,153 @@ test("expired input preparation becomes terminal instead of remaining queued", a
   db.close();
 });
 
+test("expired ready reservations become terminal and cannot be claimed", async () => {
+  const db = await migratedDatabase();
+  seedArtwork(db);
+  const [insertSql, claimSql, expireSql] = await Promise.all([
+    readSqlConstant("lib/palimpsest/store.ts", "INSERT_EDIT_RESERVATION_SQL"),
+    readSqlConstant("lib/palimpsest/queue.ts", "CLAIM_NEXT_JOB_SQL"),
+    readSqlConstant(
+      "lib/palimpsest/queue.ts",
+      "EXPIRE_READY_QUEUE_RESERVATION_SQL",
+    ),
+  ]);
+  const now = 18_000;
+  const values = reservationValues({
+    jobId: "expired-ready",
+    authorId: "author-a",
+    region: { x: 0, y: 0, width: 100, height: 100 },
+    now,
+  });
+  values[21] = now - 1;
+  assert.equal(db.prepare(insertSql).run(...values).changes, 1);
+
+  assert.equal(
+    db.prepare(claimSql).get(
+      "worker-expired",
+      now + 60_000,
+      now,
+      now,
+      "palimpsest",
+      now,
+      now,
+      now,
+      now,
+      now,
+    ),
+    undefined,
+  );
+  assert.equal(
+    db.prepare(expireSql).run(
+      now,
+      now,
+      "palimpsest",
+      Number.MAX_SAFE_INTEGER,
+      now,
+    ).changes,
+    1,
+  );
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        "SELECT state, error_code, lease_expires_at FROM edit_jobs WHERE id = 'expired-ready'",
+      ).get(),
+    },
+    {
+      state: "failed",
+      error_code: "QUEUE_LEASE_EXPIRED",
+      lease_expires_at: null,
+    },
+  );
+  db.close();
+});
+
+test("expired active work cannot be revived over a newer reservation", async () => {
+  const db = await migratedDatabase();
+  seedArtwork(db);
+  const [insertSql, claimSql, supersedeSql, requeueSql] = await Promise.all([
+    readSqlConstant("lib/palimpsest/store.ts", "INSERT_EDIT_RESERVATION_SQL"),
+    readSqlConstant("lib/palimpsest/queue.ts", "CLAIM_NEXT_JOB_SQL"),
+    readSqlConstant(
+      "lib/palimpsest/queue.ts",
+      "SUPERSEDE_EXPIRED_ACTIVE_RESERVATION_SQL",
+    ),
+    readSqlConstant(
+      "lib/palimpsest/queue.ts",
+      "REQUEUE_EXPIRED_ACTIVE_RESERVATION_SQL",
+    ),
+  ]);
+  const now = 19_000;
+  const insert = db.prepare(insertSql);
+  const expired = reservationValues({
+    jobId: "expired-active",
+    authorId: "author-a",
+    region: { x: 0, y: 0, width: 100, height: 100 },
+    now: now - 100,
+  });
+  expired[21] = now - 1;
+  assert.equal(insert.run(...expired).changes, 1);
+  db.prepare(
+    `UPDATE edit_jobs
+     SET state = 'generating', worker_token = 'worker-expired', lease_fence = 1
+     WHERE id = 'expired-active'`,
+  ).run();
+  assert.equal(
+    insert.run(...reservationValues({
+      jobId: "newer-live",
+      authorId: "author-b",
+      region: { x: 50, y: 50, width: 100, height: 100 },
+      now,
+    })).changes,
+    1,
+  );
+
+  assert.equal(
+    db.prepare(supersedeSql).run(now, now, "palimpsest", now, now).changes,
+    1,
+  );
+  assert.equal(
+    db.prepare(requeueSql).run(
+      now,
+      now + 60_000,
+      now,
+      "palimpsest",
+      now,
+      2,
+      now,
+    ).changes,
+    0,
+  );
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        "SELECT state, error_code, worker_token, lease_expires_at FROM edit_jobs WHERE id = 'expired-active'",
+      ).get(),
+    },
+    {
+      state: "failed",
+      error_code: "QUEUE_RESERVATION_SUPERSEDED",
+      worker_token: null,
+      lease_expires_at: null,
+    },
+  );
+
+  const claimed = db.prepare(claimSql).get(
+    "worker-new",
+    now + 60_000,
+    now,
+    now,
+    "palimpsest",
+    now,
+    now,
+    now,
+    now,
+    now,
+  );
+  assert.equal(claimed.id, "newer-live");
+  db.close();
+});
+
 test("full-artwork reverts wait for every active reservation", async () => {
   const db = await migratedDatabase();
   seedArtwork(db);
@@ -430,6 +577,8 @@ test("queue claims independent jobs without a requester or artwork-wide generati
     now + 2,
     now + 2,
     now + 2,
+    now + 2,
+    now + 2,
   );
   const second = claim.get(
     "worker-b",
@@ -437,6 +586,8 @@ test("queue claims independent jobs without a requester or artwork-wide generati
     now,
     now,
     "palimpsest",
+    now + 2,
+    now + 2,
     now + 2,
     now + 2,
     now + 2,

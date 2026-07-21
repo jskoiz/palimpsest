@@ -135,6 +135,7 @@ WHERE id = (
   WHERE candidate.artwork_id = ?
     AND candidate.state = 'queued'
     AND candidate.available_at <= ?
+    AND candidate.lease_expires_at > ?
     AND NOT EXISTS (
       SELECT 1 FROM edit_jobs active
       WHERE active.artwork_id = candidate.artwork_id
@@ -151,6 +152,7 @@ WHERE id = (
 )
   AND state = 'queued'
   AND available_at <= ?
+  AND lease_expires_at > ?
 RETURNING
   id,
   kind,
@@ -189,6 +191,8 @@ async function claimNextJob(env: AppEnv): Promise<QueueJob | null> {
       now,
       now,
       now,
+      now,
+      now,
     )
     .first<QueueJob>();
 }
@@ -207,6 +211,66 @@ WHERE artwork_id = ?
   AND worker_token IS NULL
   AND (lease_expires_at IS NULL OR lease_expires_at <= ?)`;
 
+export const EXPIRE_READY_QUEUE_RESERVATION_SQL = `UPDATE edit_jobs
+SET state = 'failed',
+    error_code = 'QUEUE_LEASE_EXPIRED',
+    public_error_message = 'The queued edit was not claimed before its reservation expired. Nothing was added to history.',
+    worker_token = NULL,
+    lease_expires_at = NULL,
+    updated_at = ?,
+    completed_at = ?
+WHERE artwork_id = ?
+  AND state = 'queued'
+  AND available_at <> ?
+  AND worker_token IS NULL
+  AND (lease_expires_at IS NULL OR lease_expires_at <= ?)`;
+
+export const SUPERSEDE_EXPIRED_ACTIVE_RESERVATION_SQL = `UPDATE edit_jobs
+SET state = 'failed',
+    error_code = 'QUEUE_RESERVATION_SUPERSEDED',
+    public_error_message = 'A newer contribution reserved this area after the worker lease expired. Nothing was added to history.',
+    worker_token = NULL,
+    lease_expires_at = NULL,
+    updated_at = ?,
+    completed_at = ?
+WHERE artwork_id = ?
+  AND state IN ('moderating', 'generating', 'committing')
+  AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+  AND EXISTS (
+    SELECT 1 FROM edit_jobs active
+    WHERE active.artwork_id = edit_jobs.artwork_id
+      AND active.id <> edit_jobs.id
+      AND active.state IN ('queued', 'moderating', 'generating', 'committing')
+      AND active.lease_expires_at > ?
+      AND active.region_x < edit_jobs.region_x + edit_jobs.region_width
+      AND active.region_x + active.region_width > edit_jobs.region_x
+      AND active.region_y < edit_jobs.region_y + edit_jobs.region_height
+      AND active.region_y + active.region_height > edit_jobs.region_y
+  )`;
+
+export const REQUEUE_EXPIRED_ACTIVE_RESERVATION_SQL = `UPDATE edit_jobs
+SET state = 'queued',
+    attempt_count = attempt_count + 1,
+    available_at = ?,
+    worker_token = NULL,
+    lease_expires_at = ?,
+    updated_at = ?
+WHERE artwork_id = ?
+  AND state IN ('moderating', 'generating', 'committing')
+  AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+  AND attempt_count < ?
+  AND NOT EXISTS (
+    SELECT 1 FROM edit_jobs active
+    WHERE active.artwork_id = edit_jobs.artwork_id
+      AND active.id <> edit_jobs.id
+      AND active.state IN ('queued', 'moderating', 'generating', 'committing')
+      AND active.lease_expires_at > ?
+      AND active.region_x < edit_jobs.region_x + edit_jobs.region_width
+      AND active.region_x + active.region_width > edit_jobs.region_x
+      AND active.region_y < edit_jobs.region_y + edit_jobs.region_height
+      AND active.region_y + active.region_height > edit_jobs.region_y
+  )`;
+
 async function recoverExpiredJobs(env: AppEnv, now: number) {
   await env.DB.batch([
     env.DB.prepare(EXPIRE_PREPARING_RESERVATION_SQL).bind(
@@ -214,6 +278,20 @@ async function recoverExpiredJobs(env: AppEnv, now: number) {
       now,
       ARTWORK_ID,
       PREPARING_AVAILABLE_AT,
+      now,
+    ),
+    env.DB.prepare(EXPIRE_READY_QUEUE_RESERVATION_SQL).bind(
+      now,
+      now,
+      ARTWORK_ID,
+      PREPARING_AVAILABLE_AT,
+      now,
+    ),
+    env.DB.prepare(SUPERSEDE_EXPIRED_ACTIVE_RESERVATION_SQL).bind(
+      now,
+      now,
+      ARTWORK_ID,
+      now,
       now,
     ),
     env.DB.prepare(
@@ -230,19 +308,15 @@ async function recoverExpiredJobs(env: AppEnv, now: number) {
          AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
          AND attempt_count >= ?`,
     ).bind(now, now, ARTWORK_ID, now, MAX_ATTEMPTS),
-    env.DB.prepare(
-      `UPDATE edit_jobs
-       SET state = 'queued',
-           attempt_count = attempt_count + 1,
-           available_at = ?,
-           worker_token = NULL,
-           lease_expires_at = NULL,
-           updated_at = ?
-       WHERE artwork_id = ?
-         AND state IN ('moderating', 'generating', 'committing')
-         AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
-         AND attempt_count < ?`,
-    ).bind(now, now, ARTWORK_ID, now, MAX_ATTEMPTS),
+    env.DB.prepare(REQUEUE_EXPIRED_ACTIVE_RESERVATION_SQL).bind(
+      now,
+      now + RESERVATION_LEASE_MS,
+      now,
+      ARTWORK_ID,
+      now,
+      MAX_ATTEMPTS,
+      now,
+    ),
   ]);
 }
 

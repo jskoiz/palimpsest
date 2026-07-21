@@ -21,6 +21,7 @@ import {
   generationFrameForRegion,
   nudgeEditRegion,
   positionEditRegion,
+  positionEditRegionAvoidingRegions,
   regionRelativeToFrame,
   regionsOverlap,
   timelineIndexAtPosition,
@@ -295,6 +296,57 @@ test("keyboard nudging crosses seams without snapping or escaping the artwork", 
 
   const artworkEdge = { x: 1664, y: 1728, width: 384, height: 320 };
   assert.deepEqual(nudgeEditRegion(artworkEdge, 32, 32), artworkEdge);
+});
+
+test("patch placement stops at live reservation edges without blocking edge contact", () => {
+  const patch = { x: 100, y: 100, width: 100, height: 100 };
+  const reserved = [{ x: 300, y: 100, width: 100, height: 100 }];
+
+  assert.deepEqual(positionEditRegionAvoidingRegions(patch, 200, 100, reserved), {
+    x: 200,
+    y: 100,
+    width: 100,
+    height: 100,
+  });
+  assert.deepEqual(positionEditRegionAvoidingRegions(patch, 250, 100, reserved), {
+    x: 200,
+    y: 100,
+    width: 100,
+    height: 100,
+  });
+
+  assert.deepEqual(positionEditRegionAvoidingRegions(
+    { x: 200, y: 100, width: 100, height: 100 },
+    450,
+    100,
+    reserved,
+  ), {
+    x: 200,
+    y: 100,
+    width: 100,
+    height: 100,
+  });
+});
+
+test("patch placement cannot tunnel through adjacent live reservations", () => {
+  const patch = { x: 100, y: 100, width: 100, height: 100 };
+  const reserved = [
+    { x: 300, y: 100, width: 100, height: 100 },
+    { x: 200, y: 100, width: 100, height: 100 },
+  ];
+  const placed = positionEditRegionAvoidingRegions(patch, 250, 100, reserved);
+
+  assert.equal(reserved.some((region) => regionsOverlap(placed, region)), false);
+  assert.deepEqual(placed, { x: 100, y: 100, width: 100, height: 100 });
+});
+
+test("patch placement slides along a live reservation without entering it", () => {
+  const patch = { x: 100, y: 100, width: 100, height: 100 };
+  const reserved = [{ x: 300, y: 100, width: 100, height: 100 }];
+  const placed = positionEditRegionAvoidingRegions(patch, 350, 250, reserved);
+
+  assert.equal(reserved.some((region) => regionsOverlap(placed, region)), false);
+  assert.deepEqual(placed, { x: 200, y: 250, width: 100, height: 100 });
 });
 
 test("generation frames center seam-crossing regions and clamp at every artwork edge", () => {
