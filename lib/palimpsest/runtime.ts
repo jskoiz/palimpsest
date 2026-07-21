@@ -143,7 +143,7 @@ export function readPngDimensions(bytes: Uint8Array): {
 
 export function publicJobMessage(state: string): string | null {
   if (state === "queued") return "Your contribution is in the queue.";
-  if (state === "moderating") return "Checking the contribution before it enters the work.";
+  if (state === "moderating") return "GPT-5.6 is checking and planning this edit.";
   if (state === "generating") return "Making the next revision.";
   if (state === "committing") return "Adding the revision to permanent history.";
   if (state === "succeeded") return "This revision is now part of Palimpsest.";

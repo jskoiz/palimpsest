@@ -1,21 +1,44 @@
 # Palimpsest
 
-Palimpsest is one canonical communal image with an immutable, linear memory of every accepted change. Visitors place a bounded region anywhere on the artwork, paint a mask, and submit a prompt. The artwork is reconstructed from tiled keyframes and globally positioned patch layers instead of re-encoding the master. Multiple edits can generate at once when their reserved regions do not overlap.
+**One canvas. Many hands. No collisions.**
 
-The production archive starts as one plain white 2048×2048 canvas with a single seed revision. Every visible mark comes from an accepted live contribution.
+Palimpsest is a live communal artwork with a permanent memory. Anyone can place an edit region anywhere on the canvas, paint exactly what may change, optionally attach a reference image, and describe an idea. GPT-5.6 turns that intent into a faithful edit plan; GPT Image renders only the masked area. Every accepted contribution becomes the next immutable revision.
+
+Multiple people can work at once. A live reservation locks only the region currently being generated, so the rest of the canvas remains open.
+
+## How it works
+
+1. **Place** a free-position patch anywhere on the 2048×2048 artwork.
+2. **Mask** the pixels that may change, or choose the entire patch.
+3. **Describe** the edit and optionally attach a PNG, JPEG, or WebP reference.
+4. **Plan and render.** OpenAI moderation checks the request, GPT-5.6 creates a concise visual plan without inventing new intent, and GPT Image edits the masked context frame.
+5. **Remember.** The accepted patch is appended as a new revision. The timeline can scrub, compare, replay, share, and restore earlier states without erasing history.
+
+## Why it is different
+
+- **Parallel creation without collisions.** Atomic artwork-space reservations reject positive-area overlap while allowing independent edits to generate concurrently.
+- **Precise, reversible AI editing.** Each generated context frame retains a display mask, so pixels outside the reserved area remain unchanged.
+- **A public creative memory.** Restoring an earlier look creates another revision instead of rewriting the archive.
+- **Fluid canvas navigation.** Patches can cross former tile seams, while pan, zoom, keyboard movement, and a draggable timeline keep the full work navigable.
+
+## OpenAI in the product
+
+- **GPT-5.6 (`gpt-5.6`)** is the edit planner. It preserves the contributor's request, accounts for an optional reference image, and produces a short instruction for the renderer.
+- **GPT Image (`gpt-image-2`)** performs the masked image edit on a 1024×1024 context frame.
+- **OpenAI Moderation (`omni-moderation-latest`)** checks the contributor's original request before planning or generation.
+
+The queue fails closed if any required OpenAI step is unavailable. The original contributor prompt—not the generated plan—remains the public historical record.
 
 ## Architecture
 
-- Next.js-compatible UI on vinext and Cloudflare Workers
+- Next.js-compatible React UI on vinext and Cloudflare Workers
 - D1 for artworks, revisions, edit reservations, commit fencing, rate windows, and blob metadata
-- R2 for canonical tiles, masks, patches, and keyframes
-- Generated D1 migrations are authoritative; request handlers never rerun schema DDL
-- Atomic artwork-space reservations: active regions reject positive-area overlap while edge contact remains available
-- Parallel moderation and generation with a short fenced commit lock that preserves immutable linear history
-- Region-aware rebasing lets non-overlapping jobs commit after the head advances
-- Every generated 1024×1024 context frame retains a display mask, so only its reserved region can alter the artwork
-- Live OpenAI image editing only; generation fails closed when `OPENAI_API_KEY` is unavailable
-- Append-only database triggers; restoring an earlier state creates a new revision
+- R2 for canonical tiles, masks, references, patches, and keyframes
+- Generated D1 migrations as the authoritative schema
+- Atomic global-coordinate reservations with lease recovery and overlap rejection
+- Parallel moderation/generation with a short fenced commit lock that preserves linear history
+- Region-aware rebasing for non-overlapping jobs after the head advances
+- Append-only database triggers for immutable revisions
 
 Bindings are declared in `.openai/hosting.json`. Generated D1 migrations live in `drizzle/`.
 
@@ -25,16 +48,23 @@ Requires Node.js 22.13 or later.
 
 ```bash
 npm install
-npm run dev
 ```
 
-Live image editing is required. For local development, create an uncommitted `.env.local`:
+Create an uncommitted `.env.local`:
 
 ```text
 OPENAI_API_KEY=your_key_here
 ```
 
-Without the key, the archive remains viewable but new contributions are disabled. Production must configure `OPENAI_API_KEY` as a secret before deployment.
+Then start the app:
+
+```bash
+npm run dev
+```
+
+Open `http://localhost:4317/` (or the port printed by the development server). No sample download is required: local D1 is initialized with one plain white 2048×2048 seed revision.
+
+Without `OPENAI_API_KEY`, the archive remains viewable but new contributions are disabled. Configure the same name as a production secret before deployment.
 
 ## Validation
 
@@ -44,4 +74,12 @@ npx tsc --noEmit
 npm test
 ```
 
-Focused tests cover revision ordering, free-position region limits, seam crossing, overlap rules, generation frames, region-aware concurrency, revert layer resolution, and stable history serialization.
+Focused tests cover revision ordering, free-position region limits, seam crossing, reservation overlap, expired leases, generation frames, region-aware concurrency, reference images, GPT-5.6 request/response handling, revert resolution, and stable secret-free history serialization.
+
+## Built with Codex
+
+Codex was the development partner across the entire build: product framing, freeform region geometry, canvas navigation, the draggable timeline, onboarding, concurrent reservation design, D1/R2 architecture, reference-image support, and submission QA. Parallel Codex reviews independently pressure-tested the reservation lifecycle, client collision behavior, and expiry/recovery race before integration.
+
+The resulting product uses GPT-5.6 at runtime, not only during development: every accepted image request passes through its intent-preserving edit planner before rendering.
+
+See [BUILD_WEEK_SUBMISSION.md](./BUILD_WEEK_SUBMISSION.md) for the prepared submission copy, demo script, and remaining external checklist.

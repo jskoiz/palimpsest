@@ -233,7 +233,7 @@ function activitySignature(activity: ActivityPayload) {
 
 function activeStateLabel(state: ActiveRegion["state"]) {
   if (state === "queued") return "reserved";
-  if (state === "moderating") return "preparing";
+  if (state === "moderating") return "planning";
   if (state === "committing") return "finishing";
   if (state === "generating") return "generating";
   return state;
@@ -244,7 +244,7 @@ function overlapMessage(active: ActiveRegion) {
     return `${active.author} reserved this area — it stays locked until the edit finishes.`;
   }
   if (active.state === "moderating") {
-    return `${active.author} is preparing an edit here — this area is locked.`;
+    return `${active.author} is planning an edit here — this area is locked.`;
   }
   if (active.state === "committing") {
     return `${active.author} is finishing an edit here — this area is locked.`;
@@ -521,9 +521,9 @@ function WelcomeDrawer({
                 <span>03</span>
                 <h2>Contribute</h2>
                 <p>
-                  Place the patch anywhere, paint what may change, and describe the
-                  edit. Add a reference image when useful. Live outlines mark active
-                  work; every other spot stays open.
+                  Place the patch anywhere and paint what may change. GPT-5.6 plans
+                  the request; GPT Image renders that masked area. References are
+                  optional. Live outlines lock only active work.
                 </p>
               </section>
             </div>

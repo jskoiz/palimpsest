@@ -1274,8 +1274,8 @@ body {
 
 .mono-welcome-guide {
   display: grid;
-  grid-template-columns: minmax(220px, 0.72fr) minmax(460px, 1.45fr);
-  gap: clamp(32px, 4vw, 56px);
+  grid-template-columns: minmax(170px, 0.72fr) minmax(0, 1.45fr);
+  gap: clamp(20px, 3vw, 42px);
   padding: 18px 0 20px;
 }
 
@@ -1290,6 +1290,7 @@ body {
 .mono-welcome-path {
   display: grid;
   align-content: center;
+  min-width: 0;
   border-left: 1px solid rgba(255, 255, 255, 0.2);
   padding-left: clamp(24px, 3vw, 38px);
 }
@@ -1356,7 +1357,7 @@ body {
 
 .mono-welcome-controls dl {
   display: grid;
-  grid-template-columns: repeat(5, minmax(64px, 1fr));
+  grid-template-columns: repeat(5, minmax(48px, 1fr));
   gap: 16px;
   margin: 0;
 }
@@ -1409,6 +1410,35 @@ body {
   font-size: 10px !important;
   font-weight: 600 !important;
   text-shadow: var(--over-image-shadow) !important;
+}
+
+@media (max-width: 900px) {
+  .mono-hint-text,
+  .mono-pan-hint {
+    display: none;
+  }
+
+  .mono-welcome-guide {
+    grid-template-columns: minmax(150px, 0.56fr) minmax(0, 1.44fr);
+    gap: 20px;
+  }
+
+  .mono-welcome-path {
+    padding-left: 20px;
+  }
+
+  .mono-welcome-path > section {
+    grid-template-columns: 24px 72px minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .mono-welcome-controls {
+    gap: 16px;
+  }
+
+  .mono-welcome-controls dl {
+    gap: 10px;
+  }
 }
 
 @media (max-width: 720px) {

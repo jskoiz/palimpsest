@@ -27,6 +27,11 @@ import {
   regionsOverlap,
   timelineIndexAtPosition,
 } from "../lib/palimpsest/geometry.mjs";
+import {
+  EDIT_PLANNER_MODEL,
+  buildEditPlanRequest,
+  extractEditPlan,
+} from "../lib/palimpsest/ai-planner.mjs";
 
 function expectCode(callback, code) {
   assert.throws(callback, (error) => error instanceof DomainError && error.code === code);
@@ -284,6 +289,46 @@ test("reference-image prompts use the second input without pasting its frame", (
   assert.match(prompt, /Add the flower from my reference\./);
 });
 
+test("GPT-5.6 plans the requested edit without changing contributor intent", () => {
+  const request = buildEditPlanRequest("Add one cobalt paper boat.", true);
+
+  assert.equal(request.model, EDIT_PLANNER_MODEL);
+  assert.equal(request.model, "gpt-5.6");
+  assert.deepEqual(request.reasoning, { effort: "low" });
+  assert.equal(request.store, false);
+  assert.match(request.instructions, /Preserve the contributor's intent/i);
+  assert.match(request.instructions, /Do not invent new subjects/i);
+  assert.match(request.input, /Add one cobalt paper boat\./);
+  assert.match(request.input, /second image/i);
+});
+
+test("GPT-5.6 edit plans are read from message output rather than reasoning items", () => {
+  const plan = extractEditPlan({
+    output: [
+      { type: "reasoning", summary: [] },
+      {
+        type: "message",
+        content: [
+          { type: "refusal", refusal: "not used" },
+          { type: "output_text", text: "Add one cobalt paper boat." },
+        ],
+      },
+      {
+        type: "message",
+        content: [
+          { type: "output_text", text: "Keep it fully inside the masked area." },
+        ],
+      },
+    ],
+  });
+
+  assert.equal(
+    plan,
+    "Add one cobalt paper boat.\nKeep it fully inside the masked area.",
+  );
+  assert.equal(extractEditPlan({ output: [{ type: "reasoning" }] }), null);
+});
+
 test("reference images stay optional, visible in the patch, and reach live generation", async () => {
   const [routeSource, clientSource, queueSource, storeSource] = await Promise.all([
     readFile(new URL("../app/api/edits/route.ts", import.meta.url), "utf8"),
@@ -300,7 +345,8 @@ test("reference images stay optional, visible in the patch, and reach live gener
   assert.match(storeSource, /reference_blob_id/);
   assert.match(storeSource, /'reference'/);
   assert.match(queueSource, /palimpsest-reference\.png/);
-  assert.match(queueSource, /buildOpenAiEditPrompt\(job\.prompt, Boolean\(reference\)\)/);
+  assert.match(queueSource, /buildOpenAiEditPrompt\(plannedPrompt, Boolean\(reference\)\)/);
+  assert.match(queueSource, /https:\/\/api\.openai\.com\/v1\/responses/);
 });
 
 test("stale base revisions are rejected without an implicit rebase", () => {

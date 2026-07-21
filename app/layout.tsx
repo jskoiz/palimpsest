@@ -13,16 +13,24 @@ export async function generateMetadata(): Promise<Metadata> {
     (host.startsWith("localhost") ? "http" : "https");
   const metadataBase = new URL(`${protocol}://${host}`);
   const title = "Palimpsest";
-  const description = "A shared artwork with a public revision history.";
+  const description =
+    "A live communal canvas where people create non-overlapping AI edits in parallel and every accepted change becomes part of an immutable public history.";
 
   return {
     metadataBase,
     title,
     description,
     applicationName: "Palimpsest",
+    keywords: [
+      "collaborative art",
+      "AI image editing",
+      "shared canvas",
+      "GPT-5.6",
+      "OpenAI",
+    ],
     icons: {
-      icon: "/seed/canonical.png",
-      shortcut: "/seed/canonical.png",
+      icon: "/og.png",
+      shortcut: "/og.png",
     },
     openGraph: {
       type: "website",

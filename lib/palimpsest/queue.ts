@@ -3,6 +3,7 @@ import {
   DomainError,
   buildOpenAiEditPrompt,
 } from "./domain.mjs";
+import { buildEditPlanRequest, extractEditPlan } from "./ai-planner.mjs";
 import type { AppEnv } from "./runtime";
 import { readPngDimensions, sha256Hex } from "./runtime";
 import {
@@ -49,6 +50,7 @@ const COMMIT_LOCK_LEASE_MS = 15_000;
 const COMMIT_LOCK_ATTEMPTS = 40;
 const COMMIT_LOCK_RETRY_MS = 25;
 const MODERATION_TIMEOUT_MS = 30_000;
+const EDIT_PLANNING_TIMEOUT_MS = 30_000;
 const IMAGE_EDIT_TIMEOUT_MS = 150_000;
 
 export type QueueProcessResult = {
@@ -356,8 +358,13 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
       );
     }
     await moderatePrompt(apiKey, job.prompt);
+    const plannedPrompt = await planEditPrompt(
+      apiKey,
+      job.prompt,
+      Boolean(job.referenceBlobId),
+    );
     await updateStage(env, job, "moderating", "generating");
-    const patch = await generateOpenAiPatch(env, job, apiKey);
+    const patch = await generateOpenAiPatch(env, job, apiKey, plannedPrompt);
 
     await updateStage(env, job, "generating", "committing");
     await commitPatch(env, job, patch);
@@ -460,10 +467,74 @@ async function moderatePrompt(apiKey: string, prompt: string) {
   }
 }
 
+async function planEditPrompt(
+  apiKey: string,
+  prompt: string,
+  hasReference: boolean,
+): Promise<string> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), EDIT_PLANNING_TIMEOUT_MS);
+  let response: Response;
+  let body:
+    | {
+        output?: Array<unknown>;
+        error?: { code?: string };
+      }
+    | null;
+  try {
+    response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(buildEditPlanRequest(prompt, hasReference)),
+      signal: controller.signal,
+    });
+    body = (await response.json().catch(() => null)) as typeof body;
+  } catch {
+    throw new DomainError(
+      "PROVIDER_TEMPORARY",
+      "GPT-5.6 did not finish planning this edit in time. Nothing was added to history.",
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      throw new DomainError(
+        "AI_CONFIGURATION_ERROR",
+        "GPT-5.6 could not authenticate. Nothing was added to history.",
+      );
+    }
+    if (response.status === 429 || response.status >= 500) {
+      throw new DomainError(
+        "PROVIDER_TEMPORARY",
+        "GPT-5.6 is temporarily unavailable. Nothing was added to history.",
+      );
+    }
+    throw new DomainError(
+      "AI_CONFIGURATION_ERROR",
+      "GPT-5.6 could not plan this edit. Nothing was added to history.",
+    );
+  }
+
+  const plan = extractEditPlan(body);
+  if (!plan) {
+    throw new DomainError(
+      "PROVIDER_TEMPORARY",
+      "GPT-5.6 returned no usable edit plan. Nothing was added to history.",
+    );
+  }
+  return plan;
+}
+
 async function generateOpenAiPatch(
   env: AppEnv,
   job: QueueJob,
   apiKey: string,
+  plannedPrompt: string,
 ): Promise<{ bytes: Uint8Array; contentType: string; providerRequestId?: string }> {
   if (!job.sourceBlobId || !job.maskBlobId) {
     throw new DomainError("INTERNAL_ERROR", "The image-edit inputs are missing.");
@@ -513,7 +584,7 @@ async function generateOpenAiPatch(
       }),
     );
   }
-  form.append("prompt", buildOpenAiEditPrompt(job.prompt, Boolean(reference)));
+  form.append("prompt", buildOpenAiEditPrompt(plannedPrompt, Boolean(reference)));
   form.append("size", "1024x1024");
   form.append("quality", "medium");
   form.append("output_format", "png");
