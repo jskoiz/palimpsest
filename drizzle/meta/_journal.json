@@ -22,6 +22,13 @@
       "when": 1784666018076,
       "tag": "0002_live_ai_only",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1784666426000,
+      "tag": "0003_white_canvas_reset",
+      "breakpoints": true
     }
   ]
 }

@@ -26,6 +26,8 @@ export type GenerationFrame = GlobalRegion;
 
 export const RESERVATION_LEASE_MS = 4 * 60 * 1000;
 export const PREPARING_AVAILABLE_AT = Number.MAX_SAFE_INTEGER;
+const WHITE_SEED_REVISION_ID = "rev-seed-white-000";
+const WHITE_SEED_KEYFRAME_ID = "keyframe-white-000000";
 
 type SeedRevision = {
   id: string;
@@ -33,68 +35,15 @@ type SeedRevision = {
   author: string;
   prompt: string;
   timestamp: number;
-  region?: GlobalRegion;
-  frame?: GenerationFrame;
-  svg?: string;
 };
 
 const seedRevisions: SeedRevision[] = [
   {
-    id: "rev-seed-000",
+    id: WHITE_SEED_REVISION_ID,
     authorId: "author-archive",
     author: "Palimpsest Archive",
-    prompt: "The first ground: paper, graphite, and a river remembered.",
-    timestamp: Date.UTC(2026, 4, 4, 18, 15),
-  },
-  {
-    id: "rev-seed-001",
-    authorId: "author-mara",
-    author: "Mara Bell",
-    prompt: "Let the botanical forms surface at the western edge.",
-    timestamp: Date.UTC(2026, 4, 16, 9, 42),
-    region: { x: 52, y: 116, width: 310, height: 360 },
-    frame: { x: 0, y: 0, width: 1024, height: 1024 },
-    svg: `<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024"><g fill="none" stroke="#3f463e" stroke-width="3" opacity=".28"><path d="M82 460 C145 372 182 238 198 116"/><path d="M155 300 C106 274 72 235 54 188"/><path d="M177 238 C222 210 263 166 286 114"/><ellipse cx="112" cy="252" rx="38" ry="14" transform="rotate(34 112 252)"/><ellipse cx="228" cy="188" rx="42" ry="15" transform="rotate(-37 228 188)"/></g></svg>`,
-  },
-  {
-    id: "rev-seed-002",
-    authorId: "author-ivo",
-    author: "Ivo Chen",
-    prompt: "Trace the vanished rooms lightly through the eastern field.",
-    timestamp: Date.UTC(2026, 5, 1, 21, 5),
-    region: { x: 1426, y: 1372, width: 460, height: 280 },
-    frame: { x: 1024, y: 1024, width: 1024, height: 1024 },
-    svg: `<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024"><g fill="none" stroke="#282722" stroke-width="2" opacity=".22"><path d="M422 384 H782 V612 H608 V522 H518 V612 H422 Z"/><path d="M470 432 H730 V560 H648 V486 H552 V560 H470 Z"/><circle cx="602" cy="486" r="76"/><path d="M602 410 V562 M526 486 H678"/></g></svg>`,
-  },
-  {
-    id: "rev-seed-003",
-    authorId: "author-noor",
-    author: "Noor A.",
-    prompt: "Warm the lower meadow with a veil of oxidized earth.",
-    timestamp: Date.UTC(2026, 5, 19, 6, 28),
-    region: { x: 104, y: 1544, width: 500, height: 250 },
-    frame: { x: 0, y: 1024, width: 1024, height: 1024 },
-    svg: `<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024"><g opacity=".16"><path fill="#9b5d32" d="M104 646 C208 548 354 536 604 574 L604 770 L104 770 Z"/><path fill="none" stroke="#6b432c" stroke-width="5" d="M128 704 C268 590 438 612 576 662"/></g></svg>`,
-  },
-  {
-    id: "rev-seed-004",
-    authorId: "author-elena",
-    author: "Elena Voss",
-    prompt: "Carry one vermilion thread across the old fault line.",
-    timestamp: Date.UTC(2026, 6, 3, 16, 12),
-    region: { x: 1056, y: 610, width: 510, height: 220 },
-    frame: { x: 1024, y: 0, width: 1024, height: 1024 },
-    svg: `<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024"><path d="M32 716 C138 668 214 756 306 702 S448 642 542 688" fill="none" stroke="#a63b29" stroke-width="7" stroke-linecap="round" opacity=".78"/></svg>`,
-  },
-  {
-    id: "rev-seed-005",
-    authorId: "author-conservator",
-    author: "The Night Conservator",
-    prompt: "Leave a graphite constellation where the river narrows.",
-    timestamp: Date.UTC(2026, 6, 12, 23, 47),
-    region: { x: 590, y: 570, width: 330, height: 300 },
-    frame: { x: 0, y: 0, width: 1024, height: 1024 },
-    svg: `<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024"><g fill="#272824" opacity=".36"><circle cx="622" cy="646" r="4"/><circle cx="680" cy="610" r="3"/><circle cx="742" cy="672" r="5"/><circle cx="804" cy="622" r="3"/><circle cx="862" cy="718" r="4"/><circle cx="716" cy="792" r="3"/></g><path d="M622 646 L680 610 L742 672 L804 622 L862 718 L716 792 L622 646" fill="none" stroke="#272824" stroke-width="1.5" opacity=".18"/></svg>`,
+    prompt: "Blank canvas.",
+    timestamp: Date.UTC(2026, 6, 21, 20, 30),
   },
 ];
 
@@ -131,7 +80,7 @@ export async function ensurePalimpsest(env: AppEnv, requestUrl: string): Promise
         customMetadata: { sha256: hash, immutable: "true" },
       });
       baseBlobs.push({
-        id: `blob-base-${tileX}-${tileY}`,
+        id: `blob-white-base-${tileX}-${tileY}`,
         key,
         hash,
         bytes,
@@ -141,38 +90,14 @@ export async function ensurePalimpsest(env: AppEnv, requestUrl: string): Promise
     }
   }
 
-  const patchBlobs: Array<{
-    id: string;
-    key: string;
-    hash: string;
-    bytes: Uint8Array;
-    sequence: number;
-  }> = [];
-  for (let sequence = 1; sequence < seedRevisions.length; sequence += 1) {
-    const bytes = new TextEncoder().encode(seedRevisions[sequence].svg ?? "");
-    const hash = await sha256Hex(bytes);
-    const key = `artworks/palimpsest/patches/${seedRevisions[sequence].id}/seed-${hash}.svg`;
-    await env.BLOBS.put(key, bytes, {
-      httpMetadata: { contentType: "image/svg+xml" },
-      customMetadata: { sha256: hash, immutable: "true" },
-    });
-    patchBlobs.push({
-      id: `blob-seed-patch-${String(sequence).padStart(3, "0")}`,
-      key,
-      hash,
-      bytes,
-      sequence,
-    });
-  }
-
   const statements: D1PreparedStatement[] = [];
   const createdAt = seedRevisions[0].timestamp;
   statements.push(
     env.DB.prepare(
       `INSERT OR IGNORE INTO artworks
        (id, slug, title, width, height, tile_width, tile_height, columns, rows, head_revision_id, head_sequence, created_at)
-       VALUES (?, ?, ?, 2048, 2048, 1024, 1024, 2, 2, ?, 5, ?)`,
-    ).bind(ARTWORK_ID, ARTWORK_ID, "Palimpsest", "rev-seed-005", createdAt),
+       VALUES (?, ?, ?, 2048, 2048, 1024, 1024, 2, 2, ?, 0, ?)`,
+    ).bind(ARTWORK_ID, ARTWORK_ID, "Palimpsest", seedRevisions[0].id, createdAt),
   );
 
   for (const revision of seedRevisions) {
@@ -191,24 +116,6 @@ export async function ensurePalimpsest(env: AppEnv, requestUrl: string): Promise
       ).bind(blob.id, ARTWORK_ID, blob.key, blob.bytes.byteLength, blob.hash, createdAt),
     );
   }
-  for (const blob of patchBlobs) {
-    const revision = seedRevisions[blob.sequence];
-    statements.push(
-      env.DB.prepare(
-        `INSERT OR IGNORE INTO blobs
-         (id, artwork_id, kind, r2_key, content_type, byte_length, sha256, width, height, created_at)
-         VALUES (?, ?, 'patch', ?, 'image/svg+xml', ?, ?, 1024, 1024, ?)`,
-      ).bind(
-        blob.id,
-        ARTWORK_ID,
-        blob.key,
-        blob.bytes.byteLength,
-        blob.hash,
-        revision.timestamp,
-      ),
-    );
-  }
-
   for (let sequence = 0; sequence < seedRevisions.length; sequence += 1) {
     const revision = seedRevisions[sequence];
     statements.push(
@@ -224,10 +131,10 @@ export async function ensurePalimpsest(env: AppEnv, requestUrl: string): Promise
         sequence === 0 ? null : seedRevisions[sequence - 1].id,
         revision.authorId,
         revision.prompt,
-        revision.region?.x ?? null,
-        revision.region?.y ?? null,
-        revision.region?.width ?? null,
-        revision.region?.height ?? null,
+        null,
+        null,
+        null,
+        null,
         revision.timestamp,
       ),
     );
@@ -235,25 +142,18 @@ export async function ensurePalimpsest(env: AppEnv, requestUrl: string): Promise
 
   statements.push(
     env.DB.prepare(
-      "INSERT OR IGNORE INTO keyframes (id, artwork_id, revision_id, sequence, created_at) VALUES ('keyframe-000000', ?, 'rev-seed-000', 0, ?)",
-    ).bind(ARTWORK_ID, createdAt),
+      `INSERT OR IGNORE INTO keyframes
+       (id, artwork_id, revision_id, sequence, created_at)
+       VALUES (?, ?, ?, 0, ?)`,
+    ).bind(WHITE_SEED_KEYFRAME_ID, ARTWORK_ID, WHITE_SEED_REVISION_ID, createdAt),
   );
   for (const blob of baseBlobs) {
     statements.push(
       env.DB.prepare(
-        "INSERT OR IGNORE INTO keyframe_tiles (keyframe_id, tile_x, tile_y, blob_id) VALUES ('keyframe-000000', ?, ?, ?)",
-      ).bind(blob.tileX, blob.tileY, blob.id),
-    );
-  }
-  for (const blob of patchBlobs) {
-    const revision = seedRevisions[blob.sequence];
-    statements.push(
-      env.DB.prepare(
-        `INSERT OR IGNORE INTO revision_patches
-         (revision_id, patch_blob_id, display_mask_blob_id,
-          frame_x, frame_y, frame_width, frame_height)
-         VALUES (?, ?, NULL, ?, ?, 1024, 1024)`,
-      ).bind(revision.id, blob.id, revision.frame?.x, revision.frame?.y),
+        `INSERT OR IGNORE INTO keyframe_tiles
+         (keyframe_id, tile_x, tile_y, blob_id)
+         VALUES (?, ?, ?, ?)`,
+      ).bind(WHITE_SEED_KEYFRAME_ID, blob.tileX, blob.tileY, blob.id),
     );
   }
   statements.push(
@@ -404,7 +304,7 @@ export async function getArtworkState(
       y: tile.tileY,
       base: {
         blobId: tile.blobId,
-        url: `/api/blobs/${encodeURIComponent(tile.blobId)}`,
+        url: `/api/blobs/${encodeURIComponent(tile.blobId)}?sha256=${encodeURIComponent(tile.sha256)}`,
         sha256: tile.sha256,
       },
     })),
@@ -417,7 +317,7 @@ export async function getArtworkState(
       return {
         revisionId: String(layer.revisionId),
         blobId,
-        url: `/api/blobs/${encodeURIComponent(blobId)}`,
+        url: `/api/blobs/${encodeURIComponent(blobId)}?sha256=${encodeURIComponent(String(layer.sha256))}`,
         sha256: String(layer.sha256),
         maskUrl: maskBlobId
           ? `/api/blobs/${encodeURIComponent(maskBlobId)}`

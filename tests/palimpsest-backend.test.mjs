@@ -28,14 +28,16 @@ function applyMigration(db, sql) {
 async function migratedDatabase() {
   const db = new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
-  const [initial, parallel, liveOnly] = await Promise.all([
+  const [initial, parallel, liveOnly, whiteCanvasReset] = await Promise.all([
     readFile(new URL("drizzle/0000_slow_gambit.sql", root), "utf8"),
     readFile(new URL("drizzle/0001_parallel_regions.sql", root), "utf8"),
     readFile(new URL("drizzle/0002_live_ai_only.sql", root), "utf8"),
+    readFile(new URL("drizzle/0003_white_canvas_reset.sql", root), "utf8"),
   ]);
   applyMigration(db, initial);
   applyMigration(db, parallel);
   applyMigration(db, liveOnly);
+  applyMigration(db, whiteCanvasReset);
   return db;
 }
 
@@ -305,6 +307,88 @@ test("live-only migration retires non-live work without rewriting history", asyn
     db.prepare("SELECT origin FROM revisions WHERE id = 'historical-demo'").get().origin,
     "demo",
   );
+  db.close();
+});
+
+test("white-canvas migration clears the prior archive and every reservation", async () => {
+  const db = new DatabaseSync(":memory:");
+  db.exec("PRAGMA foreign_keys = ON");
+  const [initial, parallel, liveOnly, whiteCanvasReset] = await Promise.all([
+    readFile(new URL("drizzle/0000_slow_gambit.sql", root), "utf8"),
+    readFile(new URL("drizzle/0001_parallel_regions.sql", root), "utf8"),
+    readFile(new URL("drizzle/0002_live_ai_only.sql", root), "utf8"),
+    readFile(new URL("drizzle/0003_white_canvas_reset.sql", root), "utf8"),
+  ]);
+  applyMigration(db, initial);
+  applyMigration(db, parallel);
+  applyMigration(db, liveOnly);
+  seedArtwork(db);
+  db.exec(`
+    INSERT INTO blobs (
+      id, artwork_id, kind, r2_key, content_type, byte_length,
+      sha256, width, height, created_at
+    ) VALUES
+      ('old-keyframe', 'palimpsest', 'keyframe', 'old-keyframe.png', 'image/png',
+        1, 'old-keyframe-hash', 1024, 1024, 1),
+      ('old-patch', 'palimpsest', 'patch', 'old-patch.png', 'image/png',
+        1, 'old-patch-hash', 1024, 1024, 1);
+    INSERT INTO keyframes (id, artwork_id, revision_id, sequence, created_at)
+      VALUES ('old-frame', 'palimpsest', 'r0', 0, 1);
+    INSERT INTO keyframe_tiles (keyframe_id, tile_x, tile_y, blob_id)
+      VALUES ('old-frame', 0, 0, 'old-keyframe');
+    INSERT INTO revisions (
+      id, artwork_id, sequence, parent_revision_id, origin, status,
+      author_id, prompt, region_x, region_y, region_width, region_height, created_at
+    ) VALUES ('old-revision', 'palimpsest', 1, 'r0', 'openai', 'accepted',
+      'author-a', 'Old edit', 0, 0, 128, 128, 2);
+    INSERT INTO revision_patches (
+      revision_id, patch_blob_id, display_mask_blob_id,
+      frame_x, frame_y, frame_width, frame_height
+    ) VALUES ('old-revision', 'old-patch', NULL, 0, 0, 1024, 1024);
+    INSERT INTO edit_jobs (
+      id, artwork_id, kind, state, execution_mode, author_id, requester_hash,
+      base_revision_id, prompt, region_x, region_y, region_width, region_height,
+      idempotency_key, request_fingerprint, available_at, lease_expires_at,
+      created_at, updated_at
+    ) VALUES ('active-edit', 'palimpsest', 'edit', 'generating', 'openai',
+      'author-b', 'requester', 'r0', 'Active edit', 256, 256, 128, 128,
+      'active-idem', 'active-fingerprint', 1, 999999, 1, 1);
+    INSERT INTO rate_windows (
+      requester_hash, scope, window_start, count, updated_at
+    ) VALUES ('requester', 'edit', 0, 1, 1);
+  `);
+
+  applyMigration(db, whiteCanvasReset);
+
+  for (const table of [
+    "artworks",
+    "authors",
+    "blobs",
+    "edit_jobs",
+    "keyframe_tiles",
+    "keyframes",
+    "rate_windows",
+    "revision_patches",
+    "revisions",
+    "artwork_commit_locks",
+  ]) {
+    assert.equal(
+      db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count,
+      0,
+      `${table} must be empty after the reset`,
+    );
+  }
+
+  seedArtwork(db);
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        "SELECT head_revision_id, head_sequence FROM artworks WHERE id = 'palimpsest'",
+      ).get(),
+    },
+    { head_revision_id: "r0", head_sequence: 0 },
+  );
+  assert.throws(() => db.exec("DELETE FROM revisions WHERE id = 'r0'"));
   db.close();
 });
 

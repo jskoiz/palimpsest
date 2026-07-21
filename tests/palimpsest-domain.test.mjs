@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
@@ -191,6 +192,58 @@ test("request handlers rely on packaged migrations instead of runtime schema DDL
     "utf8",
   );
   assert.doesNotMatch(storeSource, /CREATE\s+(?:TABLE|INDEX|TRIGGER)/i);
+});
+
+test("new archives begin with one blank white revision", async () => {
+  const storeSource = await readFile(
+    new URL("../lib/palimpsest/store.ts", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(storeSource, /prompt: "Blank canvas\."/);
+  assert.match(storeSource, /rev-seed-white-000/);
+  assert.match(storeSource, /blob-white-base-/);
+  assert.match(storeSource, /seedRevisions\[0\]\.id, createdAt/);
+  assert.match(storeSource, /2, 2, \?, 0, \?\)/);
+  assert.doesNotMatch(storeSource, /rev-seed-00[1-9]|blob-seed-patch/);
+  assert.match(storeSource, /\?sha256=\$\{encodeURIComponent\(tile\.sha256\)\}/);
+});
+
+test("canonical seed assets are the verified solid-white canvas", async () => {
+  const assets = [
+    [
+      "../public/seed/canonical.png",
+      2048,
+      "c989a7957d22cd3a3ca3e09ddfbb12145b6650f4114d639d9a5e61694f375559",
+    ],
+    [
+      "../public/seed/tile-0-0.png",
+      1024,
+      "b0a2a14fdb96bdbcc93e433fde76665ad377a597f380a4adafc28881e931b1c5",
+    ],
+    [
+      "../public/seed/tile-1-0.png",
+      1024,
+      "b0a2a14fdb96bdbcc93e433fde76665ad377a597f380a4adafc28881e931b1c5",
+    ],
+    [
+      "../public/seed/tile-0-1.png",
+      1024,
+      "b0a2a14fdb96bdbcc93e433fde76665ad377a597f380a4adafc28881e931b1c5",
+    ],
+    [
+      "../public/seed/tile-1-1.png",
+      1024,
+      "b0a2a14fdb96bdbcc93e433fde76665ad377a597f380a4adafc28881e931b1c5",
+    ],
+  ];
+
+  for (const [relativePath, size, expectedHash] of assets) {
+    const bytes = await readFile(new URL(relativePath, import.meta.url));
+    assert.equal(bytes.readUInt32BE(16), size);
+    assert.equal(bytes.readUInt32BE(20), size);
+    assert.equal(createHash("sha256").update(bytes).digest("hex"), expectedHash);
+  }
 });
 
 test("new contributions expose only the live AI generation path", async () => {

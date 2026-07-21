@@ -2,6 +2,8 @@
 
 Palimpsest is one canonical communal image with an immutable, linear memory of every accepted change. Visitors place a bounded region anywhere on the artwork, paint a mask, and submit a prompt. The artwork is reconstructed from tiled keyframes and globally positioned patch layers instead of re-encoding the master. Multiple edits can generate at once when their reserved regions do not overlap.
 
+The production archive starts as one plain white 2048×2048 canvas with a single seed revision. Every visible mark comes from an accepted live contribution.
+
 ## Architecture
 
 - Next.js-compatible UI on vinext and Cloudflare Workers
