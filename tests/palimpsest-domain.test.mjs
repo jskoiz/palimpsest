@@ -186,16 +186,16 @@ test("display masks keep exact hard edit boundaries without feathering", () => {
 
 test("reference framing preserves the full image with a safety margin", () => {
   assert.deepEqual(referenceImagePlacement(768, 574, { width: 384, height: 320 }), {
-    x: 397,
-    y: 426,
-    width: 230,
-    height: 172,
+    x: 426,
+    y: 448,
+    width: 173,
+    height: 129,
   });
   assert.deepEqual(referenceImagePlacement(574, 768, { width: 384, height: 320 }), {
-    x: 440,
-    y: 416,
-    width: 144,
-    height: 192,
+    x: 458,
+    y: 440,
+    width: 108,
+    height: 144,
   });
 });
 
@@ -401,10 +401,12 @@ test("reference images stay optional, visible in the patch, and reach live gener
   assert.match(clientSource, /mono-reference-on-canvas/);
   assert.match(clientSource, /image\/png,image\/jpeg,image\/webp/);
   assert.match(clientSource, /async function transparentGenerationFrame\(\)/);
+  assert.match(clientSource, /const REFERENCE_MASK_INSET = 64/);
   assert.match(
     clientSource,
     /referenceImage\s*\?\s*transparentGenerationFrame\(\)\s*:\s*flattenArtworkFrame\(editBase\.state, frame\)/,
   );
+  assert.match(clientSource, /referenceImage \? REFERENCE_MASK_INSET : 0/);
   assert.match(routeSource, /referenceValue instanceof File/);
   assert.match(routeSource, /referenceBytes/);
   assert.match(storeSource, /reference_blob_id/);
