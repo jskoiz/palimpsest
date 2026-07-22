@@ -488,6 +488,15 @@ test("purple-canvas migration removes the current duck revision and reseeds clea
   db.close();
 });
 
+test("live-canvas reset uses the validated clean-archive migration", async () => {
+  const [purpleCanvasReset, liveCanvasReset] = await Promise.all([
+    readFile(new URL("drizzle/0005_purple_canvas_reset.sql", root), "utf8"),
+    readFile(new URL("drizzle/0006_live_canvas_reset.sql", root), "utf8"),
+  ]);
+
+  assert.equal(liveCanvasReset, purpleCanvasReset);
+});
+
 test("atomic spatial reservations reject overlap, allow touching, and expire cleanly", async () => {
   const db = await migratedDatabase();
   seedArtwork(db);
