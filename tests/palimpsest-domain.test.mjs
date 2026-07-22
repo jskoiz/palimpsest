@@ -10,7 +10,6 @@ import {
   buildOpenAiEditPrompt,
   createDisplayMaskSvg,
   displayMaskForLayer,
-  referenceImagePlacement,
   resolveLayerStack,
   serializeHistory,
   validateRegion,
@@ -29,10 +28,10 @@ import {
 } from "../lib/palimpsest/geometry.mjs";
 import {
   EDIT_PLANNER_MODEL,
-  buildContainmentReviewRequest,
   buildEditPlanRequest,
-  extractContainmentReview,
   extractEditPlan,
+  buildReferenceEditReviewRequest,
+  extractReferenceEditReview,
 } from "../lib/palimpsest/ai-planner.mjs";
 
 function expectCode(callback, code) {
@@ -182,21 +181,6 @@ test("display masks keep exact hard edit boundaries without feathering", () => {
   assert.match(svg, /<rect x="100" y="200" width="384" height="320" fill="white"/);
 });
 
-test("reference framing preserves the full image with a safety margin", () => {
-  assert.deepEqual(referenceImagePlacement(768, 574, { width: 384, height: 320 }), {
-    x: 426,
-    y: 448,
-    width: 173,
-    height: 129,
-  });
-  assert.deepEqual(referenceImagePlacement(574, 768, { width: 384, height: 320 }), {
-    x: 458,
-    y: 440,
-    width: 108,
-    height: 144,
-  });
-});
-
 test("generated layers retain the reservation mask", () => {
   assert.equal(displayMaskForLayer("openai", "display-mask"), "display-mask");
   assert.equal(displayMaskForLayer("demo", "display-mask"), "display-mask");
@@ -292,22 +276,26 @@ test("live image prompts keep random objects whole without forcing an art style"
   assert.match(prompt, /entire subject comfortably inside the editable area/i);
   assert.match(prompt, /Never crop, truncate/i);
   assert.match(prompt, /clear margin on every side/i);
-  assert.match(prompt, /reference subject touches an edge/i);
+  assert.match(prompt, /approaches the editable edge/i);
   assert.match(prompt, /without forcing it into a predefined artistic motif/i);
   assert.match(prompt, /Add a bright plastic toy truck\./);
   assert.doesNotMatch(prompt, /vermilion|graphite|mixed-media/i);
 });
 
-test("reference-image prompts use the second input without pasting its frame", () => {
+test("reference-image prompts preserve the positioned subject while blending its frame", () => {
   const prompt = buildOpenAiEditPrompt("Add the flower from my reference.", true);
-  assert.match(prompt, /blank transparent first image/i);
-  assert.match(prompt, /second supplied image as a direct visual reference/i);
-  assert.match(prompt, /already been centered and scaled/i);
-  assert.match(prompt, /do not enlarge it/i);
-  assert.match(prompt, /do not paste its rectangular background/i);
-  assert.match(prompt, /isolated transparent PNG layer/i);
-  assert.match(prompt, /every non-subject pixel fully transparent/i);
-  assert.match(prompt, /Do not redraw the source canvas/i);
+  assert.match(prompt, /supplied current canvas image/i);
+  assert.match(prompt, /reference at the intended position and size/i);
+  assert.match(prompt, /within that exact footprint/i);
+  assert.match(prompt, /identity, detail, and composition source/i);
+  assert.match(prompt, /do not enlarge, crop, reposition, redesign/i);
+  assert.match(prompt, /control count and arrangement, symbols, labels/i);
+  assert.match(prompt, /matching local perspective, scale, lighting/i);
+  assert.match(prompt, /Do not copy the reference image's rectangular background/i);
+  assert.match(prompt, /do not invent hidden structure or replacement controls/i);
+  assert.match(prompt, /Reference backgrounds, display stands, or secondary props may be omitted/i);
+  assert.match(prompt, /composition guide centered inside the transparent editable area/i);
+  assert.match(prompt, /preserve the complete visible primary subject/i);
   assert.match(prompt, /Add the flower from my reference\./);
 });
 
@@ -351,40 +339,50 @@ test("GPT-5.6 edit plans are read from message output rather than reasoning item
   assert.equal(extractEditPlan({ output: [{ type: "reasoning" }] }), null);
 });
 
-test("reference generations receive structured whole-subject containment review", () => {
-  const request = buildContainmentReviewRequest({
+test("reference generations receive structured fidelity and blending review", () => {
+  const request = buildReferenceEditReviewRequest({
     requestedChange: "Place the mini keyboard.",
     generatedImageUrl: "data:image/png;base64,generated",
+    referenceImageUrl: "data:image/png;base64,reference",
     providerMaskUrl: "data:image/png;base64,mask",
   });
   assert.equal(request.model, "gpt-5.6");
   assert.equal(request.store, false);
   assert.equal(request.max_output_tokens, 500);
   assert.equal(request.input[0].content[1].type, "input_image");
-  assert.equal(request.input[0].content[2].image_url, "data:image/png;base64,mask");
+  assert.equal(request.input[0].content[2].image_url, "data:image/png;base64,reference");
+  assert.equal(request.input[0].content[3].image_url, "data:image/png;base64,mask");
   assert.equal(request.text.format.type, "json_schema");
   assert.equal(request.text.format.strict, true);
-  assert.match(request.input[0].content[0].text, /clear space on every side/i);
-  assert.match(request.input[0].content[0].text, /all background outside the subject is transparent/i);
+  assert.match(request.instructions, /control count and arrangement, symbols, labels/i);
+  assert.match(request.instructions, /no visible rectangular patch/i);
+  assert.match(request.input[0].content[0].text, /visually faithful/i);
+  assert.match(request.input[0].content[0].text, /naturally blended/i);
   assert.deepEqual(request.text.format.schema.required, [
     "contained",
-    "backgroundClear",
+    "faithful",
+    "blended",
     "reason",
   ]);
 
   assert.deepEqual(
-    extractContainmentReview({
+    extractReferenceEditReview({
       output: [{
         type: "message",
         content: [{
           type: "output_text",
-          text: '{"contained":false,"backgroundClear":true,"reason":"The keyboard is cut off."}',
+          text: '{"contained":true,"faithful":false,"blended":true,"reason":"The controls were redesigned."}',
         }],
       }],
     }),
-    { contained: false, backgroundClear: true, reason: "The keyboard is cut off." },
+    {
+      contained: true,
+      faithful: false,
+      blended: true,
+      reason: "The controls were redesigned.",
+    },
   );
-  assert.equal(extractContainmentReview({ output: [] }), null);
+  assert.equal(extractReferenceEditReview({ output: [] }), null);
 });
 
 test("reference images stay optional, visible in the patch, and reach live generation", async () => {
@@ -398,26 +396,33 @@ test("reference images stay optional, visible in the patch, and reach live gener
   assert.match(clientSource, /form\.append\("reference", referenceImage\.blob/);
   assert.match(clientSource, /mono-reference-on-canvas/);
   assert.match(clientSource, /image\/png,image\/jpeg,image\/webp/);
-  assert.match(clientSource, /async function transparentGenerationFrame\(\)/);
-  assert.match(clientSource, /const REFERENCE_MASK_INSET = 64/);
-  assert.match(
-    clientSource,
-    /referenceImage\s*\?\s*transparentGenerationFrame\(\)\s*:\s*flattenArtworkFrame\(editBase\.state, frame\)/,
-  );
-  assert.match(clientSource, /referenceImage \? REFERENCE_MASK_INSET : 0/);
+  assert.doesNotMatch(clientSource, /REFERENCE_MASK_INSET/);
+  assert.match(clientSource, /const blob = await normalizeReferenceImage\(file\)/);
+  assert.match(clientSource, /sourceBlob: file/);
+  assert.match(clientSource, /REFERENCE_IMAGE_SIZE \/ image\.width/);
+  assert.match(clientSource, /flattenArtworkFrame\(editBase\.state, frame\)/);
+  assert.match(clientSource, /placeReferenceGuide/);
+  assert.match(clientSource, /region\.width \* REFERENCE_TARGET_FILL/);
+  assert.match(clientSource, /referenceImage\.sourceBlob/);
+  assert.doesNotMatch(clientSource, /transparentGenerationFrame/);
+  assert.doesNotMatch(clientSource, /normalizeReferenceImage\(file, editRegion\)/);
+  assert.doesNotMatch(clientSource, /referenceImage \? REFERENCE_MASK_INSET : 0/);
   assert.match(routeSource, /referenceValue instanceof File/);
   assert.match(routeSource, /referenceBytes/);
   assert.match(storeSource, /reference_blob_id/);
   assert.doesNotMatch(storeSource, /kind[^\n]*'reference'|VALUES \([^\n]*'reference'/);
   assert.match(storeSource, /referenceBlobId,[\s\S]*VALUES \(\?, \?, 'input'/);
-  assert.match(queueSource, /palimpsest-reference\.png/);
-  assert.match(queueSource, /imageEditProviderPolicy\(Boolean\(referenceBytes\)\)/);
-  assert.match(queueSource, /form\.append\("background", imagePolicy\.background\)/);
-  assert.match(queueSource, /form\.append\("input_fidelity", imagePolicy\.inputFidelity\)/);
+  assert.doesNotMatch(queueSource, /palimpsest-reference\.png/);
+  assert.match(queueSource, /form\.append\("model", "gpt-image-2"\)/);
+  assert.doesNotMatch(queueSource, /gpt-image-1\.5/);
+  assert.doesNotMatch(queueSource, /form\.append\("background", "transparent"\)/);
+  assert.doesNotMatch(queueSource, /form\.append\("input_fidelity"/);
+  assert.match(queueSource, /form\.append\("quality", "medium"\)/);
   assert.match(queueSource, /buildOpenAiEditPrompt\(plannedPrompt, Boolean\(reference\)\)/);
-  assert.match(queueSource, /reviewPatchContainment/);
-  assert.match(queueSource, /MAX_CONTAINMENT_ATTEMPTS = 2/);
-  assert.match(queueSource, /no more than 45%/);
+  assert.match(queueSource, /reviewReferenceEdit/);
+  assert.match(queueSource, /review\.contained && review\.faithful && review\.blended/);
+  assert.match(queueSource, /MAX_REFERENCE_ATTEMPTS = 2/);
+  assert.match(queueSource, /already contains the reference subject at the intended position, scale, and maximum footprint/);
   assert.match(queueSource, /https:\/\/api\.openai\.com\/v1\/responses/);
 });
 

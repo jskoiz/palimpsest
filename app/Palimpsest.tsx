@@ -13,7 +13,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ARTWORK_SIZE,
   REFERENCE_TARGET_FILL,
-  referenceImagePlacement,
 } from "@/lib/palimpsest/domain.mjs";
 import {
   canvasViewCanPan,
@@ -144,6 +143,7 @@ type ReferenceImage = {
   blob: Blob;
   fileName: string;
   previewUrl: string;
+  sourceBlob: Blob;
 };
 
 const terminalJobStates = new Set(["succeeded", "stale", "rejected", "failed"]);
@@ -159,7 +159,6 @@ const QUEUE_RECOVERY_POLL_MS = 12_000;
 const DEFAULT_REGION = { x: 800, y: 832, width: 448, height: 384 };
 const WELCOME_STORAGE_KEY = "palimpsest:welcome:v1";
 const REFERENCE_IMAGE_SIZE = 1024;
-const REFERENCE_MASK_INSET = 64;
 const MAX_REFERENCE_UPLOAD_BYTES = 10 * 1024 * 1024;
 const REFERENCE_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 
@@ -608,14 +607,7 @@ function canvasBlob(canvas: HTMLCanvasElement, message: string): Promise<Blob> {
   });
 }
 
-async function transparentGenerationFrame(): Promise<Blob> {
-  const canvas = document.createElement("canvas");
-  canvas.width = REFERENCE_IMAGE_SIZE;
-  canvas.height = REFERENCE_IMAGE_SIZE;
-  return canvasBlob(canvas, "The transparent image layer could not be prepared.");
-}
-
-async function normalizeReferenceImage(file: File, targetRegion: Region): Promise<Blob> {
+async function normalizeReferenceImage(file: File): Promise<Blob> {
   let image: ImageBitmap;
   try {
     image = await createImageBitmap(file);
@@ -631,13 +623,20 @@ async function normalizeReferenceImage(file: File, targetRegion: Region): Promis
     canvas.height = REFERENCE_IMAGE_SIZE;
     const context = canvas.getContext("2d");
     if (!context) throw new Error("This browser cannot prepare reference images.");
-    const placement = referenceImagePlacement(image.width, image.height, targetRegion);
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = "high";
+    const scale = Math.min(
+      REFERENCE_IMAGE_SIZE / image.width,
+      REFERENCE_IMAGE_SIZE / image.height,
+    );
+    const width = Math.max(1, Math.round(image.width * scale));
+    const height = Math.max(1, Math.round(image.height * scale));
     context.drawImage(
       image,
-      placement.x,
-      placement.y,
-      placement.width,
-      placement.height,
+      Math.round((REFERENCE_IMAGE_SIZE - width) / 2),
+      Math.round((REFERENCE_IMAGE_SIZE - height) / 2),
+      width,
+      height,
     );
     return canvasBlob(canvas, "The reference image could not be encoded.");
   } finally {
@@ -713,12 +712,59 @@ async function flattenArtworkFrame(state: ArtworkState, frame: Region): Promise<
   return canvasBlob(source, "The artwork frame could not be encoded.");
 }
 
+async function placeReferenceGuide(
+  source: Blob,
+  reference: Blob,
+  region: Region,
+  frame: Region,
+): Promise<Blob> {
+  let sourceImage: ImageBitmap;
+  let referenceImage: ImageBitmap;
+  try {
+    [sourceImage, referenceImage] = await Promise.all([
+      createImageBitmap(source),
+      createImageBitmap(reference),
+    ]);
+  } catch {
+    throw new Error("The reference placement guide could not be prepared.");
+  }
+
+  try {
+    const canvas = document.createElement("canvas");
+    canvas.width = frame.width;
+    canvas.height = frame.height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("This browser cannot prepare reference placement.");
+    context.drawImage(sourceImage, 0, 0, frame.width, frame.height);
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = "high";
+
+    const localRegion = regionRelativeToFrame(region, frame);
+    const scale = Math.min(
+      (region.width * REFERENCE_TARGET_FILL) / referenceImage.width,
+      (region.height * REFERENCE_TARGET_FILL) / referenceImage.height,
+    );
+    const width = Math.max(1, Math.round(referenceImage.width * scale));
+    const height = Math.max(1, Math.round(referenceImage.height * scale));
+    context.drawImage(
+      referenceImage,
+      Math.round(localRegion.x + (region.width - width) / 2),
+      Math.round(localRegion.y + (region.height - height) / 2),
+      width,
+      height,
+    );
+    return canvasBlob(canvas, "The reference placement guide could not be encoded.");
+  } finally {
+    sourceImage.close();
+    referenceImage.close();
+  }
+}
+
 async function providerMask(
   region: Region,
   frame: Region,
   strokes: Stroke[],
   fill: boolean,
-  inset = 0,
 ): Promise<Blob> {
   const canvas = document.createElement("canvas");
   canvas.width = frame.width;
@@ -729,17 +775,6 @@ async function providerMask(
   context.fillRect(0, 0, frame.width, frame.height);
   context.globalCompositeOperation = "destination-out";
   const frameRegion = regionRelativeToFrame(region, frame);
-  context.save();
-  if (inset > 0) {
-    context.beginPath();
-    context.rect(
-      frameRegion.x + inset,
-      frameRegion.y + inset,
-      Math.max(1, region.width - inset * 2),
-      Math.max(1, region.height - inset * 2),
-    );
-    context.clip();
-  }
   if (fill) {
     context.clearRect(
       frameRegion.x,
@@ -766,7 +801,6 @@ async function providerMask(
       context.stroke();
     }
   }
-  context.restore();
   context.globalCompositeOperation = "source-over";
   return canvasBlob(canvas, "The mask could not be encoded.");
 }
@@ -1831,13 +1865,13 @@ export default function Palimpsest() {
     setSubmitError(null);
     setIsPreparing(true);
     try {
-      const blob = await normalizeReferenceImage(file, editRegion);
+      const blob = await normalizeReferenceImage(file);
       if (referencePreviewUrlRef.current) {
         URL.revokeObjectURL(referencePreviewUrlRef.current);
       }
       const previewUrl = URL.createObjectURL(file);
       referencePreviewUrlRef.current = previewUrl;
-      setReferenceImage({ blob, fileName: file.name, previewUrl });
+      setReferenceImage({ blob, fileName: file.name, previewUrl, sourceBlob: file });
     } catch (error) {
       event.currentTarget.value = "";
       setSubmitError(
@@ -1865,15 +1899,21 @@ export default function Palimpsest() {
     try {
       const frame = generationFrameForRegion(editRegion);
       const [source, mask] = await Promise.all([
-        referenceImage
-          ? transparentGenerationFrame()
-          : flattenArtworkFrame(editBase.state, frame),
+        flattenArtworkFrame(editBase.state, frame).then((artworkFrame) =>
+          referenceImage
+            ? placeReferenceGuide(
+                artworkFrame,
+                referenceImage.sourceBlob,
+                editRegion,
+                frame,
+              )
+            : artworkFrame,
+        ),
         providerMask(
           editRegion,
           frame,
           strokes,
           fillMask,
-          referenceImage ? REFERENCE_MASK_INSET : 0,
         ),
       ]);
       const form = new FormData();

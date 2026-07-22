@@ -11,7 +11,7 @@ Multiple people can work at once. A live reservation locks only the region curre
 1. **Place** a free-position patch anywhere on the 2048×2048 artwork.
 2. **Mask** the pixels that may change, or choose the entire patch.
 3. **Describe** the edit and optionally attach a PNG, JPEG, or WebP reference.
-4. **Plan and render.** OpenAI moderation checks the request, GPT-5.6 creates a concise visual plan without inventing new intent, and GPT Image edits the masked context frame.
+4. **Plan and render.** OpenAI moderation checks the request, GPT-5.6 creates a concise visual plan without inventing new intent, and GPT Image edits the current masked context frame. A reference is positioned directly in that real canvas frame before the model blends away its source background; the original full-resolution upload is retained for an independent fidelity review.
 5. **Remember.** The accepted patch is appended as a new revision. The timeline can scrub, compare, replay, share, and restore earlier states without erasing history.
 
 ## Why it is different
@@ -24,7 +24,7 @@ Multiple people can work at once. A live reservation locks only the region curre
 ## OpenAI in the product
 
 - **GPT-5.6 (`gpt-5.6`)** is the edit planner. It preserves the contributor's request, accounts for an optional reference image, and produces a short instruction for the renderer.
-- **GPT Image (`gpt-image-2`)** performs the masked image edit on a 1024×1024 context frame.
+- **GPT Image (`gpt-image-2`)** performs the masked image edit on a 1024×1024 crop of the current canvas. Reference subjects are already positioned in that input at the exact on-canvas footprint.
 - **OpenAI Moderation (`omni-moderation-latest`)** checks the contributor's original request before planning or generation.
 
 The queue fails closed if any required OpenAI step is unavailable. The original contributor prompt—not the generated plan—remains the public historical record.

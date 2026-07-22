@@ -492,7 +492,7 @@ test("live-canvas reset targets the current archive with validated SQL", async (
   const [domainSource, purpleCanvasReset, liveCanvasReset] = await Promise.all([
     readFile(new URL("lib/palimpsest/domain.mjs", root), "utf8"),
     readFile(new URL("drizzle/0005_purple_canvas_reset.sql", root), "utf8"),
-    readFile(new URL("drizzle/0007_current_live_canvas_reset.sql", root), "utf8"),
+    readFile(new URL("drizzle/0008_clear_live_archive.sql", root), "utf8"),
   ]);
   const artworkId = domainSource.match(/ARTWORK_ID = "([^"]+)"/u)?.[1];
 

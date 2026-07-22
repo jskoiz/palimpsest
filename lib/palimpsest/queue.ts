@@ -4,13 +4,11 @@ import {
   buildOpenAiEditPrompt,
 } from "./domain.mjs";
 import {
-  buildContainmentReviewRequest,
   buildEditPlanRequest,
-  extractContainmentReview,
   extractEditPlan,
+  buildReferenceEditReviewRequest,
+  extractReferenceEditReview,
 } from "./ai-planner.mjs";
-import { imageEditProviderPolicy } from "./image-edit-policy.mjs";
-import { inspectPngAlphaPlacement } from "./png-alpha.mjs";
 import type { AppEnv } from "./runtime";
 import { readPngDimensions, sha256Hex } from "./runtime";
 import {
@@ -59,9 +57,9 @@ const COMMIT_LOCK_RETRY_MS = 25;
 const MODERATION_TIMEOUT_MS = 30_000;
 const EDIT_PLANNING_TIMEOUT_MS = 30_000;
 const IMAGE_EDIT_TIMEOUT_MS = 150_000;
-const CONTAINMENT_REVIEW_TIMEOUT_MS = 75_000;
-const MAX_CONTAINMENT_ATTEMPTS = 2;
-const REFERENCE_LAYER_RETRY = "The previous result failed review. Regenerate from the original source and reference. Center the complete requested subject and scale it to no more than 45% of the transparent editable area's width or height, leaving obvious empty space on all four sides. Return only that subject and its natural contact shadow; every other pixel must be fully transparent. Do not crop any part or add an opaque rectangular background.";
+const REFERENCE_REVIEW_TIMEOUT_MS = 75_000;
+const MAX_REFERENCE_ATTEMPTS = 2;
+const REFERENCE_EDIT_RETRY = "The previous result failed reference review. Regenerate from the original current-canvas input. It already contains the reference subject at the intended position, scale, and maximum footprint. Preserve those visible subject pixels and their exact identity, geometry, proportions, perspective, materials, control layout, symbols, labels, and fine details; do not enlarge, crop, reposition, redraw, redesign, or substitute any component. Edit away its source background and blend it naturally into the current surroundings without a rectangular patch, matte, halo, wash, or tonal seam.";
 
 export type QueueProcessResult = {
   claimed: number;
@@ -354,14 +352,6 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
       return;
     }
 
-    const region = jobRegion(job);
-    const frame = jobFrame(job);
-    const localRegion = {
-      x: region.x - frame.x,
-      y: region.y - frame.y,
-      width: region.width,
-      height: region.height,
-    };
     if (!job.displayMaskBlobId) {
       throw new DomainError("INTERNAL_ERROR", "The generated layer mask is missing.");
     }
@@ -382,41 +372,31 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
     await updateStage(env, job, "moderating", "generating");
     let patch = await generateOpenAiPatch(env, job, apiKey, plannedPrompt);
     if (job.referenceBlobId) {
-      for (let attempt = 0; attempt < MAX_CONTAINMENT_ATTEMPTS; attempt += 1) {
+      const referenceBytes = patch.referenceBytes;
+      if (!referenceBytes) {
+        throw new DomainError("INTERNAL_ERROR", "The reference image could not be reviewed.");
+      }
+      for (let attempt = 0; attempt < MAX_REFERENCE_ATTEMPTS; attempt += 1) {
         await updateStage(env, job, "generating", "generating");
-        let alphaReview;
-        try {
-          alphaReview = await inspectPngAlphaPlacement(patch.bytes, localRegion);
-        } catch {
-          throw new DomainError(
-            "PROVIDER_TEMPORARY",
-            "Live image editing returned an unreadable transparent layer. Nothing was added to history.",
-          );
-        }
-        const review = alphaReview.backgroundClear
-          ? await reviewPatchContainment(
-              apiKey,
-              job.prompt,
-              patch.bytes,
-              patch.providerMaskBytes,
-            )
-          : null;
-        console.info(`[palimpsest:${job.id}] reference layer review`, {
+        const review = await reviewReferenceEdit(
+          apiKey,
+          job.prompt,
+          patch.bytes,
+          referenceBytes,
+          patch.providerMaskBytes,
+        );
+        console.info(`[palimpsest:${job.id}] reference edit review`, {
           attempt: attempt + 1,
-          alphaBackgroundClear: alphaReview.backgroundClear,
-          alphaBounds: alphaReview.bounds,
-          alphaFillRatio: Number(alphaReview.fillRatio.toFixed(4)),
-          alphaTouchesBoundary: alphaReview.touchesBoundary,
-          alphaRectangularFill: alphaReview.rectangularFill,
           subjectContained: review?.contained ?? null,
-          visualBackgroundClear: review?.backgroundClear ?? null,
+          referenceFaithful: review?.faithful ?? null,
+          surroundingsBlended: review?.blended ?? null,
           reviewerReason: review?.reason.slice(0, 240) ?? null,
         });
-        if (review && review.contained && alphaReview.backgroundClear) break;
-        if (attempt === MAX_CONTAINMENT_ATTEMPTS - 1) {
+        if (review.contained && review.faithful && review.blended) break;
+        if (attempt === MAX_REFERENCE_ATTEMPTS - 1) {
           throw new DomainError(
-            "SUBJECT_OUT_OF_FRAME",
-            "The generated reference could not be placed completely without a visible rectangular background. Nothing was added to history; choose a larger region and try again.",
+            "REFERENCE_REVIEW_FAILED",
+            "The generated edit could not preserve the reference faithfully and blend it into the canvas. Nothing was added to history; use a clear reference and a large enough region, then try again.",
           );
         }
         await updateStage(env, job, "generating", "generating");
@@ -424,7 +404,7 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
           env,
           job,
           apiKey,
-          `${plannedPrompt} ${REFERENCE_LAYER_RETRY}`,
+          `${plannedPrompt} ${REFERENCE_EDIT_RETRY}`,
         );
       }
     }
@@ -603,6 +583,7 @@ async function generateOpenAiPatch(
   contentType: string;
   providerRequestId?: string;
   providerMaskBytes: Uint8Array;
+  referenceBytes: Uint8Array | null;
 }> {
   if (!job.sourceBlobId || !job.maskBlobId) {
     throw new DomainError("INTERNAL_ERROR", "The image-edit inputs are missing.");
@@ -638,9 +619,8 @@ async function generateOpenAiPatch(
       : Promise.resolve(null),
   ]);
 
-  const imagePolicy = imageEditProviderPolicy(Boolean(referenceBytes));
   const form = new FormData();
-  form.append("model", imagePolicy.model);
+  form.append("model", "gpt-image-2");
   form.append(
     "image[]",
     new File([sourceBytes], "palimpsest-context.png", {
@@ -653,20 +633,6 @@ async function generateOpenAiPatch(
       type: "image/png",
     }),
   );
-  if (referenceBytes) {
-    form.append(
-      "image[]",
-      new File([referenceBytes], "palimpsest-reference.png", {
-        type: "image/png",
-      }),
-    );
-  }
-  if (imagePolicy.background) {
-    form.append("background", imagePolicy.background);
-  }
-  if (imagePolicy.inputFidelity) {
-    form.append("input_fidelity", imagePolicy.inputFidelity);
-  }
   form.append("prompt", buildOpenAiEditPrompt(plannedPrompt, Boolean(reference)));
   form.append("size", "1024x1024");
   form.append("quality", "medium");
@@ -689,7 +655,11 @@ async function generateOpenAiPatch(
     body = (await response.json().catch(() => null)) as
       | { data?: Array<{ b64_json?: string }>; error?: { code?: string } }
       | null;
-  } catch {
+  } catch (error) {
+    console.error(`[palimpsest:${job.id}] image edit request failed`, {
+      name: error instanceof Error ? error.name : "UnknownError",
+      message: error instanceof Error ? error.message : "Unknown fetch failure",
+    });
     throw new DomainError(
       "PROVIDER_TEMPORARY",
       "Live image editing did not respond in time. Nothing was added to history.",
@@ -700,6 +670,11 @@ async function generateOpenAiPatch(
 
   const providerRequestId = response.headers.get("x-request-id") ?? undefined;
   if (!response.ok) {
+    console.error(`[palimpsest:${job.id}] image edit rejected`, {
+      status: response.status,
+      code: body?.error?.code ?? null,
+      requestId: providerRequestId ?? null,
+    });
     if (body?.error?.code === "moderation_blocked") {
       throw new DomainError(
         "CONTENT_POLICY",
@@ -740,7 +715,13 @@ async function generateOpenAiPatch(
       "Live image editing returned an invalid context-frame size.",
     );
   }
-  return { bytes, contentType: "image/png", providerRequestId, providerMaskBytes };
+  return {
+    bytes,
+    contentType: "image/png",
+    providerRequestId,
+    providerMaskBytes,
+    referenceBytes,
+  };
 }
 
 function imageDataUrl(bytes: Uint8Array) {
@@ -752,14 +733,15 @@ function imageDataUrl(bytes: Uint8Array) {
   return `data:image/png;base64,${btoa(binary)}`;
 }
 
-async function reviewPatchContainment(
+async function reviewReferenceEdit(
   apiKey: string,
   requestedChange: string,
   generatedBytes: Uint8Array,
+  referenceBytes: Uint8Array,
   providerMaskBytes: Uint8Array,
 ) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), CONTAINMENT_REVIEW_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), REFERENCE_REVIEW_TIMEOUT_MS);
   let response: Response;
   let body: { output?: Array<unknown> } | null;
   try {
@@ -769,9 +751,10 @@ async function reviewPatchContainment(
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(buildContainmentReviewRequest({
+      body: JSON.stringify(buildReferenceEditReviewRequest({
         requestedChange,
         generatedImageUrl: imageDataUrl(generatedBytes),
+        referenceImageUrl: imageDataUrl(referenceBytes),
         providerMaskUrl: imageDataUrl(providerMaskBytes),
       })),
       signal: controller.signal,
@@ -780,7 +763,7 @@ async function reviewPatchContainment(
   } catch {
     throw new DomainError(
       "PROVIDER_TEMPORARY",
-      "The generated image could not be checked for a complete subject. Nothing was added to history.",
+      "The generated image could not be checked for reference fidelity. Nothing was added to history.",
     );
   } finally {
     clearTimeout(timeout);
@@ -788,14 +771,14 @@ async function reviewPatchContainment(
   if (!response.ok) {
     throw new DomainError(
       "PROVIDER_TEMPORARY",
-      "The generated image could not be checked for a complete subject. Nothing was added to history.",
+      "The generated image could not be checked for reference fidelity. Nothing was added to history.",
     );
   }
-  const review = extractContainmentReview(body);
+  const review = extractReferenceEditReview(body);
   if (!review) {
     throw new DomainError(
       "PROVIDER_TEMPORARY",
-      "The generated image returned no usable containment check. Nothing was added to history.",
+      "The generated image returned no usable reference review. Nothing was added to history.",
     );
   }
   return review;
