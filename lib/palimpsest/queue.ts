@@ -10,6 +10,7 @@ import {
   extractEditPlan,
 } from "./ai-planner.mjs";
 import { imageEditProviderPolicy } from "./image-edit-policy.mjs";
+import { inspectPngAlphaPlacement } from "./png-alpha.mjs";
 import type { AppEnv } from "./runtime";
 import { readPngDimensions, sha256Hex } from "./runtime";
 import {
@@ -353,8 +354,14 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
       return;
     }
 
-    jobRegion(job);
-    jobFrame(job);
+    const region = jobRegion(job);
+    const frame = jobFrame(job);
+    const localRegion = {
+      x: region.x - frame.x,
+      y: region.y - frame.y,
+      width: region.width,
+      height: region.height,
+    };
     if (!job.displayMaskBlobId) {
       throw new DomainError("INTERNAL_ERROR", "The generated layer mask is missing.");
     }
@@ -377,13 +384,35 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
     if (job.referenceBlobId) {
       for (let attempt = 0; attempt < MAX_CONTAINMENT_ATTEMPTS; attempt += 1) {
         await updateStage(env, job, "generating", "generating");
-        const review = await reviewPatchContainment(
-          apiKey,
-          job.prompt,
-          patch.bytes,
-          patch.providerMaskBytes,
-        );
-        if (review.contained && review.backgroundClear) break;
+        let alphaReview;
+        try {
+          alphaReview = await inspectPngAlphaPlacement(patch.bytes, localRegion);
+        } catch {
+          throw new DomainError(
+            "PROVIDER_TEMPORARY",
+            "Live image editing returned an unreadable transparent layer. Nothing was added to history.",
+          );
+        }
+        const review = alphaReview.backgroundClear
+          ? await reviewPatchContainment(
+              apiKey,
+              job.prompt,
+              patch.bytes,
+              patch.providerMaskBytes,
+            )
+          : null;
+        console.info(`[palimpsest:${job.id}] reference layer review`, {
+          attempt: attempt + 1,
+          alphaBackgroundClear: alphaReview.backgroundClear,
+          alphaBounds: alphaReview.bounds,
+          alphaFillRatio: Number(alphaReview.fillRatio.toFixed(4)),
+          alphaTouchesBoundary: alphaReview.touchesBoundary,
+          alphaRectangularFill: alphaReview.rectangularFill,
+          subjectContained: review?.contained ?? null,
+          visualBackgroundClear: review?.backgroundClear ?? null,
+          reviewerReason: review?.reason.slice(0, 240) ?? null,
+        });
+        if (review && review.contained && alphaReview.backgroundClear) break;
         if (attempt === MAX_CONTAINMENT_ATTEMPTS - 1) {
           throw new DomainError(
             "SUBJECT_OUT_OF_FRAME",
