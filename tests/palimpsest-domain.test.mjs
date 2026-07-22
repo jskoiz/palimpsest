@@ -405,8 +405,9 @@ test("reference images stay optional, visible in the patch, and reach live gener
   assert.doesNotMatch(storeSource, /kind[^\n]*'reference'|VALUES \([^\n]*'reference'/);
   assert.match(storeSource, /referenceBlobId,[\s\S]*VALUES \(\?, \?, 'input'/);
   assert.match(queueSource, /palimpsest-reference\.png/);
-  assert.match(queueSource, /form\.append\("background", "transparent"\)/);
-  assert.match(queueSource, /form\.append\("input_fidelity", "high"\)/);
+  assert.match(queueSource, /imageEditProviderPolicy\(Boolean\(referenceBytes\)\)/);
+  assert.match(queueSource, /form\.append\("background", imagePolicy\.background\)/);
+  assert.match(queueSource, /form\.append\("input_fidelity", imagePolicy\.inputFidelity\)/);
   assert.match(queueSource, /buildOpenAiEditPrompt\(plannedPrompt, Boolean\(reference\)\)/);
   assert.match(queueSource, /reviewPatchContainment/);
   assert.match(queueSource, /MAX_CONTAINMENT_ATTEMPTS = 2/);
