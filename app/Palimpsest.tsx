@@ -22,9 +22,8 @@ import {
   EDIT_REGION_MIN_EDGE,
   generationFrameForRegion,
   positionEditRegion,
-  positionEditRegionAvoidingRegions,
   regionRelativeToFrame,
-  resizeEditRegionAvoidingRegions,
+  resizeEditRegion,
   regionsOverlap,
   timelineIndexAtPosition,
 } from "@/lib/palimpsest/geometry.mjs";
@@ -228,12 +227,7 @@ function findOpenRegion(sequence: number, activeRegions: ActiveRegion[]) {
       return candidate;
     }
   }
-  return positionEditRegionAvoidingRegions(
-    centered,
-    centered.x,
-    centered.y,
-    activeRegions.map((active) => active.region),
-  );
+  return centered;
 }
 
 function activitySignature(activity: ActivityPayload) {
@@ -267,19 +261,19 @@ function activeStateLabel(active: ActiveRegion) {
 }
 
 function overlapMessage(active: ActiveRegion) {
+  let message: string;
   if (!active.reservationActive) {
-    return `${active.author}'s edit is recovering here — this area stays unavailable until recovery finishes.`;
+    message = `${active.author}'s edit is recovering here — this area stays unavailable until recovery finishes.`;
+  } else if (active.state === "queued") {
+    message = `${active.author} reserved this area — it stays locked until the edit finishes.`;
+  } else if (active.state === "moderating") {
+    message = `${active.author} is planning an edit here — this area is locked.`;
+  } else if (active.state === "committing") {
+    message = `${active.author} is finishing an edit here — this area is locked.`;
+  } else {
+    message = `${active.author} is generating here — this area is locked.`;
   }
-  if (active.state === "queued") {
-    return `${active.author} reserved this area — it stays locked until the edit finishes.`;
-  }
-  if (active.state === "moderating") {
-    return `${active.author} is planning an edit here — this area is locked.`;
-  }
-  if (active.state === "committing") {
-    return `${active.author} is finishing an edit here — this area is locked.`;
-  }
-  return `${active.author} is generating here — this area is locked.`;
+  return `${message} Your patch stays exactly where you placed it; wait for the lock to clear or move it yourself.`;
 }
 
 async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
@@ -1187,19 +1181,7 @@ export default function Palimpsest() {
     );
     if (!active) return;
     maskPointer.current = null;
-    setEditRegion((region) =>
-      positionEditRegionAvoidingRegions(
-        region,
-        region.x,
-        region.y,
-        latest.current.activeRegions.map((entry) => entry.region),
-      ),
-    );
-    setStep(1);
-    setStrokes([]);
-    setFillMask(false);
-    setSubmitError(null);
-    showToast(`${active.author} locked that area — your patch moved to open space.`);
+    showToast(`${active.author} locked that area — your patch stayed exactly where you placed it.`);
   }, [conflictingJobId, editOpen, showToast, submitted]);
 
   useEffect(() => {
@@ -1430,12 +1412,7 @@ export default function Palimpsest() {
 
   const nudgePatch = useCallback((deltaX: number, deltaY: number) => {
     setEditRegion((region) =>
-      positionEditRegionAvoidingRegions(
-        region,
-        region.x + deltaX,
-        region.y + deltaY,
-        latest.current.activeRegions.map((active) => active.region),
-      ),
+      positionEditRegion(region, region.x + deltaX, region.y + deltaY),
     );
   }, []);
 
@@ -1699,12 +1676,7 @@ export default function Palimpsest() {
     if (!point) return;
     const offset = patchDrag.current;
     setEditRegion((region) =>
-      positionEditRegionAvoidingRegions(
-        region,
-        point.x - offset.x,
-        point.y - offset.y,
-        latest.current.activeRegions.map((active) => active.region),
-      ),
+      positionEditRegion(region, point.x - offset.x, point.y - offset.y),
     );
   };
 
@@ -1718,23 +1690,13 @@ export default function Palimpsest() {
 
   const resizePatch = (desiredWidth: number, desiredHeight: number) => {
     setEditRegion((region) =>
-      resizeEditRegionAvoidingRegions(
-        region,
-        desiredWidth,
-        desiredHeight,
-        latest.current.activeRegions.map((active) => active.region),
-      ),
+      resizeEditRegion(region, desiredWidth, desiredHeight),
     );
   };
 
   const resizePatchBy = (amount: number) => {
     setEditRegion((region) =>
-      resizeEditRegionAvoidingRegions(
-        region,
-        region.width + amount,
-        region.height + amount,
-        latest.current.activeRegions.map((active) => active.region),
-      ),
+      resizeEditRegion(region, region.width + amount, region.height + amount),
     );
     wake();
   };
@@ -1761,11 +1723,10 @@ export default function Palimpsest() {
     const point = artworkPoint(event);
     if (!point) return;
     setEditRegion((region) =>
-      resizeEditRegionAvoidingRegions(
+      resizeEditRegion(
         region,
         point.x + resize.edgeOffsetX - region.x,
         point.y + resize.edgeOffsetY - region.y,
-        latest.current.activeRegions.map((active) => active.region),
       ),
     );
     event.stopPropagation();
@@ -1797,11 +1758,10 @@ export default function Palimpsest() {
     }
     if (widthDelta !== 0 || heightDelta !== 0) {
       setEditRegion((region) =>
-        resizeEditRegionAvoidingRegions(
+        resizeEditRegion(
           region,
           region.width + widthDelta,
           region.height + heightDelta,
-          latest.current.activeRegions.map((active) => active.region),
         ),
       );
     }
