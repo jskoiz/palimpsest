@@ -613,6 +613,13 @@ function canvasBlob(canvas: HTMLCanvasElement, message: string): Promise<Blob> {
   });
 }
 
+async function transparentGenerationFrame(): Promise<Blob> {
+  const canvas = document.createElement("canvas");
+  canvas.width = REFERENCE_IMAGE_SIZE;
+  canvas.height = REFERENCE_IMAGE_SIZE;
+  return canvasBlob(canvas, "The transparent image layer could not be prepared.");
+}
+
 async function normalizeReferenceImage(file: File, targetRegion: Region): Promise<Blob> {
   let image: ImageBitmap;
   try {
@@ -1884,7 +1891,9 @@ export default function Palimpsest() {
     try {
       const frame = generationFrameForRegion(editRegion);
       const [source, mask] = await Promise.all([
-        flattenArtworkFrame(editBase.state, frame),
+        referenceImage
+          ? transparentGenerationFrame()
+          : flattenArtworkFrame(editBase.state, frame),
         providerMask(editRegion, frame, strokes, fillMask),
       ]);
       const form = new FormData();
