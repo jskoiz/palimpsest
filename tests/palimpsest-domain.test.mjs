@@ -200,11 +200,12 @@ test("request handlers rely on packaged migrations instead of runtime schema DDL
 });
 
 test("new archives begin with one purple abstract revision", async () => {
-  const storeSource = await readFile(
-    new URL("../lib/palimpsest/store.ts", import.meta.url),
-    "utf8",
-  );
+  const [storeSource, domainSource] = await Promise.all([
+    readFile(new URL("../lib/palimpsest/store.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/palimpsest/domain.mjs", import.meta.url), "utf8"),
+  ]);
 
+  assert.match(domainSource, /ARTWORK_ID = "palimpsest-purple"/);
   assert.match(storeSource, /prompt: "Purple abstract canvas\."/);
   assert.match(storeSource, /rev-seed-purple-000/);
   assert.match(storeSource, /blob-purple-base-/);
