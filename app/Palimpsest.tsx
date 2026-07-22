@@ -791,7 +791,11 @@ export default function Palimpsest() {
   const closeTimer = useRef<number | null>(null);
   const panStart = useRef<{ pointerId: number; x: number; y: number } | null>(null);
   const patchDrag = useRef<{ pointerId: number; x: number; y: number } | null>(null);
-  const patchResize = useRef<{ pointerId: number } | null>(null);
+  const patchResize = useRef<{
+    pointerId: number;
+    edgeOffsetX: number;
+    edgeOffsetY: number;
+  } | null>(null);
   const compareDrag = useRef(false);
   const timelineDrag = useRef<number | null>(null);
   const maskPointer = useRef<number | null>(null);
@@ -1681,7 +1685,13 @@ export default function Palimpsest() {
   const patchResizeDown = (event: ReactPointerEvent<HTMLButtonElement>) => {
     if (step !== 1 || submitted) return;
     if (event.pointerType === "mouse" && event.button !== 0) return;
-    patchResize.current = { pointerId: event.pointerId };
+    const point = artworkPoint(event);
+    if (!point) return;
+    patchResize.current = {
+      pointerId: event.pointerId,
+      edgeOffsetX: editRegion.x + editRegion.width - point.x,
+      edgeOffsetY: editRegion.y + editRegion.height - point.y,
+    };
     event.currentTarget.setPointerCapture(event.pointerId);
     event.currentTarget.focus();
     event.stopPropagation();
@@ -1689,14 +1699,15 @@ export default function Palimpsest() {
   };
 
   const patchResizeMove = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    if (patchResize.current?.pointerId !== event.pointerId) return;
+    const resize = patchResize.current;
+    if (resize?.pointerId !== event.pointerId) return;
     const point = artworkPoint(event);
     if (!point) return;
     setEditRegion((region) =>
       resizeEditRegionAvoidingRegions(
         region,
-        point.x - region.x,
-        point.y - region.y,
+        point.x + resize.edgeOffsetX - region.x,
+        point.y + resize.edgeOffsetY - region.y,
         latest.current.activeRegions.map((active) => active.region),
       ),
     );
