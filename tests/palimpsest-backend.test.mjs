@@ -488,13 +488,21 @@ test("purple-canvas migration removes the current duck revision and reseeds clea
   db.close();
 });
 
-test("live-canvas reset uses the validated clean-archive migration", async () => {
-  const [purpleCanvasReset, liveCanvasReset] = await Promise.all([
+test("live-canvas reset targets the current archive with validated SQL", async () => {
+  const [domainSource, purpleCanvasReset, liveCanvasReset] = await Promise.all([
+    readFile(new URL("lib/palimpsest/domain.mjs", root), "utf8"),
     readFile(new URL("drizzle/0005_purple_canvas_reset.sql", root), "utf8"),
-    readFile(new URL("drizzle/0006_live_canvas_reset.sql", root), "utf8"),
+    readFile(new URL("drizzle/0007_current_live_canvas_reset.sql", root), "utf8"),
   ]);
+  const artworkId = domainSource.match(/ARTWORK_ID = "([^"]+)"/u)?.[1];
 
-  assert.equal(liveCanvasReset, purpleCanvasReset);
+  assert.equal(artworkId, "palimpsest-purple");
+  assert.match(liveCanvasReset, new RegExp(`'${artworkId}'`, "u"));
+  assert.doesNotMatch(liveCanvasReset, /'palimpsest'/u);
+  assert.equal(
+    liveCanvasReset.replaceAll("'palimpsest-purple'", "'palimpsest'"),
+    purpleCanvasReset,
+  );
 });
 
 test("atomic spatial reservations reject overlap, allow touching, and expire cleanly", async () => {
