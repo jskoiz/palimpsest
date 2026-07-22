@@ -11,6 +11,7 @@ import {
   jsonError,
   readPngDimensions,
 } from "@/lib/palimpsest/runtime";
+import { contributionRatePolicy } from "@/lib/palimpsest/rate-policy.mjs";
 import {
   enforceRateLimit,
   ensurePalimpsest,
@@ -139,8 +140,10 @@ export async function POST(request: Request) {
     }
 
     const hash = await requesterHash(env, request);
-    await enforceRateLimit(env, hash, "edit-10m", 3, 10 * 60 * 1000);
-    await enforceRateLimit(env, hash, "edit-day", 12, 24 * 60 * 60 * 1000);
+    const ratePolicy = contributionRatePolicy(env, request, "edit");
+    for (const limit of ratePolicy.limits) {
+      await enforceRateLimit(env, hash, limit.scope, limit.limit, limit.windowMs);
+    }
     const job = await insertEditJob(env, {
       baseRevisionId: meta.baseRevisionId,
       displayName,
@@ -153,6 +156,10 @@ export async function POST(request: Request) {
       sourceBytes,
       maskBytes,
       referenceBytes,
+    });
+    console.info(`[palimpsest:${requestId}] contribution accepted`, {
+      kind: "edit",
+      ratePolicy: ratePolicy.name,
     });
     return Response.json(
       { job },
