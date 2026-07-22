@@ -10,6 +10,7 @@ import {
   buildOpenAiEditPrompt,
   createDisplayMaskSvg,
   displayMaskForLayer,
+  generationMaskInset,
   referenceImagePlacement,
   resolveLayerStack,
   serializeHistory,
@@ -184,6 +185,15 @@ test("display masks keep exact hard edit boundaries without feathering", () => {
   assert.match(svg, /<rect x="100" y="200" width="384" height="320" fill="white"/);
 });
 
+test("filled generations preserve a source-matched hard seam guard", () => {
+  assert.equal(generationMaskInset({ width: 512, height: 512 }), 48);
+  assert.equal(generationMaskInset({ width: 384, height: 320 }), 40);
+  assert.equal(generationMaskInset({ width: 160, height: 160 }), 20);
+  assert.equal(generationMaskInset({ width: 96, height: 96 }), 12);
+  assert.equal(generationMaskInset({ width: 64, height: 64 }), 0);
+  assert.equal(generationMaskInset({ width: 512, height: 64 }), 0);
+});
+
 test("reference framing preserves the full image with a safety margin", () => {
   assert.deepEqual(referenceImagePlacement(768, 574, { width: 384, height: 320 }), {
     x: 397,
@@ -296,6 +306,8 @@ test("live image prompts keep random objects whole without forcing an art style"
   assert.match(prompt, /clear margin on every side/i);
   assert.match(prompt, /reference subject touches an edge/i);
   assert.match(prompt, /without forcing it into a predefined artistic motif/i);
+  assert.match(prompt, /exact seam reference/i);
+  assert.match(prompt, /visible rectangle, corner, halo, or tonal shift/i);
   assert.match(prompt, /Add a bright plastic toy truck\./);
   assert.doesNotMatch(prompt, /vermilion|graphite|mixed-media/i);
 });
