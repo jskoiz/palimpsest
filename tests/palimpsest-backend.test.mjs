@@ -107,6 +107,38 @@ test("reference image migration adds an optional private input pointer", async (
   db.close();
 });
 
+test("activity keeps expired nonterminal regions visible for recovery", async () => {
+  const db = await migratedDatabase();
+  seedArtwork(db);
+  const [insertSql, activeRegionsSql] = await Promise.all([
+    readSqlConstant("lib/palimpsest/store.ts", "INSERT_EDIT_RESERVATION_SQL"),
+    readSqlConstant("lib/palimpsest/store.ts", "ACTIVE_REGIONS_SQL"),
+  ]);
+  const insert = db.prepare(insertSql);
+  insert.run(...reservationValues({
+    jobId: "expired-visible",
+    authorId: "author-a",
+    region: { x: 0, y: 0, width: 100, height: 100 },
+    now: 1_000,
+  }));
+  insert.run(...reservationValues({
+    jobId: "active-visible",
+    authorId: "author-b",
+    region: { x: 300, y: 300, width: 100, height: 100 },
+    now: 100_000,
+  }));
+
+  const rows = db.prepare(activeRegionsSql).all(120_000, "palimpsest");
+  assert.deepEqual(
+    rows.map((row) => ({ jobId: row.jobId, reservationActive: row.reservationActive })),
+    [
+      { jobId: "expired-visible", reservationActive: 0 },
+      { jobId: "active-visible", reservationActive: 1 },
+    ],
+  );
+  db.close();
+});
+
 function insertCommittingJob(db, {
   id,
   region,
@@ -454,6 +486,15 @@ test("purple-canvas migration removes the current duck revision and reseeds clea
   seedArtwork(db);
   assert.throws(() => db.exec("DELETE FROM revisions WHERE id = 'r0'"));
   db.close();
+});
+
+test("live-canvas reset uses the validated clean-archive migration", async () => {
+  const [purpleCanvasReset, liveCanvasReset] = await Promise.all([
+    readFile(new URL("drizzle/0005_purple_canvas_reset.sql", root), "utf8"),
+    readFile(new URL("drizzle/0006_live_canvas_reset.sql", root), "utf8"),
+  ]);
+
+  assert.equal(liveCanvasReset, purpleCanvasReset);
 });
 
 test("atomic spatial reservations reject overlap, allow touching, and expire cleanly", async () => {

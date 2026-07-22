@@ -3,7 +3,12 @@ import {
   DomainError,
   buildOpenAiEditPrompt,
 } from "./domain.mjs";
-import { buildEditPlanRequest, extractEditPlan } from "./ai-planner.mjs";
+import {
+  buildContainmentReviewRequest,
+  buildEditPlanRequest,
+  extractContainmentReview,
+  extractEditPlan,
+} from "./ai-planner.mjs";
 import type { AppEnv } from "./runtime";
 import { readPngDimensions, sha256Hex } from "./runtime";
 import {
@@ -52,6 +57,9 @@ const COMMIT_LOCK_RETRY_MS = 25;
 const MODERATION_TIMEOUT_MS = 30_000;
 const EDIT_PLANNING_TIMEOUT_MS = 30_000;
 const IMAGE_EDIT_TIMEOUT_MS = 150_000;
+const CONTAINMENT_REVIEW_TIMEOUT_MS = 75_000;
+const MAX_CONTAINMENT_ATTEMPTS = 2;
+const SMALLER_SUBJECT_RETRY = "The previous result did not fit. Regenerate from the original source and reference. Center the complete requested subject and scale it to no more than 45% of the transparent editable area's width or height, leaving obvious empty space on all four sides. Do not crop any part.";
 
 export type QueueProcessResult = {
   claimed: number;
@@ -364,7 +372,32 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
       Boolean(job.referenceBlobId),
     );
     await updateStage(env, job, "moderating", "generating");
-    const patch = await generateOpenAiPatch(env, job, apiKey, plannedPrompt);
+    let patch = await generateOpenAiPatch(env, job, apiKey, plannedPrompt);
+    if (job.referenceBlobId) {
+      for (let attempt = 0; attempt < MAX_CONTAINMENT_ATTEMPTS; attempt += 1) {
+        await updateStage(env, job, "generating", "generating");
+        const review = await reviewPatchContainment(
+          apiKey,
+          job.prompt,
+          patch.bytes,
+          patch.providerMaskBytes,
+        );
+        if (review.contained) break;
+        if (attempt === MAX_CONTAINMENT_ATTEMPTS - 1) {
+          throw new DomainError(
+            "SUBJECT_OUT_OF_FRAME",
+            "The generated subject could not be fitted fully inside this patch. Nothing was added to history; choose a larger region and try again.",
+          );
+        }
+        await updateStage(env, job, "generating", "generating");
+        patch = await generateOpenAiPatch(
+          env,
+          job,
+          apiKey,
+          `${plannedPrompt} ${SMALLER_SUBJECT_RETRY}`,
+        );
+      }
+    }
 
     await updateStage(env, job, "generating", "committing");
     await commitPatch(env, job, patch);
@@ -535,7 +568,12 @@ async function generateOpenAiPatch(
   job: QueueJob,
   apiKey: string,
   plannedPrompt: string,
-): Promise<{ bytes: Uint8Array; contentType: string; providerRequestId?: string }> {
+): Promise<{
+  bytes: Uint8Array;
+  contentType: string;
+  providerRequestId?: string;
+  providerMaskBytes: Uint8Array;
+}> {
   if (!job.sourceBlobId || !job.maskBlobId) {
     throw new DomainError("INTERNAL_ERROR", "The image-edit inputs are missing.");
   }
@@ -562,24 +600,32 @@ async function generateOpenAiPatch(
     throw new DomainError("INTERNAL_ERROR", "The reference image is no longer available.");
   }
 
+  const [sourceBytes, providerMaskBytes, referenceBytes] = await Promise.all([
+    source.arrayBuffer().then((value) => new Uint8Array(value)),
+    mask.arrayBuffer().then((value) => new Uint8Array(value)),
+    reference
+      ? reference.arrayBuffer().then((value) => new Uint8Array(value))
+      : Promise.resolve(null),
+  ]);
+
   const form = new FormData();
   form.append("model", "gpt-image-2");
   form.append(
     "image[]",
-    new File([await source.arrayBuffer()], "palimpsest-context.png", {
+    new File([sourceBytes], "palimpsest-context.png", {
       type: "image/png",
     }),
   );
   form.append(
     "mask",
-    new File([await mask.arrayBuffer()], "palimpsest-mask.png", {
+    new File([providerMaskBytes], "palimpsest-mask.png", {
       type: "image/png",
     }),
   );
-  if (reference) {
+  if (referenceBytes) {
     form.append(
       "image[]",
-      new File([await reference.arrayBuffer()], "palimpsest-reference.png", {
+      new File([referenceBytes], "palimpsest-reference.png", {
         type: "image/png",
       }),
     );
@@ -657,7 +703,65 @@ async function generateOpenAiPatch(
       "Live image editing returned an invalid context-frame size.",
     );
   }
-  return { bytes, contentType: "image/png", providerRequestId };
+  return { bytes, contentType: "image/png", providerRequestId, providerMaskBytes };
+}
+
+function imageDataUrl(bytes: Uint8Array) {
+  let binary = "";
+  const chunkSize = 32_768;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return `data:image/png;base64,${btoa(binary)}`;
+}
+
+async function reviewPatchContainment(
+  apiKey: string,
+  requestedChange: string,
+  generatedBytes: Uint8Array,
+  providerMaskBytes: Uint8Array,
+) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CONTAINMENT_REVIEW_TIMEOUT_MS);
+  let response: Response;
+  let body: { output?: Array<unknown> } | null;
+  try {
+    response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(buildContainmentReviewRequest({
+        requestedChange,
+        generatedImageUrl: imageDataUrl(generatedBytes),
+        providerMaskUrl: imageDataUrl(providerMaskBytes),
+      })),
+      signal: controller.signal,
+    });
+    body = (await response.json().catch(() => null)) as typeof body;
+  } catch {
+    throw new DomainError(
+      "PROVIDER_TEMPORARY",
+      "The generated image could not be checked for a complete subject. Nothing was added to history.",
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (!response.ok) {
+    throw new DomainError(
+      "PROVIDER_TEMPORARY",
+      "The generated image could not be checked for a complete subject. Nothing was added to history.",
+    );
+  }
+  const review = extractContainmentReview(body);
+  if (!review) {
+    throw new DomainError(
+      "PROVIDER_TEMPORARY",
+      "The generated image returned no usable containment check. Nothing was added to history.",
+    );
+  }
+  return review;
 }
 
 async function acquireCommitLock(env: AppEnv, jobId: string): Promise<CommitLock> {

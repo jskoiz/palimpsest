@@ -10,14 +10,21 @@ import type {
   WheelEvent as ReactWheelEvent,
 } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ARTWORK_SIZE, maskBlendInset } from "@/lib/palimpsest/domain.mjs";
+import {
+  ARTWORK_SIZE,
+  REFERENCE_TARGET_FILL,
+  referenceImagePlacement,
+} from "@/lib/palimpsest/domain.mjs";
 import {
   canvasViewCanPan,
   constrainCanvasView,
+  EDIT_REGION_MAX_EDGE,
+  EDIT_REGION_MIN_EDGE,
   generationFrameForRegion,
   positionEditRegion,
   positionEditRegionAvoidingRegions,
   regionRelativeToFrame,
+  resizeEditRegionAvoidingRegions,
   regionsOverlap,
   timelineIndexAtPosition,
 } from "@/lib/palimpsest/geometry.mjs";
@@ -98,6 +105,7 @@ type ActiveRegion = {
   author: string;
   state: string;
   region: Region;
+  reservationActive: boolean;
   createdAt: string;
   updatedAt: string;
 };
@@ -147,7 +155,9 @@ const DEEP_IDLE_MS = 30000;
 const BRUSH_WIDTH = 30;
 const COLLAB_POLL_MS = 3000;
 const HIDDEN_COLLAB_POLL_MS = 8000;
-const DEFAULT_REGION = { x: 832, y: 864, width: 384, height: 320 };
+const PATCH_SIZE_STEP = 32;
+const QUEUE_RECOVERY_POLL_MS = 12_000;
+const DEFAULT_REGION = { x: 800, y: 832, width: 448, height: 384 };
 const WELCOME_STORAGE_KEY = "palimpsest:welcome:v1";
 const REFERENCE_IMAGE_SIZE = 1024;
 const MAX_REFERENCE_UPLOAD_BYTES = 10 * 1024 * 1024;
@@ -182,6 +192,17 @@ function regionStyle(region: Region): CSSProperties {
     top: `${(region.y / ARTWORK_SIZE) * 100}%`,
     width: `${(region.width / ARTWORK_SIZE) * 100}%`,
     height: `${(region.height / ARTWORK_SIZE) * 100}%`,
+  };
+}
+
+function referencePreviewStyle(): CSSProperties {
+  const offset = ((1 - REFERENCE_TARGET_FILL) / 2) * 100;
+  return {
+    position: "absolute",
+    width: `${REFERENCE_TARGET_FILL * 100}%`,
+    height: `${REFERENCE_TARGET_FILL * 100}%`,
+    left: `${offset}%`,
+    top: `${offset}%`,
   };
 }
 
@@ -226,12 +247,13 @@ function activitySignature(activity: ActivityPayload) {
       active.region.y,
       active.region.width,
       active.region.height,
+      active.reservationActive,
       active.updatedAt,
     ]),
   });
 }
 
-function activeStateLabel(state: ActiveRegion["state"]) {
+function jobStateLabel(state: string) {
   if (state === "queued") return "reserved";
   if (state === "moderating") return "planning";
   if (state === "committing") return "finishing";
@@ -239,7 +261,14 @@ function activeStateLabel(state: ActiveRegion["state"]) {
   return state;
 }
 
+function activeStateLabel(active: ActiveRegion) {
+  return active.reservationActive ? jobStateLabel(active.state) : "recovering";
+}
+
 function overlapMessage(active: ActiveRegion) {
+  if (!active.reservationActive) {
+    return `${active.author}'s edit is recovering here — this area stays unavailable until recovery finishes.`;
+  }
   if (active.state === "queued") {
     return `${active.author} reserved this area — it stays locked until the edit finishes.`;
   }
@@ -521,9 +550,9 @@ function WelcomeDrawer({
                 <span>03</span>
                 <h2>Contribute</h2>
                 <p>
-                  Place the patch anywhere and paint what may change. GPT-5.6 plans
-                  the request; GPT Image renders that masked area. References are
-                  optional. Live outlines lock only active work.
+                  Place and resize the patch, then paint what may change. GPT-5.6
+                  plans the request; GPT Image renders that masked area. References
+                  are optional. Live outlines lock only active work.
                 </p>
               </section>
             </div>
@@ -584,7 +613,7 @@ function canvasBlob(canvas: HTMLCanvasElement, message: string): Promise<Blob> {
   });
 }
 
-async function normalizeReferenceImage(file: File): Promise<Blob> {
+async function normalizeReferenceImage(file: File, targetRegion: Region): Promise<Blob> {
   let image: ImageBitmap;
   try {
     image = await createImageBitmap(file);
@@ -600,18 +629,13 @@ async function normalizeReferenceImage(file: File): Promise<Blob> {
     canvas.height = REFERENCE_IMAGE_SIZE;
     const context = canvas.getContext("2d");
     if (!context) throw new Error("This browser cannot prepare reference images.");
-    const scale = Math.min(
-      REFERENCE_IMAGE_SIZE / image.width,
-      REFERENCE_IMAGE_SIZE / image.height,
-    );
-    const width = Math.max(1, Math.round(image.width * scale));
-    const height = Math.max(1, Math.round(image.height * scale));
+    const placement = referenceImagePlacement(image.width, image.height, targetRegion);
     context.drawImage(
       image,
-      Math.round((REFERENCE_IMAGE_SIZE - width) / 2),
-      Math.round((REFERENCE_IMAGE_SIZE - height) / 2),
-      width,
-      height,
+      placement.x,
+      placement.y,
+      placement.width,
+      placement.height,
     );
     return canvasBlob(canvas, "The reference image could not be encoded.");
   } finally {
@@ -703,12 +727,11 @@ async function providerMask(
   context.globalCompositeOperation = "destination-out";
   const frameRegion = regionRelativeToFrame(region, frame);
   if (fill) {
-    const inset = maskBlendInset(region);
     context.clearRect(
-      frameRegion.x + inset,
-      frameRegion.y + inset,
-      region.width - inset * 2,
-      region.height - inset * 2,
+      frameRegion.x,
+      frameRegion.y,
+      region.width,
+      region.height,
     );
   } else {
     context.lineCap = "round";
@@ -787,6 +810,11 @@ export default function Palimpsest() {
   const closeTimer = useRef<number | null>(null);
   const panStart = useRef<{ pointerId: number; x: number; y: number } | null>(null);
   const patchDrag = useRef<{ pointerId: number; x: number; y: number } | null>(null);
+  const patchResize = useRef<{
+    pointerId: number;
+    edgeOffsetX: number;
+    edgeOffsetY: number;
+  } | null>(null);
   const compareDrag = useRef(false);
   const timelineDrag = useRef<number | null>(null);
   const maskPointer = useRef<number | null>(null);
@@ -1013,6 +1041,24 @@ export default function Palimpsest() {
   }, [refreshActivity, refreshHistory]);
 
   useEffect(() => {
+    let cancelled = false;
+    let timer: number | null = null;
+    const recoverQueue = async () => {
+      await requestQueueDrain();
+      if (cancelled) return;
+      await refreshActivity().catch(() => undefined);
+      if (!cancelled) {
+        timer = window.setTimeout(recoverQueue, QUEUE_RECOVERY_POLL_MS);
+      }
+    };
+    timer = window.setTimeout(recoverQueue, 0);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [refreshActivity, requestQueueDrain]);
+
+  useEffect(() => {
     armIdleTimers();
     const timers = [idleTimer, deepTimer, toastTimer, closeTimer];
     return () => {
@@ -1213,8 +1259,7 @@ export default function Palimpsest() {
     context.lineCap = "round";
     context.lineJoin = "round";
     if (fillMask) {
-      const inset = maskBlendInset(editRegion);
-      context.fillRect(inset, inset, width - inset * 2, height - inset * 2);
+      context.fillRect(0, 0, width, height);
     }
     for (const stroke of strokes) {
       const first = stroke.points[0];
@@ -1391,7 +1436,9 @@ export default function Palimpsest() {
         case "ArrowRight":
         case "ArrowUp":
         case "ArrowDown": {
-          if (target?.closest?.("[role=slider], [data-canvas-pan]")) break;
+          if (target?.closest?.("[role=slider], [data-canvas-pan], [data-patch-resize]")) {
+            break;
+          }
           if (current.editOpen) {
             if (current.step === 1 && !current.submitted) {
               const amount = event.shiftKey ? 32 : 8;
@@ -1612,6 +1659,7 @@ export default function Palimpsest() {
   const patchDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (step !== 1 || submitted) return;
     if (event.pointerType === "mouse" && event.button !== 0) return;
+    if ((event.target as HTMLElement).closest("[data-patch-resize]")) return;
     const point = artworkPoint(event);
     if (!point) return;
     patchDrag.current = {
@@ -1645,6 +1693,100 @@ export default function Palimpsest() {
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
+  };
+
+  const resizePatch = (desiredWidth: number, desiredHeight: number) => {
+    setEditRegion((region) =>
+      resizeEditRegionAvoidingRegions(
+        region,
+        desiredWidth,
+        desiredHeight,
+        latest.current.activeRegions.map((active) => active.region),
+      ),
+    );
+  };
+
+  const resizePatchBy = (amount: number) => {
+    setEditRegion((region) =>
+      resizeEditRegionAvoidingRegions(
+        region,
+        region.width + amount,
+        region.height + amount,
+        latest.current.activeRegions.map((active) => active.region),
+      ),
+    );
+    wake();
+  };
+
+  const patchResizeDown = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (step !== 1 || submitted) return;
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    const point = artworkPoint(event);
+    if (!point) return;
+    patchResize.current = {
+      pointerId: event.pointerId,
+      edgeOffsetX: editRegion.x + editRegion.width - point.x,
+      edgeOffsetY: editRegion.y + editRegion.height - point.y,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.currentTarget.focus();
+    event.stopPropagation();
+    event.preventDefault();
+  };
+
+  const patchResizeMove = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const resize = patchResize.current;
+    if (resize?.pointerId !== event.pointerId) return;
+    const point = artworkPoint(event);
+    if (!point) return;
+    setEditRegion((region) =>
+      resizeEditRegionAvoidingRegions(
+        region,
+        point.x + resize.edgeOffsetX - region.x,
+        point.y + resize.edgeOffsetY - region.y,
+        latest.current.activeRegions.map((active) => active.region),
+      ),
+    );
+    event.stopPropagation();
+  };
+
+  const patchResizeUp = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (patchResize.current?.pointerId !== event.pointerId) return;
+    patchResize.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    event.stopPropagation();
+  };
+
+  const patchResizeKey = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    const amount = event.shiftKey ? PATCH_SIZE_STEP * 2 : PATCH_SIZE_STEP;
+    let widthDelta = 0;
+    let heightDelta = 0;
+    if (event.key === "ArrowLeft") widthDelta = -amount;
+    else if (event.key === "ArrowRight") widthDelta = amount;
+    else if (event.key === "ArrowUp") heightDelta = -amount;
+    else if (event.key === "ArrowDown") heightDelta = amount;
+    else if (event.key === "Home") {
+      resizePatch(EDIT_REGION_MIN_EDGE, EDIT_REGION_MIN_EDGE);
+    } else if (event.key === "End") {
+      resizePatch(EDIT_REGION_MAX_EDGE, EDIT_REGION_MAX_EDGE);
+    } else {
+      return;
+    }
+    if (widthDelta !== 0 || heightDelta !== 0) {
+      setEditRegion((region) =>
+        resizeEditRegionAvoidingRegions(
+          region,
+          region.width + widthDelta,
+          region.height + heightDelta,
+          latest.current.activeRegions.map((active) => active.region),
+        ),
+      );
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    wake();
   };
 
   const maskPoint = (event: ReactPointerEvent<HTMLCanvasElement>) => {
@@ -1708,11 +1850,11 @@ export default function Palimpsest() {
     setSubmitError(null);
     setIsPreparing(true);
     try {
-      const blob = await normalizeReferenceImage(file);
+      const blob = await normalizeReferenceImage(file, editRegion);
       if (referencePreviewUrlRef.current) {
         URL.revokeObjectURL(referencePreviewUrlRef.current);
       }
-      const previewUrl = URL.createObjectURL(blob);
+      const previewUrl = URL.createObjectURL(file);
       referencePreviewUrlRef.current = previewUrl;
       setReferenceImage({ blob, fileName: file.name, previewUrl });
     } catch (error) {
@@ -1841,6 +1983,14 @@ export default function Palimpsest() {
   const echoRegion = showHistory && !playing ? selectedRevision?.region ?? null : null;
   const echoStyle = echoRegion ? regionStyle(echoRegion) : undefined;
   const patchStyle = regionStyle(editRegion);
+  const patchMaximumWidth = Math.min(
+    EDIT_REGION_MAX_EDGE,
+    ARTWORK_SIZE - editRegion.x,
+  );
+  const patchMaximumHeight = Math.min(
+    EDIT_REGION_MAX_EDGE,
+    ARTWORK_SIZE - editRegion.y,
+  );
 
   const hoverRevision = hoverIdx >= 0 ? revisions[hoverIdx] ?? null : null;
   const tickLeft = (index: number) =>
@@ -1861,8 +2011,8 @@ export default function Palimpsest() {
     ...otherActiveRegions.map((active) => ({
       id: active.jobId,
       author: active.author,
-      state: activeStateLabel(active.state),
-      accent: active.state !== "queued",
+      state: activeStateLabel(active),
+      accent: active.state !== "queued" && active.reservationActive,
       prompt: `region ${active.region.x},${active.region.y} · ${active.region.width}×${active.region.height}`,
     })),
     ...activity.recent.map((revision) => ({
@@ -1963,14 +2113,14 @@ export default function Palimpsest() {
                     active.state === "generating" || active.state === "committing"
                       ? " is-active"
                       : ""
-                  }`}
+                  }${!active.reservationActive ? " is-recovering" : ""}`}
                   data-testid="active-reservation"
                   style={regionStyle(active.region)}
                   role="listitem"
-                  aria-label={`${active.author}, ${activeStateLabel(active.state)}, region ${active.region.x}, ${active.region.y}, ${active.region.width} by ${active.region.height}`}
+                  aria-label={`${active.author}, ${activeStateLabel(active)}, region ${active.region.x}, ${active.region.y}, ${active.region.width} by ${active.region.height}`}
                 >
                   <span>
-                    {active.author} · {activeStateLabel(active.state)}
+                    {active.author} · {activeStateLabel(active)}
                   </span>
                 </div>
               ))}
@@ -1980,9 +2130,9 @@ export default function Palimpsest() {
                   data-testid="local-reservation"
                   style={regionStyle(pendingEdit.region)}
                   role="listitem"
-                  aria-label={`Your region, ${activeStateLabel(job.state)}`}
+                  aria-label={`Your region, ${jobStateLabel(job.state)}`}
                 >
-                  <span>you · {activeStateLabel(job.state)}</span>
+                  <span>you · {jobStateLabel(job.state)}</span>
                 </div>
               ) : null}
             </div>
@@ -1993,7 +2143,7 @@ export default function Palimpsest() {
                 data-testid="edit-patch"
                 role="group"
                 tabIndex={step === 1 && !submitted ? 0 : -1}
-                aria-label="Selected edit patch. Drag anywhere outside live reserved outlines, including across seams. Use the arrow keys to nudge it."
+                aria-label={`Selected edit patch, ${editRegion.width} by ${editRegion.height} pixels. Drag to move it, pull the lower-right corner to resize it, or use the arrow keys to nudge it.`}
                 aria-describedby={conflictingRegion ? "overlap-note" : undefined}
                 onPointerDown={patchDown}
                 onPointerMove={patchMove}
@@ -2001,11 +2151,33 @@ export default function Palimpsest() {
                 onPointerCancel={patchUp}
               >
                 {step === 1 && !submitted ? (
-                  <span className="mono-patch-label">drag patch</span>
+                  <>
+                    <span className="mono-patch-size" aria-hidden="true">
+                      {editRegion.width} × {editRegion.height}
+                    </span>
+                    <span className="mono-patch-label">drag to move</span>
+                    <button
+                      type="button"
+                      className="mono-patch-resize"
+                      data-patch-resize
+                      data-testid="patch-resize-handle"
+                      aria-label={`Resize edit patch, currently ${editRegion.width} by ${editRegion.height} pixels. Drag the handle, or use arrow keys; Home selects the minimum and End the maximum.`}
+                      aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown Home End"
+                      onPointerDown={patchResizeDown}
+                      onPointerMove={patchResizeMove}
+                      onPointerUp={patchResizeUp}
+                      onPointerCancel={patchResizeUp}
+                      onKeyDown={patchResizeKey}
+                    />
+                  </>
                 ) : null}
                 {referenceImage && step === 3 && !submitted ? (
                   <div className="mono-reference-on-canvas" aria-hidden="true">
-                    <img src={referenceImage.previewUrl} alt="" />
+                    <img
+                      src={referenceImage.previewUrl}
+                      alt=""
+                      style={referencePreviewStyle()}
+                    />
                     <span>reference</span>
                   </div>
                 ) : null}
@@ -2350,8 +2522,35 @@ export default function Palimpsest() {
           {step === 1 ? (
             <div className="mono-edit-row">
               <span className="mono-edit-hint">
-                live outlines are locked · drag anywhere else · arrow keys nudge
+                live outlines are locked · drag to move · pull the corner to resize
               </span>
+              <div className="mono-patch-size-control" role="group" aria-label="Edit patch size">
+                <button
+                  type="button"
+                  aria-label="Make edit patch smaller"
+                  disabled={
+                    editRegion.width <= EDIT_REGION_MIN_EDGE &&
+                    editRegion.height <= EDIT_REGION_MIN_EDGE
+                  }
+                  onClick={() => resizePatchBy(-PATCH_SIZE_STEP)}
+                >
+                  −
+                </button>
+                <output>
+                  {editRegion.width} × {editRegion.height}
+                </output>
+                <button
+                  type="button"
+                  aria-label="Make edit patch larger"
+                  disabled={
+                    editRegion.width >= patchMaximumWidth &&
+                    editRegion.height >= patchMaximumHeight
+                  }
+                  onClick={() => resizePatchBy(PATCH_SIZE_STEP)}
+                >
+                  +
+                </button>
+              </div>
               <button
                 type="button"
                 className="mono-action is-accent"
