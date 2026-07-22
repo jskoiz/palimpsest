@@ -24,6 +24,8 @@ import {
   positionEditRegion,
   positionEditRegionAvoidingRegions,
   regionRelativeToFrame,
+  resizeEditRegion,
+  resizeEditRegionAvoidingRegions,
   regionsOverlap,
   timelineIndexAtPosition,
 } from "../lib/palimpsest/geometry.mjs";
@@ -146,13 +148,12 @@ test("region constraints reject legacy tile fields and unsafe masks", () => {
     expectCode(() => validateRegion({ region, fill: true }), "REGION_OUT_OF_BOUNDS");
   }
 
-  expectCode(
-    () =>
-      validateRegion({
-        region: { x: 0, y: 0, width: 512, height: 257 },
-        fill: true,
-      }),
-    "MASK_TOO_LARGE",
+  assert.deepEqual(
+    validateRegion({
+      region: { x: 0, y: 0, width: 512, height: 512 },
+      fill: true,
+    }).region,
+    { x: 0, y: 0, width: 512, height: 512 },
   );
   expectCode(
     () =>
@@ -444,6 +445,44 @@ test("keyboard nudging crosses seams without snapping or escaping the artwork", 
 
   const artworkEdge = { x: 1664, y: 1728, width: 384, height: 320 };
   assert.deepEqual(nudgeEditRegion(artworkEdge, 32, 32), artworkEdge);
+});
+
+test("patch resizing stays useful, bounded, and inside the artwork", () => {
+  const region = { x: 800, y: 800, width: 448, height: 384 };
+
+  assert.deepEqual(resizeEditRegion(region, 496, 432), {
+    x: 800,
+    y: 800,
+    width: 496,
+    height: 432,
+  });
+  assert.deepEqual(resizeEditRegion(region, 40, 900), {
+    x: 800,
+    y: 800,
+    width: 160,
+    height: 512,
+  });
+  assert.deepEqual(
+    resizeEditRegion({ x: 1960, y: 1930, width: 88, height: 118 }, 500, 500, 64),
+    { x: 1960, y: 1930, width: 88, height: 118 },
+  );
+});
+
+test("patch resizing cannot enter a live reservation", () => {
+  const patch = { x: 100, y: 100, width: 200, height: 200 };
+  const reserved = [{ x: 360, y: 100, width: 120, height: 180 }];
+
+  assert.deepEqual(
+    resizeEditRegionAvoidingRegions(patch, 400, 260, reserved),
+    { x: 100, y: 100, width: 200, height: 260 },
+  );
+  assert.deepEqual(
+    resizeEditRegionAvoidingRegions(patch, 400, 400, [
+      ...reserved,
+      { x: 100, y: 320, width: 180, height: 120 },
+    ]),
+    patch,
+  );
 });
 
 test("patch placement stops at live reservation edges without blocking edge contact", () => {
