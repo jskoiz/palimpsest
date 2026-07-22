@@ -2,6 +2,7 @@ import {
   DomainError,
   normalizeDisplayName,
 } from "@/lib/palimpsest/domain.mjs";
+import { contributionRatePolicy } from "@/lib/palimpsest/rate-policy.mjs";
 import { createRequestId, getRuntimeEnv, jsonError } from "@/lib/palimpsest/runtime";
 import {
   enforceRateLimit,
@@ -33,7 +34,10 @@ export async function POST(request: Request) {
       throw new DomainError("INVALID_REQUEST", "Base and restore-target revisions are required.");
     }
     const hash = await requesterHash(env, request);
-    await enforceRateLimit(env, hash, "revert-hour", 2, 60 * 60 * 1000);
+    const ratePolicy = contributionRatePolicy(env, request, "revert");
+    for (const limit of ratePolicy.limits) {
+      await enforceRateLimit(env, hash, limit.scope, limit.limit, limit.windowMs);
+    }
     const job = await insertRevertJob(env, {
       baseRevisionId: body.baseRevisionId,
       targetRevisionId: body.targetRevisionId,
@@ -41,11 +45,19 @@ export async function POST(request: Request) {
       requesterHash: hash,
       idempotencyKey,
     });
+    console.info(`[palimpsest:${requestId}] contribution accepted`, {
+      kind: "revert",
+      ratePolicy: ratePolicy.name,
+    });
     return Response.json(
       { job, notice: "The earlier appearance will be restored as a new revision. Existing history remains unchanged." },
       { status: 202, headers: { "Cache-Control": "no-store", "X-Request-Id": requestId } },
     );
   } catch (error) {
-    return jsonError(error, requestId);
+    const response = jsonError(error, requestId);
+    if (error instanceof DomainError && error.code === "RATE_LIMITED") {
+      response.headers.set("Retry-After", "600");
+    }
+    return response;
   }
 }
