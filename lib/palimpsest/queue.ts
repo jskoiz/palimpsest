@@ -59,7 +59,7 @@ const EDIT_PLANNING_TIMEOUT_MS = 30_000;
 const IMAGE_EDIT_TIMEOUT_MS = 150_000;
 const CONTAINMENT_REVIEW_TIMEOUT_MS = 75_000;
 const MAX_CONTAINMENT_ATTEMPTS = 2;
-const SMALLER_SUBJECT_RETRY = "The previous result did not fit. Regenerate from the original source and reference. Center the complete requested subject and scale it to no more than 45% of the transparent editable area's width or height, leaving obvious empty space on all four sides. Do not crop any part.";
+const REFERENCE_LAYER_RETRY = "The previous result failed review. Regenerate from the original source and reference. Center the complete requested subject and scale it to no more than 45% of the transparent editable area's width or height, leaving obvious empty space on all four sides. Return only that subject and its natural contact shadow; every other pixel must be fully transparent. Do not crop any part or add an opaque rectangular background.";
 
 export type QueueProcessResult = {
   claimed: number;
@@ -382,11 +382,11 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
           patch.bytes,
           patch.providerMaskBytes,
         );
-        if (review.contained) break;
+        if (review.contained && review.backgroundClear) break;
         if (attempt === MAX_CONTAINMENT_ATTEMPTS - 1) {
           throw new DomainError(
             "SUBJECT_OUT_OF_FRAME",
-            "The generated subject could not be fitted fully inside this patch. Nothing was added to history; choose a larger region and try again.",
+            "The generated reference could not be placed completely without a visible rectangular background. Nothing was added to history; choose a larger region and try again.",
           );
         }
         await updateStage(env, job, "generating", "generating");
@@ -394,7 +394,7 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
           env,
           job,
           apiKey,
-          `${plannedPrompt} ${SMALLER_SUBJECT_RETRY}`,
+          `${plannedPrompt} ${REFERENCE_LAYER_RETRY}`,
         );
       }
     }
@@ -629,6 +629,8 @@ async function generateOpenAiPatch(
         type: "image/png",
       }),
     );
+    form.append("background", "transparent");
+    form.append("input_fidelity", "high");
   }
   form.append("prompt", buildOpenAiEditPrompt(plannedPrompt, Boolean(reference)));
   form.append("size", "1024x1024");
