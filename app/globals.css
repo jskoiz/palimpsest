@@ -623,19 +623,25 @@ body {
   top: 23px;
   right: var(--edge);
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 22px;
   font-size: 11px;
 }
 
-.mono-queue-toggle {
+.mono-topright > button {
+  min-height: 16px;
   display: inline-flex;
   align-items: center;
+  line-height: 1;
+}
+
+.mono-queue-toggle {
   gap: 7px;
   opacity: 0.9;
 }
 
 .mono-live-dot {
+  flex: 0 0 auto;
   width: 5px;
   height: 5px;
   border-radius: 50%;
