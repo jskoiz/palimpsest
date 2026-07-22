@@ -6,6 +6,7 @@ export interface AppEnv {
   DB: D1Database;
   BLOBS: R2Bucket;
   OPENAI_API_KEY?: string;
+  ADMIN_EMAIL_ALLOWLIST?: string;
   RATE_LIMIT_SALT?: string;
 }
 
