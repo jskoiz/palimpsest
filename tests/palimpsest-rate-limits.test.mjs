@@ -68,7 +68,8 @@ test("both contribution routes consume the centralized server policy", async () 
 
   for (const route of [editRoute, revertRoute]) {
     assert.match(route, /contributionRatePolicy\(env, request, "(?:edit|revert)"\)/);
-    assert.match(route, /for \(const limit of ratePolicy\.limits\)/);
+    assert.match(route, /rateLimits: ratePolicy\.limits/);
+    assert.doesNotMatch(route, /enforceRateLimit/);
     assert.doesNotMatch(route, /x-palimpsest-admin/i);
   }
 });

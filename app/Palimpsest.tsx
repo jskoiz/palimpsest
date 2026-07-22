@@ -11,6 +11,15 @@ import type {
 } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  activityJobCounts,
+  activityJobIsInProcess,
+  activityJobNeedsAttention,
+  activityJobState,
+  collaborationPollDelay,
+  queueRecoveryDelay,
+  viewForActivityRegion,
+} from "@/app/activity-ui.mjs";
+import {
   ARTWORK_SIZE,
   REFERENCE_TARGET_FILL,
 } from "@/lib/palimpsest/domain.mjs";
@@ -94,8 +103,27 @@ type HistoryPayload = {
 
 type ActivityPayload = {
   queue: { queued: number; active: number };
+  jobs: ActivityJob[];
   recent: Revision[];
   activeRegions: ActiveRegion[];
+};
+
+type ActivityJob = {
+  id: string;
+  kind: "edit" | "revert";
+  author: string;
+  state: string;
+  region: Region | null;
+  reservationActive: boolean;
+  prompt: string | null;
+  displaySummary: string;
+  error: { code: string; message: string | null } | null;
+  requestId: string | null;
+  submittedAt: string;
+  updatedAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  retryable: boolean;
 };
 
 type ActiveRegion = {
@@ -125,6 +153,12 @@ type Job = {
   error: { code: string; message: string } | null;
   submittedAt: string;
   updatedAt: string;
+  retryToken?: string;
+};
+
+type RetryCapability = {
+  token: string;
+  requestKey?: string;
 };
 
 type PendingEdit = {
@@ -132,6 +166,20 @@ type PendingEdit = {
   author: string;
   prompt: string;
   region: Region | null;
+};
+
+type LocalSubmissionFailure = {
+  id: string;
+  author: string;
+  prompt: string;
+  region: Region;
+  errorCode: string | null;
+  errorMessage: string;
+  requestId: string | null;
+  updatedAt: string;
+  idempotencyKey: string | null;
+  retryToken: string | null;
+  payloadFingerprint: string;
 };
 
 type Stroke = {
@@ -152,18 +200,17 @@ const AUTO_HIDE = true;
 const IDLE_HIDE_MS = 4000;
 const DEEP_IDLE_MS = 30000;
 const BRUSH_WIDTH = 30;
-const COLLAB_POLL_MS = 3000;
-const HIDDEN_COLLAB_POLL_MS = 8000;
 const PATCH_SIZE_STEP = 32;
-const QUEUE_RECOVERY_POLL_MS = 12_000;
 const DEFAULT_REGION = { x: 800, y: 832, width: 448, height: 384 };
 const WELCOME_STORAGE_KEY = "palimpsest:welcome:v1";
+const RETRY_CAPABILITIES_STORAGE_KEY = "palimpsest:retry-capabilities:v1";
 const REFERENCE_IMAGE_SIZE = 1024;
 const MAX_REFERENCE_UPLOAD_BYTES = 10 * 1024 * 1024;
 const REFERENCE_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 
 const EMPTY_ACTIVITY: ActivityPayload = {
   queue: { queued: 0, active: 0 },
+  jobs: [],
   recent: [],
   activeRegions: [],
 };
@@ -232,6 +279,25 @@ function findOpenRegion(sequence: number, activeRegions: ActiveRegion[]) {
 function activitySignature(activity: ActivityPayload) {
   return JSON.stringify({
     queue: activity.queue,
+    jobs: activity.jobs.map((job) => [
+      job.id,
+      job.author,
+      job.state,
+      job.region?.x ?? null,
+      job.region?.y ?? null,
+      job.region?.width ?? null,
+      job.region?.height ?? null,
+      job.reservationActive,
+      job.displaySummary,
+      job.error?.code ?? null,
+      job.error?.message ?? null,
+      job.requestId,
+      job.submittedAt,
+      job.updatedAt,
+      job.startedAt,
+      job.completedAt,
+      job.retryable,
+    ]),
     recent: activity.recent.map((revision) => [revision.id, revision.createdAt]),
     activeRegions: activity.activeRegions.map((active) => [
       active.jobId,
@@ -259,6 +325,16 @@ function activeStateLabel(active: ActiveRegion) {
   return active.reservationActive ? jobStateLabel(active.state) : "recovering";
 }
 
+function activityFailureQualifier(job: ActivityJob) {
+  if (job.state === "rejected") return "rejected";
+  if (job.error?.code.includes("LEASE_EXPIRED")) return "expired";
+  if (job.error?.code === "PROVIDER_TEMPORARY") return "temporary";
+  if (job.error?.code === "REFERENCE_REVIEW_FAILED") return "fidelity check";
+  if (job.state === "stale") return "superseded";
+  if (!job.startedAt) return "never started";
+  return "attention";
+}
+
 function overlapMessage(active: ActiveRegion) {
   let message: string;
   if (!active.reservationActive) {
@@ -279,16 +355,29 @@ async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
   const response = await fetch(input, init);
   const body = (await response.json().catch(() => null)) as
     | T
-    | { error?: { code?: string; message?: string } }
+    | { error?: { code?: string; message?: string; requestId?: string } }
     | null;
   if (!response.ok) {
-    const message =
-      body && typeof body === "object" && "error" in body && body.error?.message
-        ? body.error.message
-        : "Palimpsest could not complete that request.";
-    throw new Error(message);
+    const error = body && typeof body === "object" && "error" in body ? body.error : null;
+    throw new PalimpsestRequestError(
+      error?.message ?? "Palimpsest could not complete that request.",
+      error?.code ?? null,
+      error?.requestId ?? response.headers.get("x-request-id"),
+    );
   }
   return body as T;
+}
+
+class PalimpsestRequestError extends Error {
+  code: string | null;
+  requestId: string | null;
+
+  constructor(message: string, code: string | null, requestId: string | null) {
+    super(message);
+    this.name = "PalimpsestRequestError";
+    this.code = code;
+    this.requestId = requestId;
+  }
 }
 
 function ArtworkLayers({
@@ -831,6 +920,11 @@ export default function Palimpsest() {
   const [panPointerFocused, setPanPointerFocused] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [welcomeOpen, setWelcomeOpen] = useState(false);
+  const [focusedJobId, setFocusedJobId] = useState<string | null>(null);
+  const [retryingJobId, setRetryingJobId] = useState<string | null>(null);
+  const [retryCapabilitiesByJobId, setRetryCapabilitiesByJobId] = useState<
+    Record<string, RetryCapability>
+  >({});
 
   const [step, setStep] = useState<1 | 2 | 3>(1);
   const [editRegion, setEditRegion] = useState<Region>({ ...DEFAULT_REGION });
@@ -849,8 +943,11 @@ export default function Palimpsest() {
   const [confirmRestore, setConfirmRestore] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
   const [pendingEdit, setPendingEdit] = useState<PendingEdit | null>(null);
+  const [localSubmissionFailure, setLocalSubmissionFailure] =
+    useState<LocalSubmissionFailure | null>(null);
 
   const drainInFlight = useRef(false);
+  const retryInFlightJobId = useRef<string | null>(null);
   const activityRequest = useRef<Promise<ActivityPayload> | null>(null);
   const activitySignatureRef = useRef(activitySignature(EMPTY_ACTIVITY));
   const idleTimer = useRef<number | null>(null);
@@ -883,8 +980,13 @@ export default function Palimpsest() {
   const notCurrent = Boolean(selectedRevision && history && selectedRevision.id !== history.headRevisionId);
   const validMask = fillMask || strokes.length > 0;
   const jobActive = Boolean(job && !terminalJobStates.has(job.state));
-  const queueTotal = activity.queue.queued + activity.queue.active;
-  const queueBusy = activity.queue.active > 0 || jobActive;
+  const activityCounts = activityJobCounts(activity.jobs);
+  const queueTotal = activityCounts.inProcess;
+  const queueFailed = activityCounts.failed + (localSubmissionFailure ? 1 : 0);
+  const queueBusy = queueTotal > 0 || jobActive;
+  const hasRecoverableWork =
+    activity.queue.queued > 0 ||
+    activity.activeRegions.some((active) => !active.reservationActive);
   const liveEditingAvailable = Boolean(history?.editing.available);
   const canPanCanvas = canvasViewCanPan(view, viewport.width, viewport.height);
   const otherActiveRegions = activity.activeRegions.filter(
@@ -894,7 +996,10 @@ export default function Palimpsest() {
     regionsOverlap(editRegion, active.region),
   );
   const conflictingJobId = conflictingRegion?.jobId ?? null;
-
+  const focusedJob = activity.jobs.find((activityJob) => activityJob.id === focusedJobId) ?? null;
+  const focusedJobHasReservation = Boolean(
+    focusedJob && activity.activeRegions.some((active) => active.jobId === focusedJob.id),
+  );
   const latest = useRef({
     panelOpen,
     zoom: view.zoom,
@@ -910,6 +1015,7 @@ export default function Palimpsest() {
     currentState,
     welcomeOpen,
     activeRegions: activity.activeRegions,
+    activityHasWork: queueTotal > 0 || hasRecoverableWork,
   });
   useEffect(() => {
     latest.current = {
@@ -927,6 +1033,7 @@ export default function Palimpsest() {
       currentState,
       welcomeOpen,
       activeRegions: activity.activeRegions,
+      activityHasWork: queueTotal > 0 || hasRecoverableWork,
     };
   });
 
@@ -989,6 +1096,52 @@ export default function Palimpsest() {
     toastTimer.current = window.setTimeout(() => setToast(null), 4200);
   }, []);
 
+  const saveRetryCapabilities = useCallback(
+    (update: (current: Record<string, RetryCapability>) => Record<string, RetryCapability>) => {
+      setRetryCapabilitiesByJobId((current) => {
+        const next = update(current);
+        try {
+          window.sessionStorage.setItem(
+            RETRY_CAPABILITIES_STORAGE_KEY,
+            JSON.stringify(next),
+          );
+        } catch {
+          // The current page still retains capabilities when storage is unavailable.
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
+  const rememberRetryCapability = useCallback((jobId: string, token?: string) => {
+    if (!token) return;
+    saveRetryCapabilities((current) => ({
+      ...current,
+      [jobId]: { token },
+    }));
+  }, [saveRetryCapabilities]);
+
+  const rememberRetryRequestKey = useCallback((jobId: string, requestKey: string) => {
+    saveRetryCapabilities((current) => {
+      const capability = current[jobId];
+      if (!capability) return current;
+      return {
+        ...current,
+        [jobId]: { ...capability, requestKey },
+      };
+    });
+  }, [saveRetryCapabilities]);
+
+  const replaceRetryCapability = useCallback((previousJobId: string, job: Job) => {
+    saveRetryCapabilities((current) => {
+      const next = { ...current };
+      delete next[previousJobId];
+      if (job.retryToken) next[job.id] = { token: job.retryToken };
+      return next;
+    });
+  }, [saveRetryCapabilities]);
+
   const clearReferenceImage = useCallback(() => {
     if (referencePreviewUrlRef.current) {
       URL.revokeObjectURL(referencePreviewUrlRef.current);
@@ -1027,13 +1180,15 @@ export default function Palimpsest() {
   }, []);
 
   const requestQueueDrain = useCallback(async () => {
-    if (drainInFlight.current) return;
+    if (drainInFlight.current) return false;
     drainInFlight.current = true;
     try {
       const response = await fetch("/api/queue/drain", { method: "POST" });
       if (!response.ok) throw new Error("The queue could not be reached.");
+      return true;
     } catch {
-      // The immutable job remains queued; the next status poll will retry this active request.
+      // The durable job remains queued; bounded recovery retries with backoff.
+      return false;
     } finally {
       drainInFlight.current = false;
     }
@@ -1082,6 +1237,33 @@ export default function Palimpsest() {
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
+      try {
+        const stored = JSON.parse(
+          window.sessionStorage.getItem(RETRY_CAPABILITIES_STORAGE_KEY) ?? "{}",
+        ) as Record<string, unknown>;
+        const capabilities = Object.fromEntries(
+          Object.entries(stored).filter(
+            (entry): entry is [string, RetryCapability] =>
+              Boolean(
+                entry[1] &&
+                  typeof entry[1] === "object" &&
+                  "token" in entry[1] &&
+                  typeof entry[1].token === "string" &&
+                  (!("requestKey" in entry[1]) ||
+                    typeof entry[1].requestKey === "string"),
+              ),
+          ),
+        );
+        setRetryCapabilitiesByJobId(capabilities);
+      } catch {
+        // Session storage can be disabled or contain an interrupted write.
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
       Promise.all([refreshHistory(), refreshActivity()]).catch((error: unknown) => {
         setLoadingError(error instanceof Error ? error.message : "The archive could not be opened.");
       });
@@ -1090,22 +1272,34 @@ export default function Palimpsest() {
   }, [refreshActivity, refreshHistory]);
 
   useEffect(() => {
+    if (!hasRecoverableWork) return;
     let cancelled = false;
     let timer: number | null = null;
+    let failedAttempts = 0;
     const recoverQueue = async () => {
-      await requestQueueDrain();
+      const drained = await requestQueueDrain();
       if (cancelled) return;
-      await refreshActivity().catch(() => undefined);
-      if (!cancelled) {
-        timer = window.setTimeout(recoverQueue, QUEUE_RECOVERY_POLL_MS);
-      }
+      const payload = await refreshActivity().catch(() => null);
+      const stillRecoverable =
+        payload &&
+        (payload.queue.queued > 0 ||
+          payload.activeRegions.some((active) => !active.reservationActive));
+      if (cancelled || (payload && !stillRecoverable)) return;
+      failedAttempts = drained ? 0 : failedAttempts + 1;
+      timer = window.setTimeout(
+        recoverQueue,
+        queueRecoveryDelay(failedAttempts, Math.random()),
+      );
     };
-    timer = window.setTimeout(recoverQueue, 0);
+    timer = window.setTimeout(
+      recoverQueue,
+      queueRecoveryDelay(0, Math.random()),
+    );
     return () => {
       cancelled = true;
       if (timer !== null) window.clearTimeout(timer);
     };
-  }, [refreshActivity, requestQueueDrain]);
+  }, [hasRecoverableWork, refreshActivity, requestQueueDrain]);
 
   useEffect(() => {
     armIdleTimers();
@@ -1174,9 +1368,15 @@ export default function Palimpsest() {
     let cancelled = false;
     let timer: number | null = null;
     const poll = async () => {
+      let hasWork = latest.current.activityHasWork;
       try {
         const payload = await refreshActivity();
         if (cancelled) return;
+        hasWork =
+          payload.queue.queued > 0 ||
+          payload.queue.active > 0 ||
+          payload.jobs.some(activityJobIsInProcess) ||
+          payload.activeRegions.length > 0;
         const sharedHeadRevisionId = payload.recent[0]?.id ?? null;
         const current = latest.current;
         if (
@@ -1196,12 +1396,15 @@ export default function Palimpsest() {
         if (!cancelled) {
           timer = window.setTimeout(
             poll,
-            document.hidden ? HIDDEN_COLLAB_POLL_MS : COLLAB_POLL_MS,
+            collaborationPollDelay(hasWork, document.hidden, Math.random()),
           );
         }
       }
     };
-    timer = window.setTimeout(poll, COLLAB_POLL_MS);
+    timer = window.setTimeout(
+      poll,
+      collaborationPollDelay(latest.current.activityHasWork, document.hidden, Math.random()),
+    );
     return () => {
       cancelled = true;
       if (timer !== null) window.clearTimeout(timer);
@@ -1220,13 +1423,11 @@ export default function Palimpsest() {
 
   useEffect(() => {
     if (!job || terminalJobStates.has(job.state)) return;
-    void requestQueueDrain();
     const timer = window.setTimeout(async () => {
       try {
         const payload = await fetchJson<{ job: Job }>(`/api/jobs/${encodeURIComponent(job.id)}`);
         if (!terminalJobStates.has(payload.job.state)) {
           setJob(payload.job);
-          await refreshActivity();
           return;
         }
         if (payload.job.state === "succeeded" && payload.job.resultRevisionId) {
@@ -1256,9 +1457,9 @@ export default function Palimpsest() {
       } catch {
         setJob((current) => (current ? { ...current } : current));
       }
-    }, 1200);
+    }, 3000);
     return () => window.clearTimeout(timer);
-  }, [clearReferenceImage, job, refreshActivity, refreshHistory, requestQueueDrain, showToast]);
+  }, [clearReferenceImage, job, refreshActivity, refreshHistory, showToast]);
 
   useEffect(() => {
     if (!compareOn || selectedIndex <= 0) return;
@@ -1365,9 +1566,142 @@ export default function Palimpsest() {
     setCompareOn(false);
     setSubmitted(false);
     setConfirmRestore(false);
-    clearReferenceImage();
+    if (!localSubmissionFailure) clearReferenceImage();
     wake();
-  }, [clearReferenceImage, wake]);
+  }, [clearReferenceImage, localSubmissionFailure, wake]);
+
+  const focusActivityJob = useCallback(
+    (activityJob: ActivityJob) => {
+      if (!activityJob.region) {
+        showToast("This contribution applies to the whole revision, not one canvas region.");
+        return;
+      }
+      setFocusedJobId(activityJob.id);
+      setPlaying(false);
+      setCompareOn(false);
+      setView(
+        constrainCanvasView(
+          viewForActivityRegion(
+            activityJob.region,
+            window.innerWidth,
+            window.innerHeight,
+            ARTWORK_SIZE,
+          ),
+          window.innerWidth,
+          window.innerHeight,
+        ),
+      );
+      showToast(`${activityJobState(activityJob)} — showing ${activityJob.author}'s region`);
+      wake();
+    },
+    [showToast, wake],
+  );
+
+  const resumeLocalSubmission = useCallback(() => {
+    if (!localSubmissionFailure || !editBase) return;
+    setQueueOpen(false);
+    setHistoryOpen(false);
+    setPlaying(false);
+    setCompareOn(false);
+    setEditOpen(true);
+    setStep(3);
+    setSubmitted(false);
+    setSubmitError(localSubmissionFailure.errorMessage);
+    setView(
+      constrainCanvasView(
+        viewForActivityRegion(
+          localSubmissionFailure.region,
+          window.innerWidth,
+          window.innerHeight,
+          ARTWORK_SIZE,
+        ),
+        window.innerWidth,
+        window.innerHeight,
+      ),
+    );
+    showToast("Submission restored — review it, then generate again.");
+    wake();
+  }, [editBase, localSubmissionFailure, showToast, wake]);
+
+  const retryActivityJob = useCallback(
+    async (activityJob: ActivityJob) => {
+      const capability = retryCapabilitiesByJobId[activityJob.id];
+      if (!activityJob.retryable || !capability || retryInFlightJobId.current) return;
+      const requestKey = capability.requestKey ?? crypto.randomUUID();
+      rememberRetryRequestKey(activityJob.id, requestKey);
+      retryInFlightJobId.current = activityJob.id;
+      setRetryingJobId(activityJob.id);
+      try {
+        const payload = await fetchJson<{ job: Job }>(
+          `/api/jobs/${encodeURIComponent(activityJob.id)}/retry`,
+          {
+            method: "POST",
+            headers: {
+              "Idempotency-Key": requestKey,
+              "X-Palimpsest-Retry-Token": capability.token,
+            },
+          },
+        );
+        replaceRetryCapability(activityJob.id, payload.job);
+        if (terminalJobStates.has(payload.job.state)) {
+          setJob(null);
+          setPendingEdit(null);
+          if (payload.job.state === "succeeded" && payload.job.resultRevisionId) {
+            await refreshHistory(payload.job.resultRevisionId);
+            showToast("The retried contribution was already accepted.");
+          } else {
+            showToast(
+              payload.job.error?.message ??
+                payload.job.message ??
+                "The retried contribution could not be completed.",
+            );
+          }
+          await refreshActivity();
+          return;
+        }
+        setJob(payload.job);
+        setPendingEdit({
+          jobId: payload.job.id,
+          author: activityJob.author,
+          prompt: activityJob.displaySummary,
+          region: activityJob.region,
+        });
+        showToast("Retry reserved — generation is starting again.");
+        void requestQueueDrain();
+        await refreshActivity();
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : "This retry could not be started.");
+        await refreshActivity().catch(() => undefined);
+      } finally {
+        retryInFlightJobId.current = null;
+        setRetryingJobId(null);
+      }
+    },
+    [
+      refreshActivity,
+      refreshHistory,
+      rememberRetryRequestKey,
+      replaceRetryCapability,
+      requestQueueDrain,
+      retryCapabilitiesByJobId,
+      showToast,
+    ],
+  );
+
+  const openRecentRevision = useCallback(
+    (revision: Revision) => {
+      const index = revisions.findIndex((candidate) => candidate.id === revision.id);
+      if (index < 0) return;
+      setSelectedIndex(index);
+      setQueueOpen(false);
+      setHistoryOpen(true);
+      setPlaying(false);
+      setCompareOn(false);
+      setConfirmRestore(false);
+      wake();
+    },
+    [revisions, wake],
+  );
 
   const openEditor = useCallback(async () => {
     const initial = latest.current;
@@ -1402,6 +1736,7 @@ export default function Palimpsest() {
     setFillMask(false);
     setPrompt("");
     clearReferenceImage();
+    setLocalSubmissionFailure(null);
     setSubmitted(false);
     setSubmitError(null);
     setConfirmRestore(false);
@@ -1412,16 +1747,18 @@ export default function Palimpsest() {
 
   const closeEditor = useCallback(() => {
     setEditOpen(false);
-    setEditBase(null);
     setSubmitted(false);
-    clearReferenceImage();
+    if (!localSubmissionFailure) {
+      setEditBase(null);
+      clearReferenceImage();
+    }
     if (closeTimer.current) window.clearTimeout(closeTimer.current);
     wake();
-  }, [clearReferenceImage, wake]);
+  }, [clearReferenceImage, localSubmissionFailure, wake]);
 
   const closeAll = useCallback(() => {
     setEditOpen(false);
-    setEditBase(null);
+    if (!localSubmissionFailure) setEditBase(null);
     setQueueOpen(false);
     setHistoryOpen(false);
     setCompareOn(false);
@@ -1429,11 +1766,11 @@ export default function Palimpsest() {
     setSubmitted(false);
     setConfirmRestore(false);
     setHoverIdx(-1);
-    clearReferenceImage();
+    if (!localSubmissionFailure) clearReferenceImage();
     setView({ zoom: 1, x: 0, y: 0 });
     if (closeTimer.current) window.clearTimeout(closeTimer.current);
     wake();
-  }, [clearReferenceImage, wake]);
+  }, [clearReferenceImage, localSubmissionFailure, wake]);
 
   const returnToCurrent = useCallback(() => {
     if (!latest.current.revLen) return;
@@ -1582,7 +1919,7 @@ export default function Palimpsest() {
   };
 
   const handleWheel = (event: ReactWheelEvent<HTMLElement>) => {
-    if ((event.target as HTMLElement).closest(".mono-welcome")) return;
+    if ((event.target as HTMLElement).closest(".mono-welcome, .mono-activity-scroll")) return;
     const unit =
       event.deltaMode === 1
         ? event.deltaY * 33
@@ -1896,8 +2233,38 @@ export default function Palimpsest() {
     if (!editBase || !canSubmit) return;
     setSubmitError(null);
     setIsPreparing(true);
+    const frame = generationFrameForRegion(editRegion);
+    const meta = {
+      artworkId: "palimpsest",
+      baseRevisionId: editBase.revisionId,
+      displayName: cleanDisplayName(),
+      prompt: prompt.trim(),
+      region: editRegion,
+      frame,
+      fill: fillMask,
+      strokes,
+    };
+    const payloadFingerprint = JSON.stringify({
+      meta,
+      reference: referenceImage
+        ? {
+            fileName: referenceImage.fileName,
+            size: referenceImage.sourceBlob.size,
+            type: referenceImage.sourceBlob.type,
+          }
+        : null,
+    });
+    const idempotencyKey =
+      localSubmissionFailure?.payloadFingerprint === payloadFingerprint &&
+      localSubmissionFailure.idempotencyKey
+        ? localSubmissionFailure.idempotencyKey
+        : crypto.randomUUID();
+    const retryToken =
+      localSubmissionFailure?.payloadFingerprint === payloadFingerprint &&
+      localSubmissionFailure.retryToken
+        ? localSubmissionFailure.retryToken
+        : crypto.randomUUID();
     try {
-      const frame = generationFrameForRegion(editRegion);
       const [source, mask] = await Promise.all([
         flattenArtworkFrame(editBase.state, frame).then((artworkFrame) =>
           referenceImage
@@ -1917,19 +2284,7 @@ export default function Palimpsest() {
         ),
       ]);
       const form = new FormData();
-      form.append(
-        "meta",
-        JSON.stringify({
-          artworkId: "palimpsest",
-          baseRevisionId: editBase.revisionId,
-          displayName: cleanDisplayName(),
-          prompt: prompt.trim(),
-          region: editRegion,
-          frame,
-          fill: fillMask,
-          strokes,
-        }),
-      );
+      form.append("meta", JSON.stringify(meta));
       form.append("source", source, "source.png");
       form.append("mask", mask, "mask.png");
       if (referenceImage) {
@@ -1937,9 +2292,41 @@ export default function Palimpsest() {
       }
       const payload = await fetchJson<{ job: Job }>("/api/edits", {
         method: "POST",
-        headers: { "Idempotency-Key": crypto.randomUUID() },
+        headers: {
+          "Idempotency-Key": idempotencyKey,
+          "X-Palimpsest-Retry-Token": retryToken,
+        },
         body: form,
       });
+      rememberRetryCapability(payload.job.id, payload.job.retryToken ?? retryToken);
+      setLocalSubmissionFailure(null);
+      if (terminalJobStates.has(payload.job.state)) {
+        setJob(null);
+        setPendingEdit(null);
+        setSubmitted(false);
+        if (payload.job.state === "succeeded" && payload.job.resultRevisionId) {
+          await refreshHistory(payload.job.resultRevisionId);
+          setEditOpen(false);
+          setEditBase(null);
+          setStep(1);
+          setPrompt("");
+          setStrokes([]);
+          setFillMask(false);
+          clearReferenceImage();
+          showToast("This contribution was already accepted.");
+        } else {
+          const message =
+            payload.job.error?.message ??
+            payload.job.message ??
+            "This contribution could not be completed.";
+          setSubmitError(message);
+          setEditOpen(false);
+          setQueueOpen(true);
+          showToast(message);
+        }
+        await refreshActivity();
+        return;
+      }
       setJob(payload.job);
       setPendingEdit({
         jobId: payload.job.id,
@@ -1957,7 +2344,22 @@ export default function Palimpsest() {
         clearReferenceImage();
       }, 2400);
     } catch (error) {
-      setSubmitError(error instanceof Error ? error.message : "The edit could not be submitted.");
+      const message = error instanceof Error ? error.message : "The edit could not be submitted.";
+      const requestError = error instanceof PalimpsestRequestError ? error : null;
+      setSubmitError(message);
+      setLocalSubmissionFailure({
+        id: `local-${requestError?.requestId ?? crypto.randomUUID()}`,
+        author: cleanDisplayName() || "anonymous visitor",
+        prompt: prompt.trim(),
+        region: { ...editRegion },
+        errorCode: requestError?.code ?? null,
+        errorMessage: message,
+        requestId: requestError?.requestId ?? null,
+        updatedAt: new Date().toISOString(),
+        idempotencyKey,
+        retryToken,
+        payloadFingerprint,
+      });
       try {
         await refreshActivity();
       } catch {
@@ -1986,6 +2388,7 @@ export default function Palimpsest() {
         }),
       });
       setJob(payload.job);
+      rememberRetryCapability(payload.job.id, payload.job.retryToken);
       setPendingEdit({
         jobId: payload.job.id,
         author: cleanDisplayName() || "anonymous visitor",
@@ -2024,34 +2427,6 @@ export default function Palimpsest() {
   const hoverRevision = hoverIdx >= 0 ? revisions[hoverIdx] ?? null : null;
   const tickLeft = (index: number) =>
     revisions.length > 1 ? (index / (revisions.length - 1)) * 100 : 50;
-
-  const queueEntries = [
-    ...(jobActive && pendingEdit
-      ? [
-          {
-            id: pendingEdit.jobId,
-            author: pendingEdit.author,
-            state: job?.state === "queued" ? "waiting" : "making",
-            accent: job?.state !== "queued",
-            prompt: pendingEdit.prompt,
-          },
-        ]
-      : []),
-    ...otherActiveRegions.map((active) => ({
-      id: active.jobId,
-      author: active.author,
-      state: activeStateLabel(active),
-      accent: active.state !== "queued" && active.reservationActive,
-      prompt: `region ${active.region.x},${active.region.y} · ${active.region.width}×${active.region.height}`,
-    })),
-    ...activity.recent.map((revision) => ({
-      id: revision.id,
-      author: revision.author,
-      state: `done · ${compactTime(revision.createdAt)}`,
-      accent: false,
-      prompt: revision.prompt,
-    })),
-  ].slice(0, 4);
 
   const submitLabel = submitted
     ? "reserved ✓"
@@ -2121,6 +2496,7 @@ export default function Palimpsest() {
       {echoRegion ||
       editOpen ||
       otherActiveRegions.length > 0 ||
+      (focusedJob?.region && activityJobIsInProcess(focusedJob)) ||
       (jobActive && pendingEdit?.region) ? (
         <div className={`${zoomClass} mono-overlays`} style={zoomStyle}>
           <div className="mono-cover" ref={overlayCoverRef}>
@@ -2142,7 +2518,9 @@ export default function Palimpsest() {
                     active.state === "generating" || active.state === "committing"
                       ? " is-active"
                       : ""
-                  }${!active.reservationActive ? " is-recovering" : ""}`}
+                  }${!active.reservationActive ? " is-recovering" : ""}${
+                    active.jobId === focusedJobId ? " is-focused" : ""
+                  }`}
                   data-testid="active-reservation"
                   style={regionStyle(active.region)}
                   role="listitem"
@@ -2162,6 +2540,18 @@ export default function Palimpsest() {
                   aria-label={`Your region, ${jobStateLabel(job.state)}`}
                 >
                   <span>you · {jobStateLabel(job.state)}</span>
+                </div>
+              ) : null}
+              {focusedJob?.region &&
+              activityJobIsInProcess(focusedJob) &&
+              !focusedJobHasReservation ? (
+                <div
+                  className="mono-reservation is-focused is-recovering"
+                  style={regionStyle(focusedJob.region)}
+                  role="listitem"
+                  aria-label={`${focusedJob.author}, ${activityJobState(focusedJob)}, focused region`}
+                >
+                  <span>{focusedJob.author} · {activityJobState(focusedJob)}</span>
                 </div>
               ) : null}
             </div>
@@ -2298,12 +2688,19 @@ export default function Palimpsest() {
         </button>
         <button
           type="button"
-          className="mono-queue-toggle"
-          aria-label={`Queue, ${queueTotal} pending`}
+          className={`mono-queue-toggle${queueFailed > 0 ? " has-attention" : ""}`}
+          aria-label={`Queue, ${queueTotal} in process${
+            queueFailed > 0 ? `, ${queueFailed} failed and needs attention` : ""
+          }`}
+          aria-controls="contribution-activity"
+          aria-expanded={queueOpen}
           onClick={toggleQueue}
         >
           <span className={`mono-live-dot${queueBusy ? " is-pulsing" : ""}`} aria-hidden="true" />
-          queue/{queueTotal}
+          <span>queue/{queueTotal}</span>
+          {queueFailed > 0 ? (
+            <span className="mono-queue-alert" aria-hidden="true">!{queueFailed}</span>
+          ) : null}
         </button>
         <button
           type="button"
@@ -2498,11 +2895,16 @@ export default function Palimpsest() {
       ) : null}
 
       {queueOpen ? (
-        <section className="mono-strip" aria-label="Contribution queue">
+        <section
+          id="contribution-activity"
+          className="mono-strip mono-activity-strip"
+          aria-label="Contribution activity"
+        >
           <div className="mono-strip-head">
             <span className="mono-strip-summary">
-              live work — {activity.queue.queued} reserved · {activity.queue.active} making ·
-              open space stays editable
+              live work — {queueTotal} in process
+              {queueFailed > 0 ? ` · ${queueFailed} failed — attention needed` : ""}
+              {queueTotal > 0 ? " · use show to find work on the canvas" : ""}
             </span>
             <button
               type="button"
@@ -2513,20 +2915,150 @@ export default function Palimpsest() {
               ×
             </button>
           </div>
-          <div className="mono-queue-list">
-            {queueEntries.map((entry, index) => (
-              <div
-                key={entry.id}
-                className="mono-queue-entry"
-                style={{ "--stagger": `${index * 70}ms` } as CSSProperties}
-              >
-                <span className="mono-queue-author">{entry.author}</span>
-                <span className={`mono-queue-state${entry.accent ? " is-accent" : ""}`}>
-                  {entry.state}
-                </span>
-                <p>{entry.prompt}</p>
+          <div className="mono-activity-scroll">
+            <section className="mono-activity-group" aria-labelledby="activity-jobs-title">
+              <div className="mono-activity-group-head">
+                <h2 id="activity-jobs-title">contributions</h2>
+                <span>{activity.jobs.length + (localSubmissionFailure ? 1 : 0)} shown</span>
               </div>
-            ))}
+              {activity.jobs.length === 0 && !localSubmissionFailure ? (
+                <p className="mono-queue-empty">No contributions are in process or waiting for attention.</p>
+              ) : (
+                <div className="mono-queue-list" role="list" aria-live="polite">
+                  {localSubmissionFailure ? (
+                    <article
+                      className="mono-queue-entry is-failed is-local-failure"
+                      role="listitem"
+                    >
+                      <div className="mono-queue-entry-head">
+                        <span className="mono-queue-author">{localSubmissionFailure.author}</span>
+                        <span className="mono-queue-state is-failed">failed · not accepted</span>
+                        <time
+                          dateTime={localSubmissionFailure.updatedAt}
+                          title={new Date(localSubmissionFailure.updatedAt).toLocaleString()}
+                        >
+                          {compactTime(localSubmissionFailure.updatedAt)} ago
+                        </time>
+                      </div>
+                      <p className="mono-queue-summary">&quot;{localSubmissionFailure.prompt}&quot;</p>
+                      <p className="mono-queue-error">{localSubmissionFailure.errorMessage}</p>
+                      <div className="mono-queue-detail">
+                        <span>not accepted into the queue</span>
+                        {localSubmissionFailure.errorCode ? (
+                          <span>{localSubmissionFailure.errorCode}</span>
+                        ) : null}
+                        {localSubmissionFailure.requestId ? (
+                          <span>request {localSubmissionFailure.requestId}</span>
+                        ) : null}
+                      </div>
+                      <div className="mono-queue-actions">
+                        <button type="button" onClick={resumeLocalSubmission}>
+                          review &amp; retry
+                        </button>
+                      </div>
+                    </article>
+                  ) : null}
+                  {activity.jobs.map((activityJob, index) => {
+                    const state = activityJobState(activityJob);
+                    const failed = activityJobNeedsAttention(activityJob);
+                    const canRetry = Boolean(
+                      activityJob.retryable && retryCapabilitiesByJobId[activityJob.id],
+                    );
+                    const canShow = Boolean(
+                      activityJob.region && activityJobIsInProcess(activityJob),
+                    );
+                    return (
+                      <article
+                        key={activityJob.id}
+                        className={`mono-queue-entry is-${state}`}
+                        style={{ "--stagger": `${index * 40}ms` } as CSSProperties}
+                        role="listitem"
+                      >
+                        <div className="mono-queue-entry-head">
+                          <span className="mono-queue-author">{activityJob.author}</span>
+                          <span
+                            className={`mono-queue-state${
+                              failed
+                                ? " is-failed"
+                                : activityJobIsInProcess(activityJob)
+                                  ? " is-accent"
+                                  : ""
+                            }`}
+                          >
+                            {state}
+                            {failed ? ` · ${activityFailureQualifier(activityJob)}` : ""}
+                          </span>
+                          <time
+                            dateTime={activityJob.updatedAt}
+                            title={new Date(activityJob.updatedAt).toLocaleString()}
+                          >
+                            updated {compactTime(activityJob.updatedAt)} ago
+                          </time>
+                        </div>
+                        <p className="mono-queue-summary">{activityJob.displaySummary}</p>
+                        {failed ? (
+                          <p className="mono-queue-error">
+                            {activityJob.error?.message ?? "This contribution could not be completed."}
+                          </p>
+                        ) : null}
+                        <div className="mono-queue-detail">
+                          <span>submitted {compactTime(activityJob.submittedAt)} ago</span>
+                          {activityJob.error?.code ? <span>{activityJob.error.code}</span> : null}
+                          {activityJob.requestId ? (
+                            <span>request {activityJob.requestId}</span>
+                          ) : null}
+                        </div>
+                        {canShow || canRetry ? (
+                          <div className="mono-queue-actions">
+                            {canShow ? (
+                              <button
+                                type="button"
+                                aria-pressed={focusedJobId === activityJob.id}
+                                onClick={() => focusActivityJob(activityJob)}
+                              >
+                                {focusedJobId === activityJob.id ? "shown" : "show"}
+                              </button>
+                            ) : null}
+                            {canRetry ? (
+                              <button
+                                type="button"
+                                disabled={retryingJobId !== null}
+                                onClick={() => void retryActivityJob(activityJob)}
+                              >
+                                {retryingJobId === activityJob.id ? "retrying…" : "retry"}
+                              </button>
+                            ) : null}
+                          </div>
+                        ) : null}
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+
+            {activity.recent.length > 0 ? (
+              <section className="mono-activity-group is-history" aria-labelledby="activity-history-title">
+                <div className="mono-activity-group-head">
+                  <h2 id="activity-history-title">accepted revisions</h2>
+                  <span>permanent history</span>
+                </div>
+                <div className="mono-activity-history-list">
+                  {activity.recent.map((revision) => (
+                    <button
+                      key={revision.id}
+                      type="button"
+                      onClick={() => openRecentRevision(revision)}
+                      aria-label={`Open ${seqTag(revision.sequence)}, ${revision.prompt}, by ${revision.author}`}
+                    >
+                      <span>{seqTag(revision.sequence)} · {revision.author}</span>
+                      <span>{compactTime(revision.createdAt)} ago</span>
+                      <span>{revision.prompt}</span>
+                    </button>
+                  ))}
+                </div>
+              </section>
+            ) : null}
           </div>
         </section>
       ) : null}

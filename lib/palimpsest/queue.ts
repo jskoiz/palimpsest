@@ -9,6 +9,7 @@ import {
   buildReferenceEditReviewRequest,
   extractReferenceEditReview,
 } from "./ai-planner.mjs";
+import { isRetryableD1Reset, retryIdempotentD1 } from "./d1.mjs";
 import type { AppEnv } from "./runtime";
 import { readPngDimensions, sha256Hex } from "./runtime";
 import {
@@ -103,10 +104,49 @@ function jobFrame(job: QueueJob): GenerationFrame {
 
 export async function processQueue(
   env: AppEnv,
-  maxJobs = 4,
+  maxJobs = 1,
 ): Promise<QueueProcessResult> {
   const boundedMaxJobs = Math.max(1, Math.min(8, Math.floor(maxJobs)));
-  await recoverExpiredJobs(env, Date.now());
+  const now = Date.now();
+  let status: { hasReady: number; needsRecovery: number } | null;
+  try {
+    status = await retryIdempotentD1(() =>
+      env.DB.prepare(QUEUE_WORK_STATUS_SQL)
+        .bind(
+          ARTWORK_ID,
+          PREPARING_AVAILABLE_AT,
+          now,
+          now,
+          ARTWORK_ID,
+          now,
+        )
+        .first<{ hasReady: number; needsRecovery: number }>(),
+    );
+  } catch (error) {
+    if (isRetryableD1Reset(error)) {
+      throw new DomainError(
+        "SERVICE_UNAVAILABLE",
+        "The contribution queue is briefly overloaded. Try again in a moment.",
+      );
+    }
+    throw error;
+  }
+  if (!status?.hasReady && !status?.needsRecovery) {
+    return { claimed: 0, completed: 0, workerFailures: 0 };
+  }
+  if (status.needsRecovery) {
+    try {
+      await retryIdempotentD1(() => recoverExpiredJobs(env, Date.now()));
+    } catch (error) {
+      if (isRetryableD1Reset(error)) {
+        throw new DomainError(
+          "SERVICE_UNAVAILABLE",
+          "The contribution queue is briefly overloaded. Try again in a moment.",
+        );
+      }
+      throw error;
+    }
+  }
 
   const claimed: QueueJob[] = [];
   for (let index = 0; index < boundedMaxJobs; index += 1) {
@@ -124,6 +164,28 @@ export async function processQueue(
     workerFailures: results.filter((result) => result.status === "rejected").length,
   };
 }
+
+export const QUEUE_WORK_STATUS_SQL = `SELECT
+  EXISTS (
+    SELECT 1 FROM edit_jobs
+    WHERE artwork_id = ?
+      AND state = 'queued'
+      AND available_at <> ?
+      AND available_at <= ?
+      AND lease_expires_at > ?
+    LIMIT 1
+  ) AS hasReady,
+  EXISTS (
+    SELECT 1 FROM edit_jobs
+    WHERE artwork_id = ?
+      AND (
+        (state IN ('queued', 'moderating', 'generating', 'committing')
+         AND (lease_expires_at IS NULL OR lease_expires_at <= ?))
+        OR (kind = 'edit' AND execution_mode <> 'openai'
+            AND state IN ('queued', 'moderating', 'generating', 'committing'))
+      )
+    LIMIT 1
+  ) AS needsRecovery`;
 
 export const CLAIM_NEXT_JOB_SQL = `UPDATE edit_jobs
 SET state = CASE
@@ -188,21 +250,60 @@ RETURNING
 async function claimNextJob(env: AppEnv): Promise<QueueJob | null> {
   const workerToken = crypto.randomUUID();
   const now = Date.now();
-  return env.DB.prepare(CLAIM_NEXT_JOB_SQL)
-    .bind(
-      workerToken,
-      now + RESERVATION_LEASE_MS,
-      now,
-      now,
-      ARTWORK_ID,
-      now,
-      now,
-      now,
-      now,
-      now,
-    )
-    .first<QueueJob>();
+  try {
+    return await env.DB.prepare(CLAIM_NEXT_JOB_SQL)
+      .bind(
+        workerToken,
+        now + RESERVATION_LEASE_MS,
+        now,
+        now,
+        ARTWORK_ID,
+        now,
+        now,
+        now,
+        now,
+        now,
+      )
+      .first<QueueJob>();
+  } catch (error) {
+    if (!isRetryableD1Reset(error)) throw error;
+    let reconciled: QueueJob | null;
+    try {
+      reconciled = await retryIdempotentD1(() =>
+        env.DB.prepare(CLAIMED_JOB_BY_TOKEN_SQL)
+          .bind(ARTWORK_ID, workerToken)
+          .first<QueueJob>(),
+      );
+    } catch (reconciliationError) {
+      if (!isRetryableD1Reset(reconciliationError)) throw reconciliationError;
+      throw new DomainError(
+        "SERVICE_UNAVAILABLE",
+        "The queue could not safely confirm an ambiguous claim. Recovery will preserve it.",
+      );
+    }
+    if (reconciled) return reconciled;
+  }
+  throw new DomainError(
+    "SERVICE_UNAVAILABLE",
+    "The queue could not confirm whether a reservation was claimed. Recovery will preserve it.",
+  );
 }
+
+export const CLAIMED_JOB_BY_TOKEN_SQL = `SELECT
+  id, kind, state, author_id AS authorId,
+  base_revision_id AS baseRevisionId, target_revision_id AS targetRevisionId,
+  prompt, region_x AS regionX, region_y AS regionY,
+  region_width AS regionWidth, region_height AS regionHeight,
+  frame_x AS frameX, frame_y AS frameY,
+  frame_width AS frameWidth, frame_height AS frameHeight,
+  source_blob_id AS sourceBlobId, mask_blob_id AS maskBlobId,
+  display_mask_blob_id AS displayMaskBlobId, reference_blob_id AS referenceBlobId,
+  attempt_count AS attemptCount, lease_fence AS leaseFence,
+  worker_token AS workerToken, created_at AS createdAt
+FROM edit_jobs
+WHERE artwork_id = ? AND worker_token = ?
+  AND state IN ('moderating', 'generating', 'committing')
+LIMIT 1`;
 
 export const EXPIRE_PREPARING_RESERVATION_SQL = `UPDATE edit_jobs
 SET state = 'failed',
@@ -231,6 +332,14 @@ WHERE artwork_id = ?
   AND available_at <> ?
   AND worker_token IS NULL
   AND (lease_expires_at IS NULL OR lease_expires_at <= ?)`;
+
+export const RELEASE_FAILED_PREPARATION_RATE_CLAIMS_SQL = `DELETE FROM rate_limit_claims
+WHERE job_id IN (
+  SELECT id FROM edit_jobs
+  WHERE artwork_id = ?
+    AND state = 'failed'
+    AND error_code = 'QUEUE_PREPARATION_EXPIRED'
+)`;
 
 export const RETIRE_NON_LIVE_EDIT_JOBS_SQL = `UPDATE edit_jobs
 SET state = 'failed',
@@ -305,6 +414,7 @@ async function recoverExpiredJobs(env: AppEnv, now: number) {
       PREPARING_AVAILABLE_AT,
       now,
     ),
+    env.DB.prepare(RELEASE_FAILED_PREPARATION_RATE_CLAIMS_SQL).bind(ARTWORK_ID),
     env.DB.prepare(EXPIRE_READY_QUEUE_RESERVATION_SQL).bind(
       now,
       now,

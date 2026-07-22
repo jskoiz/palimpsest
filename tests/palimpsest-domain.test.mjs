@@ -33,10 +33,66 @@ import {
   buildReferenceEditReviewRequest,
   extractReferenceEditReview,
 } from "../lib/palimpsest/ai-planner.mjs";
+import {
+  activityJobCounts,
+  activityJobState,
+  collaborationPollDelay,
+  queueRecoveryDelay,
+  viewForActivityRegion,
+} from "../app/activity-ui.mjs";
 
 function expectCode(callback, code) {
   assert.throws(callback, (error) => error instanceof DomainError && error.code === code);
 }
+
+test("activity jobs use stable visitor-facing states and separate failures from in-process work", () => {
+  const jobs = [
+    { state: "queued", reservationActive: true },
+    { state: "moderating", reservationActive: true },
+    { state: "generating", reservationActive: true },
+    { state: "committing", reservationActive: true },
+    { state: "generating", reservationActive: false },
+    { state: "failed", reservationActive: false },
+    { state: "succeeded", reservationActive: false },
+  ];
+
+  assert.deepEqual(jobs.map(activityJobState), [
+    "reserved",
+    "planning",
+    "generating",
+    "finishing",
+    "recovering",
+    "failed",
+    "done",
+  ]);
+  assert.deepEqual(activityJobCounts(jobs), { inProcess: 5, failed: 1, done: 1 });
+});
+
+test("queue recovery and collaboration polling back off with bounded jitter", () => {
+  assert.equal(queueRecoveryDelay(0, 0.5), 12_000);
+  assert.equal(queueRecoveryDelay(1, 0.5), 24_000);
+  assert.equal(queueRecoveryDelay(8, 0.5), 60_000);
+  assert.equal(queueRecoveryDelay(0, 0), 10_200);
+  assert.equal(queueRecoveryDelay(0, 1), 13_800);
+
+  assert.equal(collaborationPollDelay(true, false, 0.5), 3_000);
+  assert.equal(collaborationPollDelay(false, false, 0.5), 15_000);
+  assert.equal(collaborationPollDelay(true, true, 0.5), 8_000);
+  assert.equal(collaborationPollDelay(false, true, 0.5), 30_000);
+});
+
+test("activity region focus places the target above the queue panel", () => {
+  const region = { x: 0, y: 0, width: 200, height: 200 };
+  const view = viewForActivityRegion(region, 1000, 600, ARTWORK_SIZE);
+  const canvasSize = 1000;
+  const coverTop = (600 - canvasSize) / 2;
+  const centerX = ((region.x + region.width / 2) / ARTWORK_SIZE) * canvasSize;
+  const centerY = coverTop + ((region.y + region.height / 2) / ARTWORK_SIZE) * canvasSize;
+
+  assert.equal(view.zoom, 1.65);
+  assert.ok(Math.abs(view.x + view.zoom * centerX - 500) < 0.001);
+  assert.ok(Math.abs(view.y + view.zoom * centerY - 600 * 0.38) < 0.001);
+});
 
 test("revision ordering uses immutable sequence rather than timestamps", () => {
   const rows = [

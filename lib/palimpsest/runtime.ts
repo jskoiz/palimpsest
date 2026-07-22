@@ -85,6 +85,12 @@ export function jsonError(
     });
   }
   const code = domainError?.code ?? "INTERNAL_ERROR";
+  if (code === "SERVICE_UNAVAILABLE") {
+    console.warn(`[palimpsest:${requestId}] dependency temporarily unavailable`, {
+      code,
+      message: domainError?.message,
+    });
+  }
   const status =
     code === "STALE_BASE_REVISION" ||
     code === "IDEMPOTENCY_CONFLICT" ||
@@ -106,7 +112,7 @@ export function jsonError(
     "Palimpsest could not complete that request. Nothing was added to history.";
   const publicDetails = details ?? (domainError ? safeRegionBusyDetails(domainError) : undefined);
 
-  return Response.json(
+  const response = Response.json(
     {
       error: {
         code,
@@ -117,6 +123,10 @@ export function jsonError(
     },
     { status },
   );
+  if (code === "SERVICE_UNAVAILABLE") {
+    response.headers.set("Retry-After", "3");
+  }
+  return response;
 }
 
 export async function sha256Hex(value: ArrayBuffer | Uint8Array | string): Promise<string> {

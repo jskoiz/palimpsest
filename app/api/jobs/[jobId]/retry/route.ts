@@ -1,54 +1,41 @@
-import {
-  DomainError,
-  normalizeDisplayName,
-} from "@/lib/palimpsest/domain.mjs";
+import { DomainError } from "@/lib/palimpsest/domain.mjs";
 import { contributionRatePolicy } from "@/lib/palimpsest/rate-policy.mjs";
 import { createRequestId, getRuntimeEnv, jsonError } from "@/lib/palimpsest/runtime";
 import {
   ensurePalimpsest,
-  insertRevertJob,
   requesterHash,
+  retryFailedEditJob,
 } from "@/lib/palimpsest/store";
 
-export async function POST(request: Request) {
+export async function POST(
+  request: Request,
+  context: { params: Promise<{ jobId: string }> },
+) {
   const requestId = createRequestId();
   try {
     const env = getRuntimeEnv();
     await ensurePalimpsest(env, request.url);
+    const retryToken = request.headers.get("X-Palimpsest-Retry-Token")?.trim() ?? "";
+    if (retryToken.length < 16 || retryToken.length > 128) {
+      throw new DomainError("NOT_FOUND", "That retryable contribution could not be found.");
+    }
     const idempotencyKey = request.headers.get("Idempotency-Key")?.trim() ?? "";
     if (idempotencyKey.length < 8 || idempotencyKey.length > 128) {
       throw new DomainError("INVALID_REQUEST", "A valid Idempotency-Key header is required.");
     }
-    const body = (await request.json()) as {
-      artworkId?: string;
-      baseRevisionId?: string;
-      targetRevisionId?: string;
-      displayName?: string;
-    };
-    if (
-      body.artworkId !== "palimpsest" ||
-      typeof body.baseRevisionId !== "string" ||
-      typeof body.targetRevisionId !== "string"
-    ) {
-      throw new DomainError("INVALID_REQUEST", "Base and restore-target revisions are required.");
-    }
+    const { jobId } = await context.params;
     const hash = await requesterHash(env, request);
-    const ratePolicy = contributionRatePolicy(env, request, "revert");
-    const job = await insertRevertJob(env, {
-      baseRevisionId: body.baseRevisionId,
-      targetRevisionId: body.targetRevisionId,
-      displayName: normalizeDisplayName(body.displayName),
+    const ratePolicy = contributionRatePolicy(env, request, "edit");
+    const job = await retryFailedEditJob(env, {
+      jobId,
       requesterHash: hash,
+      retryToken,
       idempotencyKey,
       rateLimits: ratePolicy.limits,
       requestId,
     });
-    console.info(`[palimpsest:${requestId}] contribution accepted`, {
-      kind: "revert",
-      ratePolicy: ratePolicy.name,
-    });
     return Response.json(
-      { job, notice: "The earlier appearance will be restored as a new revision. Existing history remains unchanged." },
+      { job },
       { status: 202, headers: { "Cache-Control": "no-store", "X-Request-Id": requestId } },
     );
   } catch (error) {

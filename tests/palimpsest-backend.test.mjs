@@ -2,6 +2,11 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import { serializeRecentJobPayload } from "../lib/palimpsest/activity.mjs";
+import {
+  isRetryableD1Reset,
+  retryIdempotentD1,
+} from "../lib/palimpsest/d1.mjs";
 
 const root = new URL("../", import.meta.url);
 
@@ -25,21 +30,23 @@ function applyMigration(db, sql) {
   }
 }
 
-async function migratedDatabase() {
+async function migratedDatabase({ durable = true } = {}) {
   const db = new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
-  const [initial, parallel, liveOnly, whiteCanvasReset, referenceImages] = await Promise.all([
+  const [initial, parallel, liveOnly, whiteCanvasReset, referenceImages, durableJobs] = await Promise.all([
     readFile(new URL("drizzle/0000_slow_gambit.sql", root), "utf8"),
     readFile(new URL("drizzle/0001_parallel_regions.sql", root), "utf8"),
     readFile(new URL("drizzle/0002_live_ai_only.sql", root), "utf8"),
     readFile(new URL("drizzle/0003_white_canvas_reset.sql", root), "utf8"),
     readFile(new URL("drizzle/0004_reference_images.sql", root), "utf8"),
+    readFile(new URL("drizzle/0009_durable_job_attempts.sql", root), "utf8"),
   ]);
   applyMigration(db, initial);
   applyMigration(db, parallel);
   applyMigration(db, liveOnly);
   applyMigration(db, whiteCanvasReset);
   applyMigration(db, referenceImages);
+  if (durable) applyMigration(db, durableJobs);
   return db;
 }
 
@@ -97,6 +104,13 @@ function reservationValues({
     now,
     now + 60_000,
     now,
+    `retry-token-hash-${jobId}`,
+    `request-${jobId}`,
+    0,
+    0,
+    3,
+    0,
+    12,
   ];
 }
 
@@ -105,6 +119,81 @@ test("reference image migration adds an optional private input pointer", async (
   const columns = db.prepare("PRAGMA table_info(edit_jobs)").all();
   assert.equal(columns.some((column) => column.name === "reference_blob_id"), true);
   db.close();
+});
+
+test("D1 storage resets retry with exponential jitter but ordinary failures do not", async () => {
+  let attempts = 0;
+  const delays = [];
+  const value = await retryIdempotentD1(
+    async () => {
+      attempts += 1;
+      if (attempts < 3) {
+        throw new Error("outer", {
+          cause: new Error("D1 DB storage operation exceeded timeout which caused object to be reset"),
+        });
+      }
+      return "accepted-once";
+    },
+    {
+      attempts: 3,
+      random: () => 0,
+      sleep: async (delay) => delays.push(delay),
+    },
+  );
+  assert.equal(value, "accepted-once");
+  assert.equal(attempts, 3);
+  assert.deepEqual(delays, [150, 300]);
+  assert.equal(isRetryableD1Reset(new Error("storage caused object to be reset")), true);
+
+  let ordinaryAttempts = 0;
+  await assert.rejects(
+    retryIdempotentD1(async () => {
+      ordinaryAttempts += 1;
+      throw new Error("constraint failed");
+    }),
+    /constraint failed/u,
+  );
+  assert.equal(ordinaryAttempts, 1);
+});
+
+test("activity job serializer preserves the public durable-attempt contract", () => {
+  const payload = serializeRecentJobPayload({
+    jobId: "failed-1",
+    kind: "edit",
+    author: "Visitor",
+    state: "failed",
+    prompt: "private rejected prompt",
+    regionX: 10,
+    regionY: 20,
+    regionWidth: 30,
+    regionHeight: 40,
+    reservationActive: 0,
+    errorCode: "PROVIDER_TEMPORARY",
+    publicErrorMessage: "Try again.",
+    requestId: "request-1",
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    startedAt: 1_500,
+    completedAt: 2_000,
+    retryable: 1,
+  });
+  assert.deepEqual(payload, {
+    id: "failed-1",
+    kind: "edit",
+    author: "Visitor",
+    state: "failed",
+    region: { x: 10, y: 20, width: 30, height: 40 },
+    reservationActive: false,
+    prompt: null,
+    displaySummary: "region 10,20 · 30×40",
+    error: { code: "PROVIDER_TEMPORARY", message: "Try again." },
+    requestId: "request-1",
+    submittedAt: new Date(1_000).toISOString(),
+    updatedAt: new Date(2_000).toISOString(),
+    startedAt: new Date(1_500).toISOString(),
+    completedAt: new Date(2_000).toISOString(),
+    retryable: true,
+  });
 });
 
 test("activity keeps expired nonterminal regions visible for recovery", async () => {
@@ -436,7 +525,7 @@ test("white-canvas migration clears the prior archive and every reservation", as
 });
 
 test("purple-canvas migration removes the current duck revision and reseeds cleanly", async () => {
-  const db = await migratedDatabase();
+  const db = await migratedDatabase({ durable: false });
   seedArtwork(db);
   db.exec(`
     INSERT INTO blobs (
@@ -566,14 +655,57 @@ test("atomic spatial reservations reject overlap, allow touching, and expire cle
   db.close();
 });
 
+test("reservation rate gates are atomic inputs and same-key replay stays singular", async () => {
+  const db = await migratedDatabase();
+  seedArtwork(db);
+  const insertSql = await readSqlConstant(
+    "lib/palimpsest/store.ts",
+    "INSERT_EDIT_RESERVATION_SQL",
+  );
+  db.exec(`
+    INSERT INTO rate_limit_claims
+      (requester_hash, scope, window_start, idempotency_key, job_id, created_at)
+    VALUES
+      ('limited', 'edit-10m', 0, 'used-1', 'old-1', 1),
+      ('limited', 'edit-10m', 0, 'used-2', 'old-2', 1),
+      ('limited', 'edit-10m', 0, 'used-3', 'old-3', 1);
+  `);
+  const values = reservationValues({
+    jobId: "rate-gated",
+    authorId: "author-a",
+    requesterHash: "limited",
+    region: { x: 0, y: 0, width: 100, height: 100 },
+    now: 10_000,
+  });
+  values[26] = 1;
+  values[27] = 0;
+  values[28] = 3;
+  values[29] = 0;
+  values[30] = 12;
+  assert.equal(db.prepare(insertSql).run(...values).changes, 0);
+
+  db.exec("DELETE FROM rate_limit_claims WHERE idempotency_key = 'used-3'");
+  assert.equal(db.prepare(insertSql).run(...values).changes, 1);
+  assert.equal(db.prepare(insertSql).run(...values).changes, 0);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS count FROM edit_jobs WHERE idempotency_key = 'idem-rate-gated'").get().count,
+    1,
+  );
+  db.close();
+});
+
 test("expired input preparation becomes terminal instead of remaining queued", async () => {
   const db = await migratedDatabase();
   seedArtwork(db);
-  const [insertSql, expireSql] = await Promise.all([
+  const [insertSql, expireSql, releaseClaimsSql] = await Promise.all([
     readSqlConstant("lib/palimpsest/store.ts", "INSERT_EDIT_RESERVATION_SQL"),
     readSqlConstant(
       "lib/palimpsest/queue.ts",
       "EXPIRE_PREPARING_RESERVATION_SQL",
+    ),
+    readSqlConstant(
+      "lib/palimpsest/queue.ts",
+      "RELEASE_FAILED_PREPARATION_RATE_CLAIMS_SQL",
     ),
   ]);
   const now = 15_000;
@@ -586,6 +718,12 @@ test("expired input preparation becomes terminal instead of remaining queued", a
   values[21] = Number.MAX_SAFE_INTEGER;
   values[22] = now - 1;
   assert.equal(db.prepare(insertSql).run(...values).changes, 1);
+  db.prepare(
+    `INSERT INTO rate_limit_claims
+     (requester_hash, scope, window_start, idempotency_key, job_id, created_at)
+     VALUES ('shared-nat', 'edit-10m', 0, 'idem-abandoned-preparation',
+             'abandoned-preparation', ?)`,
+  ).run(now);
 
   assert.equal(
     db.prepare(expireSql).run(
@@ -596,6 +734,13 @@ test("expired input preparation becomes terminal instead of remaining queued", a
       now,
     ).changes,
     1,
+  );
+  assert.equal(db.prepare(releaseClaimsSql).run("palimpsest").changes, 1);
+  assert.equal(
+    db.prepare(
+      "SELECT COUNT(*) AS count FROM rate_limit_claims WHERE job_id = 'abandoned-preparation'",
+    ).get().count,
+    0,
   );
   assert.deepEqual(
     {
@@ -794,6 +939,11 @@ test("full-artwork reverts wait for every active reservation", async () => {
     now,
     now + 60_000,
     now,
+    null,
+    "request-revert",
+    0,
+    0,
+    2,
   ];
   assert.equal(revert.run(...revertValues).changes, 0);
 
@@ -1017,4 +1167,112 @@ test("stale overlapping generation and superseded leases cannot commit", async (
     0,
   );
   superseded.db.close();
+});
+
+test("empty drains are read-only while expired or ready work is discoverable", async () => {
+  const db = await migratedDatabase();
+  seedArtwork(db);
+  const [insertSql, statusSql] = await Promise.all([
+    readSqlConstant("lib/palimpsest/store.ts", "INSERT_EDIT_RESERVATION_SQL"),
+    readSqlConstant("lib/palimpsest/queue.ts", "QUEUE_WORK_STATUS_SQL"),
+  ]);
+  const now = 50_000;
+  assert.deepEqual(
+    { ...db.prepare(statusSql).get("palimpsest", Number.MAX_SAFE_INTEGER, now, now, "palimpsest", now) },
+    { hasReady: 0, needsRecovery: 0 },
+  );
+  const preparing = reservationValues({
+    jobId: "preparing",
+    authorId: "author-a",
+    region: { x: 0, y: 0, width: 100, height: 100 },
+    now,
+  });
+  preparing[21] = Number.MAX_SAFE_INTEGER;
+  db.prepare(insertSql).run(...preparing);
+  assert.deepEqual(
+    { ...db.prepare(statusSql).get("palimpsest", Number.MAX_SAFE_INTEGER, now, now, "palimpsest", now) },
+    { hasReady: 0, needsRecovery: 0 },
+  );
+  db.exec("UPDATE edit_jobs SET lease_expires_at = 49999 WHERE id = 'preparing'");
+  assert.equal(
+    db.prepare(statusSql).get("palimpsest", Number.MAX_SAFE_INTEGER, now, now, "palimpsest", now).needsRecovery,
+    1,
+  );
+  db.exec("UPDATE edit_jobs SET available_at = 50000, lease_expires_at = 99999 WHERE id = 'preparing'");
+  assert.equal(
+    db.prepare(statusSql).get("palimpsest", Number.MAX_SAFE_INTEGER, now, now, "palimpsest", now).hasReady,
+    1,
+  );
+  db.close();
+});
+
+test("safe manual retry creates one immutable successor and keeps the failure visible", async () => {
+  const db = await migratedDatabase();
+  seedArtwork(db);
+  db.exec(`
+    INSERT INTO blobs (
+      id, artwork_id, kind, r2_key, content_type, byte_length,
+      sha256, width, height, created_at
+    ) VALUES
+      ('retry-source', 'palimpsest', 'input', 'retry-source.png', 'image/png', 1, 's', 1024, 1024, 1),
+      ('retry-mask', 'palimpsest', 'mask', 'retry-mask.png', 'image/png', 1, 'm', 1024, 1024, 1),
+      ('retry-display', 'palimpsest', 'display_mask', 'retry-display.svg', 'image/svg+xml', 1, 'd', 1024, 1024, 1);
+    INSERT INTO edit_jobs (
+      id, artwork_id, kind, state, execution_mode, author_id, requester_hash,
+      base_revision_id, prompt, region_x, region_y, region_width, region_height,
+      frame_x, frame_y, frame_width, frame_height,
+      source_blob_id, mask_blob_id, display_mask_blob_id,
+      idempotency_key, request_fingerprint, retry_token_hash, request_id,
+      available_at, lease_expires_at, error_code, public_error_message,
+      created_at, updated_at, completed_at
+    ) VALUES (
+      'failed-parent', 'palimpsest', 'edit', 'failed', 'openai', 'author-a', 'owner',
+      'r0', 'Private prompt', 10, 20, 100, 120, 0, 0, 1024, 1024,
+      'retry-source', 'retry-mask', 'retry-display', 'parent-key', 'fingerprint',
+      'token-hash', 'request-parent', 1, NULL, 'PROVIDER_TEMPORARY', 'Try again.',
+      1000, 2000, 2000
+    );
+  `);
+  const retrySql = await readSqlConstant(
+    "lib/palimpsest/store.ts",
+    "INSERT_RETRY_JOB_SQL",
+  );
+  const values = [
+    "retry-child", "failed-parent", "palimpsest", "owner", "token-hash",
+    "child-key", "request-child", 3000, 63000, 0, 0, 3, 0, 12,
+  ];
+  assert.equal(db.prepare(retrySql).run(...values).changes, 1);
+  assert.equal(db.prepare(retrySql).run("other-child", ...values.slice(1)).changes, 0);
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        "SELECT state, error_code, completed_at FROM edit_jobs WHERE id = 'failed-parent'",
+      ).get(),
+    },
+    { state: "failed", error_code: "PROVIDER_TEMPORARY", completed_at: 2000 },
+  );
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        `SELECT state, retry_of_job_id, source_blob_id, mask_blob_id,
+                display_mask_blob_id, request_id
+         FROM edit_jobs WHERE id = 'retry-child'`,
+      ).get(),
+    },
+    {
+      state: "queued",
+      retry_of_job_id: "failed-parent",
+      source_blob_id: "retry-source",
+      mask_blob_id: "retry-mask",
+      display_mask_blob_id: "retry-display",
+      request_id: "request-child",
+    },
+  );
+  const recentSql = await readSqlConstant("lib/palimpsest/store.ts", "RECENT_JOBS_SQL");
+  const recent = db.prepare(recentSql).all(4000, "palimpsest", "palimpsest");
+  const parent = recent.find((row) => row.jobId === "failed-parent");
+  assert.equal(parent.errorCode, "PROVIDER_TEMPORARY");
+  assert.equal(parent.requestId, "request-parent");
+  assert.equal(parent.retryable, 0, "a parent with an existing successor is no longer retryable");
+  db.close();
 });

@@ -352,6 +352,14 @@ body {
   background: rgba(224, 118, 95, 0.08);
 }
 
+.mono-reservation.is-focused {
+  border-color: #fff;
+  box-shadow:
+    0 0 0 3px rgba(224, 118, 95, 0.78),
+    0 0 32px rgba(224, 118, 95, 0.5);
+  animation: focused-region 900ms ease-in-out 2 alternate;
+}
+
 .mono-reservation > span {
   position: absolute;
   left: 3px;
@@ -366,6 +374,14 @@ body {
   text-overflow: ellipsis;
   text-shadow: var(--over-image-shadow);
   white-space: nowrap;
+}
+
+@keyframes focused-region {
+  to {
+    box-shadow:
+      0 0 0 6px rgba(224, 118, 95, 0.3),
+      0 0 44px rgba(224, 118, 95, 0.68);
+  }
 }
 
 .mono-patch {
@@ -645,6 +661,20 @@ body {
   opacity: 0.9;
 }
 
+.mono-queue-toggle.has-attention {
+  opacity: 1;
+}
+
+.mono-queue-alert {
+  border: 1px solid rgba(255, 194, 179, 0.72);
+  border-radius: 999px;
+  padding: 1px 4px;
+  background: rgba(88, 17, 11, 0.58);
+  color: #ffd4ca;
+  font-size: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
 .mono-live-dot {
   flex: 0 0 auto;
   width: 5px;
@@ -891,41 +921,211 @@ body {
   color: rgba(255, 255, 255, 0.35);
 }
 
-/* Queue ticker */
+/* Durable contribution activity */
+
+.mono-activity-strip {
+  max-height: min(62dvh, 590px);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+  padding: 11px 13px 13px;
+  background: rgba(var(--ink), 0.78);
+  box-shadow: 0 16px 52px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(16px) saturate(0.9);
+}
+
+.mono-activity-scroll {
+  display: grid;
+  gap: 14px;
+  max-height: min(52dvh, 500px);
+  margin-top: 10px;
+  padding-right: 5px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+.mono-activity-group {
+  min-width: 0;
+}
+
+.mono-activity-group + .mono-activity-group {
+  border-top: 1px solid rgba(255, 255, 255, 0.16);
+  padding-top: 11px;
+}
+
+.mono-activity-group-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 7px;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 8px;
+}
+
+.mono-activity-group-head h2 {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.82);
+  font: inherit;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
 
 .mono-queue-list {
-  display: flex;
-  gap: 32px;
-  margin-top: 8px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(270px, 100%), 1fr));
+  gap: 8px;
 }
 
 .mono-queue-entry {
+  position: relative;
+  display: grid;
+  align-content: start;
+  gap: 5px;
   min-width: 0;
-  flex: 1;
+  min-height: 96px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+  padding: 9px 10px;
+  background: rgba(255, 255, 255, 0.045);
   animation: panel-up 360ms var(--stagger, 0ms) var(--panel-ease) both;
+}
+
+.mono-queue-entry.is-failed {
+  border-color: rgba(255, 162, 143, 0.5);
+  background: rgba(92, 24, 17, 0.3);
+}
+
+.mono-queue-entry.is-done {
+  opacity: 0.72;
+}
+
+.mono-queue-entry-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
 }
 
 .mono-queue-author {
   font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .mono-queue-state {
   font-size: 9px;
-  margin-left: 8px;
   color: rgba(255, 255, 255, 0.55);
+  white-space: nowrap;
 }
 
 .mono-queue-state.is-accent {
   color: var(--accent);
 }
 
-.mono-queue-entry > p {
-  margin: 2px 0 0;
+.mono-queue-state.is-failed {
+  color: #ffc0b2;
+}
+
+.mono-queue-entry-head > time {
+  margin-left: auto;
+  color: rgba(255, 255, 255, 0.42);
+  font-size: 8px;
+  white-space: nowrap;
+}
+
+.mono-queue-summary,
+.mono-queue-error {
+  margin: 0;
   font-size: 9px;
-  opacity: 0.6;
+  line-height: 1.4;
+}
+
+.mono-queue-summary {
+  color: rgba(255, 255, 255, 0.62);
+}
+
+.mono-queue-error {
+  color: rgba(255, 220, 211, 0.9);
+}
+
+.mono-queue-detail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 8px;
+  overflow-wrap: anywhere;
+}
+
+.mono-queue-actions {
+  display: flex;
+  gap: 12px;
+  margin-top: auto;
+  padding-top: 2px;
+}
+
+.mono-queue-actions > button {
+  min-height: 24px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.4);
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 9px;
+}
+
+.mono-queue-actions > button:hover,
+.mono-queue-actions > button[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.mono-queue-actions > button:disabled {
+  opacity: 0.45;
+}
+
+.mono-queue-empty {
+  margin: 0;
+  border: 1px dashed rgba(255, 255, 255, 0.18);
+  padding: 14px;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 9px;
+}
+
+.mono-activity-history-list {
+  display: flex;
+  gap: 8px;
+  padding-bottom: 3px;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+}
+
+.mono-activity-history-list > button {
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 3px 12px;
+  min-width: 210px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 3px;
+  padding: 7px 9px;
+  background: rgba(255, 255, 255, 0.03);
+  text-align: left;
+}
+
+.mono-activity-history-list > button > span {
   overflow: hidden;
+  color: rgba(255, 255, 255, 0.68);
+  font-size: 8px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.mono-activity-history-list > button > span:nth-child(2) {
+  color: rgba(255, 255, 255, 0.4);
+  text-align: right;
+}
+
+.mono-activity-history-list > button > span:last-child {
+  grid-column: 1 / -1;
+  color: rgba(255, 255, 255, 0.46);
 }
 
 /* Contribute strip */
@@ -1542,7 +1742,15 @@ body {
   }
 
   .mono-queue-list {
-    gap: 18px;
+    gap: 8px;
+  }
+
+  .mono-activity-strip {
+    max-height: min(72dvh, 620px);
+  }
+
+  .mono-activity-scroll {
+    max-height: min(62dvh, 530px);
   }
 
   .mono-welcome {
@@ -1610,9 +1818,22 @@ body {
 }
 
 @media (max-width: 560px) {
-  .mono-queue-entry:nth-child(4),
-  .mono-queue-entry:nth-child(3) {
-    display: none;
+  .mono-topright {
+    gap: 14px;
+  }
+
+  .mono-activity-strip {
+    padding-right: 9px;
+    padding-left: 9px;
+  }
+
+  .mono-queue-entry-head {
+    flex-wrap: wrap;
+  }
+
+  .mono-queue-entry-head > time {
+    flex-basis: 100%;
+    margin-left: 0;
   }
 
   .mono-overlap-note {

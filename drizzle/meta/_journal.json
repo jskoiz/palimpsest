@@ -64,6 +64,13 @@
       "when": 1784746104000,
       "tag": "0008_clear_live_archive",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1784750400000,
+      "tag": "0009_durable_job_attempts",
+      "breakpoints": true
     }
   ]
 }

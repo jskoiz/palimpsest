@@ -198,6 +198,9 @@ export const editJobs = sqliteTable(
     referenceBlobId: text("reference_blob_id"),
     idempotencyKey: text("idempotency_key").notNull(),
     requestFingerprint: text("request_fingerprint").notNull(),
+    retryOfJobId: text("retry_of_job_id"),
+    retryTokenHash: text("retry_token_hash"),
+    requestId: text("request_id"),
     attemptCount: integer("attempt_count").notNull().default(0),
     availableAt: integer("available_at").notNull(),
     workerToken: text("worker_token"),
@@ -229,6 +232,12 @@ export const editJobs = sqliteTable(
       table.state,
       table.leaseExpiresAt,
     ),
+    uniqueIndex("edit_jobs_retry_of_uq").on(table.retryOfJobId),
+    index("edit_jobs_activity_idx").on(
+      table.artworkId,
+      table.createdAt,
+      table.id,
+    ),
   ],
 );
 
@@ -243,18 +252,24 @@ export const commitLocks = sqliteTable("artwork_commit_locks", {
   leaseExpiresAt: integer("lease_expires_at"),
 });
 
-export const rateWindows = sqliteTable(
-  "rate_windows",
+export const rateLimitClaims = sqliteTable(
+  "rate_limit_claims",
   {
     requesterHash: text("requester_hash").notNull(),
     scope: text("scope").notNull(),
     windowStart: integer("window_start").notNull(),
-    count: integer("count").notNull(),
-    updatedAt: integer("updated_at").notNull(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    jobId: text("job_id").notNull(),
+    createdAt,
   },
   (table) => [
     primaryKey({
-      columns: [table.requesterHash, table.scope, table.windowStart],
+      columns: [
+        table.requesterHash,
+        table.scope,
+        table.windowStart,
+        table.idempotencyKey,
+      ],
     }),
   ],
 );

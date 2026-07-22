@@ -13,7 +13,6 @@ import {
 } from "@/lib/palimpsest/runtime";
 import { contributionRatePolicy } from "@/lib/palimpsest/rate-policy.mjs";
 import {
-  enforceRateLimit,
   ensurePalimpsest,
   insertEditJob,
   requesterHash,
@@ -53,6 +52,13 @@ export async function POST(request: Request) {
     const idempotencyKey = request.headers.get("Idempotency-Key")?.trim() ?? "";
     if (idempotencyKey.length < 8 || idempotencyKey.length > 128) {
       throw new DomainError("INVALID_REQUEST", "A valid Idempotency-Key header is required.");
+    }
+    const retryToken = request.headers.get("X-Palimpsest-Retry-Token")?.trim() ?? "";
+    if (retryToken.length < 16 || retryToken.length > 128) {
+      throw new DomainError(
+        "INVALID_REQUEST",
+        "A valid X-Palimpsest-Retry-Token header is required.",
+      );
     }
 
     const form = await request.formData();
@@ -141,9 +147,6 @@ export async function POST(request: Request) {
 
     const hash = await requesterHash(env, request);
     const ratePolicy = contributionRatePolicy(env, request, "edit");
-    for (const limit of ratePolicy.limits) {
-      await enforceRateLimit(env, hash, limit.scope, limit.limit, limit.windowMs);
-    }
     const job = await insertEditJob(env, {
       baseRevisionId: meta.baseRevisionId,
       displayName,
@@ -156,6 +159,9 @@ export async function POST(request: Request) {
       sourceBytes,
       maskBytes,
       referenceBytes,
+      rateLimits: ratePolicy.limits,
+      requestId,
+      retryToken,
     });
     console.info(`[palimpsest:${requestId}] contribution accepted`, {
       kind: "edit",
