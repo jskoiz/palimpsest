@@ -341,6 +341,7 @@ type ActiveRegionRow = {
   regionY: number;
   regionWidth: number;
   regionHeight: number;
+  reservationActive: number;
   createdAt: number;
   updatedAt: number;
 };
@@ -356,35 +357,36 @@ function serializeActiveRegion(row: ActiveRegionRow) {
       width: Number(row.regionWidth),
       height: Number(row.regionHeight),
     },
+    reservationActive: Boolean(row.reservationActive),
     createdAt: new Date(Number(row.createdAt)).toISOString(),
     updatedAt: new Date(Number(row.updatedAt)).toISOString(),
   };
 }
 
+export const ACTIVE_REGIONS_SQL = `SELECT
+  j.id AS jobId,
+  a.display_name AS author,
+  j.state AS state,
+  j.region_x AS regionX,
+  j.region_y AS regionY,
+  j.region_width AS regionWidth,
+  j.region_height AS regionHeight,
+  CASE WHEN j.lease_expires_at > ? THEN 1 ELSE 0 END AS reservationActive,
+  j.created_at AS createdAt,
+  j.updated_at AS updatedAt
+FROM edit_jobs j
+JOIN authors a ON a.id = j.author_id
+WHERE j.artwork_id = ?
+  AND j.state IN ('queued', 'moderating', 'generating', 'committing')
+  AND j.region_x IS NOT NULL
+  AND j.region_y IS NOT NULL
+  AND j.region_width > 0
+  AND j.region_height > 0
+ORDER BY j.created_at ASC, j.id ASC`;
+
 export async function getActiveRegions(env: AppEnv, now = Date.now()) {
-  const rows = await env.DB.prepare(
-    `SELECT
-       j.id AS jobId,
-       a.display_name AS author,
-       j.state AS state,
-       j.region_x AS regionX,
-       j.region_y AS regionY,
-       j.region_width AS regionWidth,
-       j.region_height AS regionHeight,
-       j.created_at AS createdAt,
-       j.updated_at AS updatedAt
-     FROM edit_jobs j
-     JOIN authors a ON a.id = j.author_id
-     WHERE j.artwork_id = ?
-       AND j.state IN ('queued', 'moderating', 'generating', 'committing')
-       AND j.lease_expires_at > ?
-       AND j.region_x IS NOT NULL
-       AND j.region_y IS NOT NULL
-       AND j.region_width > 0
-       AND j.region_height > 0
-     ORDER BY j.created_at ASC, j.id ASC`,
-  )
-    .bind(ARTWORK_ID, now)
+  const rows = await env.DB.prepare(ACTIVE_REGIONS_SQL)
+    .bind(now, ARTWORK_ID)
     .all<ActiveRegionRow>();
   return rows.results.map(serializeActiveRegion);
 }
@@ -873,7 +875,7 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
         .prepare(
           `INSERT INTO blobs
            (id, artwork_id, kind, r2_key, content_type, byte_length, sha256, width, height, created_at)
-           VALUES (?, ?, 'reference', ?, 'image/png', ?, ?, 1024, 1024, ?)`,
+           VALUES (?, ?, 'input', ?, 'image/png', ?, ?, 1024, 1024, ?)`,
         )
         .bind(
           referenceBlobId,

@@ -76,6 +76,13 @@ export function jsonError(
   details?: Record<string, unknown>,
 ): Response {
   const domainError = error instanceof DomainError ? error : null;
+  if (!domainError) {
+    console.error(`[palimpsest:${requestId}] unexpected request failure`, {
+      name: error instanceof Error ? error.name : "UnknownError",
+      message: error instanceof Error ? error.message : "Unknown server failure",
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+  }
   const code = domainError?.code ?? "INTERNAL_ERROR";
   const status =
     code === "STALE_BASE_REVISION" ||

@@ -347,6 +347,11 @@ body {
   border-color: rgba(224, 118, 95, 0.9);
 }
 
+.mono-reservation.is-recovering {
+  border-style: dashed;
+  background: rgba(224, 118, 95, 0.08);
+}
+
 .mono-reservation > span {
   position: absolute;
   left: 3px;

@@ -10,7 +10,7 @@ import {
   buildOpenAiEditPrompt,
   createDisplayMaskSvg,
   displayMaskForLayer,
-  maskBlendInset,
+  referenceImagePlacement,
   resolveLayerStack,
   serializeHistory,
   validateRegion,
@@ -31,7 +31,9 @@ import {
 } from "../lib/palimpsest/geometry.mjs";
 import {
   EDIT_PLANNER_MODEL,
+  buildContainmentReviewRequest,
   buildEditPlanRequest,
+  extractContainmentReview,
   extractEditPlan,
 } from "../lib/palimpsest/ai-planner.mjs";
 
@@ -174,15 +176,27 @@ test("region constraints reject legacy tile fields and unsafe masks", () => {
   );
 });
 
-test("filled object masks reserve a feathered blend margin", () => {
+test("display masks keep exact hard edit boundaries without feathering", () => {
   const region = { x: 100, y: 200, width: 384, height: 320 };
-  assert.equal(maskBlendInset(region), 24);
-  assert.equal(maskBlendInset({ width: 64, height: 64 }), 24);
-
   const svg = createDisplayMaskSvg({ region, fill: true, strokes: [] });
-  assert.match(svg, /feGaussianBlur stdDeviation="10"/);
+  assert.doesNotMatch(svg, /feGaussianBlur|filter=/);
   assert.match(svg, /clipPath id="edit-bounds"/);
-  assert.match(svg, /<rect x="124" y="224" width="336" height="272" fill="white"\/>/);
+  assert.match(svg, /<rect x="100" y="200" width="384" height="320" fill="white"/);
+});
+
+test("reference framing preserves the full image with a safety margin", () => {
+  assert.deepEqual(referenceImagePlacement(768, 574, { width: 384, height: 320 }), {
+    x: 397,
+    y: 426,
+    width: 230,
+    height: 172,
+  });
+  assert.deepEqual(referenceImagePlacement(574, 768, { width: 384, height: 320 }), {
+    x: 440,
+    y: 416,
+    width: 144,
+    height: 192,
+  });
 });
 
 test("generated layers retain the reservation mask", () => {
@@ -279,6 +293,8 @@ test("live image prompts keep random objects whole without forcing an art style"
   const prompt = buildOpenAiEditPrompt("Add a bright plastic toy truck.");
   assert.match(prompt, /entire subject comfortably inside the editable area/i);
   assert.match(prompt, /Never crop, truncate/i);
+  assert.match(prompt, /clear margin on every side/i);
+  assert.match(prompt, /reference subject touches an edge/i);
   assert.match(prompt, /without forcing it into a predefined artistic motif/i);
   assert.match(prompt, /Add a bright plastic toy truck\./);
   assert.doesNotMatch(prompt, /vermilion|graphite|mixed-media/i);
@@ -287,6 +303,8 @@ test("live image prompts keep random objects whole without forcing an art style"
 test("reference-image prompts use the second input without pasting its frame", () => {
   const prompt = buildOpenAiEditPrompt("Add the flower from my reference.", true);
   assert.match(prompt, /second supplied image as a direct visual reference/i);
+  assert.match(prompt, /already been centered and scaled/i);
+  assert.match(prompt, /do not enlarge it/i);
   assert.match(prompt, /do not paste its rectangular background/i);
   assert.match(prompt, /Add the flower from my reference\./);
 });
@@ -331,6 +349,35 @@ test("GPT-5.6 edit plans are read from message output rather than reasoning item
   assert.equal(extractEditPlan({ output: [{ type: "reasoning" }] }), null);
 });
 
+test("reference generations receive structured whole-subject containment review", () => {
+  const request = buildContainmentReviewRequest({
+    requestedChange: "Place the mini keyboard.",
+    generatedImageUrl: "data:image/png;base64,generated",
+    providerMaskUrl: "data:image/png;base64,mask",
+  });
+  assert.equal(request.model, "gpt-5.6");
+  assert.equal(request.store, false);
+  assert.equal(request.input[0].content[1].type, "input_image");
+  assert.equal(request.input[0].content[2].image_url, "data:image/png;base64,mask");
+  assert.equal(request.text.format.type, "json_schema");
+  assert.equal(request.text.format.strict, true);
+  assert.match(request.input[0].content[0].text, /clear space on every side/i);
+
+  assert.deepEqual(
+    extractContainmentReview({
+      output: [{
+        type: "message",
+        content: [{
+          type: "output_text",
+          text: '{"contained":false,"reason":"The keyboard is cut off."}',
+        }],
+      }],
+    }),
+    { contained: false, reason: "The keyboard is cut off." },
+  );
+  assert.equal(extractContainmentReview({ output: [] }), null);
+});
+
 test("reference images stay optional, visible in the patch, and reach live generation", async () => {
   const [routeSource, clientSource, queueSource, storeSource] = await Promise.all([
     readFile(new URL("../app/api/edits/route.ts", import.meta.url), "utf8"),
@@ -345,9 +392,13 @@ test("reference images stay optional, visible in the patch, and reach live gener
   assert.match(routeSource, /referenceValue instanceof File/);
   assert.match(routeSource, /referenceBytes/);
   assert.match(storeSource, /reference_blob_id/);
-  assert.match(storeSource, /'reference'/);
+  assert.doesNotMatch(storeSource, /kind[^\n]*'reference'|VALUES \([^\n]*'reference'/);
+  assert.match(storeSource, /referenceBlobId,[\s\S]*VALUES \(\?, \?, 'input'/);
   assert.match(queueSource, /palimpsest-reference\.png/);
   assert.match(queueSource, /buildOpenAiEditPrompt\(plannedPrompt, Boolean\(reference\)\)/);
+  assert.match(queueSource, /reviewPatchContainment/);
+  assert.match(queueSource, /MAX_CONTAINMENT_ATTEMPTS = 2/);
+  assert.match(queueSource, /no more than 45%/);
   assert.match(queueSource, /https:\/\/api\.openai\.com\/v1\/responses/);
 });
 
