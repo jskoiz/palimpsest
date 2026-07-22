@@ -403,6 +403,59 @@ test("white-canvas migration clears the prior archive and every reservation", as
   db.close();
 });
 
+test("purple-canvas migration removes the current duck revision and reseeds cleanly", async () => {
+  const db = await migratedDatabase();
+  seedArtwork(db);
+  db.exec(`
+    INSERT INTO blobs (
+      id, artwork_id, kind, r2_key, content_type, byte_length,
+      sha256, width, height, created_at
+    ) VALUES ('duck-patch', 'palimpsest', 'patch', 'duck.png', 'image/png',
+      1, 'duck-hash', 1024, 1024, 2);
+    INSERT INTO revisions (
+      id, artwork_id, sequence, parent_revision_id, origin, status,
+      author_id, prompt, region_x, region_y, region_width, region_height, created_at
+    ) VALUES ('duck-revision', 'palimpsest', 1, 'r0', 'openai', 'accepted',
+      'author-a', 'A large rubber duck', 512, 512, 1024, 1024, 2);
+    INSERT INTO revision_patches (
+      revision_id, patch_blob_id, display_mask_blob_id,
+      frame_x, frame_y, frame_width, frame_height
+    ) VALUES ('duck-revision', 'duck-patch', NULL, 512, 512, 1024, 1024);
+    UPDATE artworks
+    SET head_revision_id = 'duck-revision', head_sequence = 1
+    WHERE id = 'palimpsest';
+  `);
+
+  const purpleCanvasReset = await readFile(
+    new URL("drizzle/0005_purple_canvas_reset.sql", root),
+    "utf8",
+  );
+  applyMigration(db, purpleCanvasReset);
+
+  for (const table of [
+    "artworks",
+    "authors",
+    "blobs",
+    "edit_jobs",
+    "keyframe_tiles",
+    "keyframes",
+    "rate_windows",
+    "revision_patches",
+    "revisions",
+    "artwork_commit_locks",
+  ]) {
+    assert.equal(
+      db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count,
+      0,
+      `${table} must be empty after the purple reset`,
+    );
+  }
+
+  seedArtwork(db);
+  assert.throws(() => db.exec("DELETE FROM revisions WHERE id = 'r0'"));
+  db.close();
+});
+
 test("atomic spatial reservations reject overlap, allow touching, and expire cleanly", async () => {
   const db = await migratedDatabase();
   seedArtwork(db);

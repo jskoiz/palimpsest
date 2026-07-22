@@ -199,47 +199,47 @@ test("request handlers rely on packaged migrations instead of runtime schema DDL
   assert.doesNotMatch(storeSource, /CREATE\s+(?:TABLE|INDEX|TRIGGER)/i);
 });
 
-test("new archives begin with one blank white revision", async () => {
+test("new archives begin with one purple abstract revision", async () => {
   const storeSource = await readFile(
     new URL("../lib/palimpsest/store.ts", import.meta.url),
     "utf8",
   );
 
-  assert.match(storeSource, /prompt: "Blank canvas\."/);
-  assert.match(storeSource, /rev-seed-white-000/);
-  assert.match(storeSource, /blob-white-base-/);
+  assert.match(storeSource, /prompt: "Purple abstract canvas\."/);
+  assert.match(storeSource, /rev-seed-purple-000/);
+  assert.match(storeSource, /blob-purple-base-/);
   assert.match(storeSource, /seedRevisions\[0\]\.id, createdAt/);
   assert.match(storeSource, /2, 2, \?, 0, \?\)/);
   assert.doesNotMatch(storeSource, /rev-seed-00[1-9]|blob-seed-patch/);
   assert.match(storeSource, /\?sha256=\$\{encodeURIComponent\(tile\.sha256\)\}/);
 });
 
-test("canonical seed assets are the verified solid-white canvas", async () => {
+test("canonical seed assets are the verified purple abstract canvas", async () => {
   const assets = [
     [
       "../public/seed/canonical.png",
       2048,
-      "c989a7957d22cd3a3ca3e09ddfbb12145b6650f4114d639d9a5e61694f375559",
+      "12a2ef4ba08d5eda39c16816fe40c3f50846643b45982b8882566d9182afc27c",
     ],
     [
       "../public/seed/tile-0-0.png",
       1024,
-      "b0a2a14fdb96bdbcc93e433fde76665ad377a597f380a4adafc28881e931b1c5",
+      "b9b641ffde035c2fd48e7edf8687dc24a4f861a58ff6e3ec8cdb8b16fa5e0723",
     ],
     [
       "../public/seed/tile-1-0.png",
       1024,
-      "b0a2a14fdb96bdbcc93e433fde76665ad377a597f380a4adafc28881e931b1c5",
+      "bc51ce00a4fec4c271d7ed5b27d0edbd3fa1a75bc525183c5c1ee48a10ed6539",
     ],
     [
       "../public/seed/tile-0-1.png",
       1024,
-      "b0a2a14fdb96bdbcc93e433fde76665ad377a597f380a4adafc28881e931b1c5",
+      "801672e584e3ecb6ec942c88a72e8b9169d582eda919bddb5feef20e94187b59",
     ],
     [
       "../public/seed/tile-1-1.png",
       1024,
-      "b0a2a14fdb96bdbcc93e433fde76665ad377a597f380a4adafc28881e931b1c5",
+      "265f67b0f802cd643ad50942a72e79fb35dbd21c091b982e2ac8f3a3c58e9f24",
     ],
   ];
 

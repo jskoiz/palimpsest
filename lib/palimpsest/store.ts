@@ -26,8 +26,8 @@ export type GenerationFrame = GlobalRegion;
 
 export const RESERVATION_LEASE_MS = 4 * 60 * 1000;
 export const PREPARING_AVAILABLE_AT = Number.MAX_SAFE_INTEGER;
-const WHITE_SEED_REVISION_ID = "rev-seed-white-000";
-const WHITE_SEED_KEYFRAME_ID = "keyframe-white-000000";
+const PURPLE_SEED_REVISION_ID = "rev-seed-purple-000";
+const PURPLE_SEED_KEYFRAME_ID = "keyframe-purple-000000";
 
 type SeedRevision = {
   id: string;
@@ -39,10 +39,10 @@ type SeedRevision = {
 
 const seedRevisions: SeedRevision[] = [
   {
-    id: WHITE_SEED_REVISION_ID,
+    id: PURPLE_SEED_REVISION_ID,
     authorId: "author-archive",
     author: "Palimpsest Archive",
-    prompt: "Blank canvas.",
+    prompt: "Purple abstract canvas.",
     timestamp: Date.UTC(2026, 6, 21, 20, 30),
   },
 ];
@@ -80,7 +80,7 @@ export async function ensurePalimpsest(env: AppEnv, requestUrl: string): Promise
         customMetadata: { sha256: hash, immutable: "true" },
       });
       baseBlobs.push({
-        id: `blob-white-base-${tileX}-${tileY}`,
+        id: `blob-purple-base-${tileX}-${tileY}`,
         key,
         hash,
         bytes,
@@ -145,7 +145,7 @@ export async function ensurePalimpsest(env: AppEnv, requestUrl: string): Promise
       `INSERT OR IGNORE INTO keyframes
        (id, artwork_id, revision_id, sequence, created_at)
        VALUES (?, ?, ?, 0, ?)`,
-    ).bind(WHITE_SEED_KEYFRAME_ID, ARTWORK_ID, WHITE_SEED_REVISION_ID, createdAt),
+    ).bind(PURPLE_SEED_KEYFRAME_ID, ARTWORK_ID, PURPLE_SEED_REVISION_ID, createdAt),
   );
   for (const blob of baseBlobs) {
     statements.push(
@@ -153,7 +153,7 @@ export async function ensurePalimpsest(env: AppEnv, requestUrl: string): Promise
         `INSERT OR IGNORE INTO keyframe_tiles
          (keyframe_id, tile_x, tile_y, blob_id)
          VALUES (?, ?, ?, ?)`,
-      ).bind(WHITE_SEED_KEYFRAME_ID, blob.tileX, blob.tileY, blob.id),
+      ).bind(PURPLE_SEED_KEYFRAME_ID, blob.tileX, blob.tileY, blob.id),
     );
   }
   statements.push(

@@ -799,8 +799,6 @@ export default function Palimpsest() {
   const selectedRevision = revisions[selectedIndex] ?? null;
   const headRevision = revisions.at(-1) ?? null;
   const previousRevision = selectedIndex > 0 ? revisions[selectedIndex - 1] : null;
-  const isBlankCanvas =
-    selectedRevision?.sequence === 0 || selectedState?.layers.length === 0;
   const panelOpen = historyOpen || queueOpen || editOpen || welcomeOpen;
   const chromeShown = chromeVisible || panelOpen;
   const showHistory =
@@ -1888,7 +1886,7 @@ export default function Palimpsest() {
 
   return (
     <main
-      className={`mono-stage${isBlankCanvas ? " is-blank-canvas" : ""}`}
+      className="mono-stage"
       onPointerMove={wake}
       onWheel={handleWheel}
       onDoubleClick={handleDoubleClick}
