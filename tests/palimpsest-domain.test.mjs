@@ -22,10 +22,8 @@ import {
   generationFrameForRegion,
   nudgeEditRegion,
   positionEditRegion,
-  positionEditRegionAvoidingRegions,
   regionRelativeToFrame,
   resizeEditRegion,
-  resizeEditRegionAvoidingRegions,
   regionsOverlap,
   timelineIndexAtPosition,
 } from "../lib/palimpsest/geometry.mjs";
@@ -540,72 +538,26 @@ test("patch resizing stays useful, bounded, and inside the artwork", () => {
   );
 });
 
-test("patch resizing cannot enter a live reservation", () => {
+test("patch selection preserves user coordinates when it overlaps a live reservation", () => {
   const patch = { x: 100, y: 100, width: 200, height: 200 };
-  const reserved = [{ x: 360, y: 100, width: 120, height: 180 }];
+  const reserved = { x: 300, y: 180, width: 180, height: 180 };
+  const moved = positionEditRegion(patch, 240, 140);
+  const resized = resizeEditRegion(moved, 320, 280);
 
-  assert.deepEqual(
-    resizeEditRegionAvoidingRegions(patch, 400, 260, reserved),
-    { x: 100, y: 100, width: 200, height: 260 },
-  );
-  assert.deepEqual(
-    resizeEditRegionAvoidingRegions(patch, 400, 400, [
-      ...reserved,
-      { x: 100, y: 320, width: 180, height: 120 },
-    ]),
-    patch,
-  );
+  assert.deepEqual(moved, { x: 240, y: 140, width: 200, height: 200 });
+  assert.deepEqual(resized, { x: 240, y: 140, width: 320, height: 280 });
+  assert.equal(regionsOverlap(moved, reserved), true);
+  assert.equal(regionsOverlap(resized, reserved), true);
 });
 
-test("patch placement stops at live reservation edges without blocking edge contact", () => {
-  const patch = { x: 100, y: 100, width: 100, height: 100 };
-  const reserved = [{ x: 300, y: 100, width: 100, height: 100 }];
+test("collaboration UI never silently relocates a selected patch", async () => {
+  const source = await readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8");
 
-  assert.deepEqual(positionEditRegionAvoidingRegions(patch, 200, 100, reserved), {
-    x: 200,
-    y: 100,
-    width: 100,
-    height: 100,
-  });
-  assert.deepEqual(positionEditRegionAvoidingRegions(patch, 250, 100, reserved), {
-    x: 200,
-    y: 100,
-    width: 100,
-    height: 100,
-  });
-
-  assert.deepEqual(positionEditRegionAvoidingRegions(
-    { x: 200, y: 100, width: 100, height: 100 },
-    450,
-    100,
-    reserved,
-  ), {
-    x: 200,
-    y: 100,
-    width: 100,
-    height: 100,
-  });
-});
-
-test("patch placement cannot tunnel through adjacent live reservations", () => {
-  const patch = { x: 100, y: 100, width: 100, height: 100 };
-  const reserved = [
-    { x: 300, y: 100, width: 100, height: 100 },
-    { x: 200, y: 100, width: 100, height: 100 },
-  ];
-  const placed = positionEditRegionAvoidingRegions(patch, 250, 100, reserved);
-
-  assert.equal(reserved.some((region) => regionsOverlap(placed, region)), false);
-  assert.deepEqual(placed, { x: 100, y: 100, width: 100, height: 100 });
-});
-
-test("patch placement slides along a live reservation without entering it", () => {
-  const patch = { x: 100, y: 100, width: 100, height: 100 };
-  const reserved = [{ x: 300, y: 100, width: 100, height: 100 }];
-  const placed = positionEditRegionAvoidingRegions(patch, 350, 250, reserved);
-
-  assert.equal(reserved.some((region) => regionsOverlap(placed, region)), false);
-  assert.deepEqual(placed, { x: 200, y: 250, width: 100, height: 100 });
+  assert.doesNotMatch(source, /positionEditRegionAvoidingRegions/);
+  assert.doesNotMatch(source, /resizeEditRegionAvoidingRegions/);
+  assert.doesNotMatch(source, /patch moved to open space/);
+  assert.match(source, /your patch stayed exactly where you placed it/);
+  assert.match(source, /!conflictingRegion/);
 });
 
 test("generation frames center seam-crossing regions and clamp at every artwork edge", () => {
