@@ -160,6 +160,7 @@ const QUEUE_RECOVERY_POLL_MS = 12_000;
 const DEFAULT_REGION = { x: 800, y: 832, width: 448, height: 384 };
 const WELCOME_STORAGE_KEY = "palimpsest:welcome:v1";
 const REFERENCE_IMAGE_SIZE = 1024;
+const REFERENCE_MASK_INSET = 64;
 const MAX_REFERENCE_UPLOAD_BYTES = 10 * 1024 * 1024;
 const REFERENCE_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 
@@ -723,6 +724,7 @@ async function providerMask(
   frame: Region,
   strokes: Stroke[],
   fill: boolean,
+  inset = 0,
 ): Promise<Blob> {
   const canvas = document.createElement("canvas");
   canvas.width = frame.width;
@@ -733,6 +735,17 @@ async function providerMask(
   context.fillRect(0, 0, frame.width, frame.height);
   context.globalCompositeOperation = "destination-out";
   const frameRegion = regionRelativeToFrame(region, frame);
+  context.save();
+  if (inset > 0) {
+    context.beginPath();
+    context.rect(
+      frameRegion.x + inset,
+      frameRegion.y + inset,
+      Math.max(1, region.width - inset * 2),
+      Math.max(1, region.height - inset * 2),
+    );
+    context.clip();
+  }
   if (fill) {
     context.clearRect(
       frameRegion.x,
@@ -759,6 +772,7 @@ async function providerMask(
       context.stroke();
     }
   }
+  context.restore();
   context.globalCompositeOperation = "source-over";
   return canvasBlob(canvas, "The mask could not be encoded.");
 }
@@ -1894,7 +1908,13 @@ export default function Palimpsest() {
         referenceImage
           ? transparentGenerationFrame()
           : flattenArtworkFrame(editBase.state, frame),
-        providerMask(editRegion, frame, strokes, fillMask),
+        providerMask(
+          editRegion,
+          frame,
+          strokes,
+          fillMask,
+          referenceImage ? REFERENCE_MASK_INSET : 0,
+        ),
       ]);
       const form = new FormData();
       form.append(
