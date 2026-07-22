@@ -10,7 +10,11 @@ import type {
   WheelEvent as ReactWheelEvent,
 } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ARTWORK_SIZE, maskBlendInset } from "@/lib/palimpsest/domain.mjs";
+import {
+  ARTWORK_SIZE,
+  REFERENCE_TARGET_FILL,
+  referenceImagePlacement,
+} from "@/lib/palimpsest/domain.mjs";
 import {
   canvasViewCanPan,
   constrainCanvasView,
@@ -101,6 +105,7 @@ type ActiveRegion = {
   author: string;
   state: string;
   region: Region;
+  reservationActive: boolean;
   createdAt: string;
   updatedAt: string;
 };
@@ -151,6 +156,7 @@ const BRUSH_WIDTH = 30;
 const COLLAB_POLL_MS = 3000;
 const HIDDEN_COLLAB_POLL_MS = 8000;
 const PATCH_SIZE_STEP = 32;
+const QUEUE_RECOVERY_POLL_MS = 12_000;
 const DEFAULT_REGION = { x: 800, y: 832, width: 448, height: 384 };
 const WELCOME_STORAGE_KEY = "palimpsest:welcome:v1";
 const REFERENCE_IMAGE_SIZE = 1024;
@@ -186,6 +192,17 @@ function regionStyle(region: Region): CSSProperties {
     top: `${(region.y / ARTWORK_SIZE) * 100}%`,
     width: `${(region.width / ARTWORK_SIZE) * 100}%`,
     height: `${(region.height / ARTWORK_SIZE) * 100}%`,
+  };
+}
+
+function referencePreviewStyle(): CSSProperties {
+  const offset = ((1 - REFERENCE_TARGET_FILL) / 2) * 100;
+  return {
+    position: "absolute",
+    width: `${REFERENCE_TARGET_FILL * 100}%`,
+    height: `${REFERENCE_TARGET_FILL * 100}%`,
+    left: `${offset}%`,
+    top: `${offset}%`,
   };
 }
 
@@ -230,12 +247,13 @@ function activitySignature(activity: ActivityPayload) {
       active.region.y,
       active.region.width,
       active.region.height,
+      active.reservationActive,
       active.updatedAt,
     ]),
   });
 }
 
-function activeStateLabel(state: ActiveRegion["state"]) {
+function jobStateLabel(state: string) {
   if (state === "queued") return "reserved";
   if (state === "moderating") return "planning";
   if (state === "committing") return "finishing";
@@ -243,7 +261,14 @@ function activeStateLabel(state: ActiveRegion["state"]) {
   return state;
 }
 
+function activeStateLabel(active: ActiveRegion) {
+  return active.reservationActive ? jobStateLabel(active.state) : "recovering";
+}
+
 function overlapMessage(active: ActiveRegion) {
+  if (!active.reservationActive) {
+    return `${active.author}'s edit is recovering here — this area stays unavailable until recovery finishes.`;
+  }
   if (active.state === "queued") {
     return `${active.author} reserved this area — it stays locked until the edit finishes.`;
   }
@@ -588,7 +613,7 @@ function canvasBlob(canvas: HTMLCanvasElement, message: string): Promise<Blob> {
   });
 }
 
-async function normalizeReferenceImage(file: File): Promise<Blob> {
+async function normalizeReferenceImage(file: File, targetRegion: Region): Promise<Blob> {
   let image: ImageBitmap;
   try {
     image = await createImageBitmap(file);
@@ -604,18 +629,13 @@ async function normalizeReferenceImage(file: File): Promise<Blob> {
     canvas.height = REFERENCE_IMAGE_SIZE;
     const context = canvas.getContext("2d");
     if (!context) throw new Error("This browser cannot prepare reference images.");
-    const scale = Math.min(
-      REFERENCE_IMAGE_SIZE / image.width,
-      REFERENCE_IMAGE_SIZE / image.height,
-    );
-    const width = Math.max(1, Math.round(image.width * scale));
-    const height = Math.max(1, Math.round(image.height * scale));
+    const placement = referenceImagePlacement(image.width, image.height, targetRegion);
     context.drawImage(
       image,
-      Math.round((REFERENCE_IMAGE_SIZE - width) / 2),
-      Math.round((REFERENCE_IMAGE_SIZE - height) / 2),
-      width,
-      height,
+      placement.x,
+      placement.y,
+      placement.width,
+      placement.height,
     );
     return canvasBlob(canvas, "The reference image could not be encoded.");
   } finally {
@@ -707,12 +727,11 @@ async function providerMask(
   context.globalCompositeOperation = "destination-out";
   const frameRegion = regionRelativeToFrame(region, frame);
   if (fill) {
-    const inset = maskBlendInset(region);
     context.clearRect(
-      frameRegion.x + inset,
-      frameRegion.y + inset,
-      region.width - inset * 2,
-      region.height - inset * 2,
+      frameRegion.x,
+      frameRegion.y,
+      region.width,
+      region.height,
     );
   } else {
     context.lineCap = "round";
@@ -1022,6 +1041,24 @@ export default function Palimpsest() {
   }, [refreshActivity, refreshHistory]);
 
   useEffect(() => {
+    let cancelled = false;
+    let timer: number | null = null;
+    const recoverQueue = async () => {
+      await requestQueueDrain();
+      if (cancelled) return;
+      await refreshActivity().catch(() => undefined);
+      if (!cancelled) {
+        timer = window.setTimeout(recoverQueue, QUEUE_RECOVERY_POLL_MS);
+      }
+    };
+    timer = window.setTimeout(recoverQueue, 0);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [refreshActivity, requestQueueDrain]);
+
+  useEffect(() => {
     armIdleTimers();
     const timers = [idleTimer, deepTimer, toastTimer, closeTimer];
     return () => {
@@ -1222,8 +1259,7 @@ export default function Palimpsest() {
     context.lineCap = "round";
     context.lineJoin = "round";
     if (fillMask) {
-      const inset = maskBlendInset(editRegion);
-      context.fillRect(inset, inset, width - inset * 2, height - inset * 2);
+      context.fillRect(0, 0, width, height);
     }
     for (const stroke of strokes) {
       const first = stroke.points[0];
@@ -1814,11 +1850,11 @@ export default function Palimpsest() {
     setSubmitError(null);
     setIsPreparing(true);
     try {
-      const blob = await normalizeReferenceImage(file);
+      const blob = await normalizeReferenceImage(file, editRegion);
       if (referencePreviewUrlRef.current) {
         URL.revokeObjectURL(referencePreviewUrlRef.current);
       }
-      const previewUrl = URL.createObjectURL(blob);
+      const previewUrl = URL.createObjectURL(file);
       referencePreviewUrlRef.current = previewUrl;
       setReferenceImage({ blob, fileName: file.name, previewUrl });
     } catch (error) {
@@ -1975,8 +2011,8 @@ export default function Palimpsest() {
     ...otherActiveRegions.map((active) => ({
       id: active.jobId,
       author: active.author,
-      state: activeStateLabel(active.state),
-      accent: active.state !== "queued",
+      state: activeStateLabel(active),
+      accent: active.state !== "queued" && active.reservationActive,
       prompt: `region ${active.region.x},${active.region.y} · ${active.region.width}×${active.region.height}`,
     })),
     ...activity.recent.map((revision) => ({
@@ -2077,14 +2113,14 @@ export default function Palimpsest() {
                     active.state === "generating" || active.state === "committing"
                       ? " is-active"
                       : ""
-                  }`}
+                  }${!active.reservationActive ? " is-recovering" : ""}`}
                   data-testid="active-reservation"
                   style={regionStyle(active.region)}
                   role="listitem"
-                  aria-label={`${active.author}, ${activeStateLabel(active.state)}, region ${active.region.x}, ${active.region.y}, ${active.region.width} by ${active.region.height}`}
+                  aria-label={`${active.author}, ${activeStateLabel(active)}, region ${active.region.x}, ${active.region.y}, ${active.region.width} by ${active.region.height}`}
                 >
                   <span>
-                    {active.author} · {activeStateLabel(active.state)}
+                    {active.author} · {activeStateLabel(active)}
                   </span>
                 </div>
               ))}
@@ -2094,9 +2130,9 @@ export default function Palimpsest() {
                   data-testid="local-reservation"
                   style={regionStyle(pendingEdit.region)}
                   role="listitem"
-                  aria-label={`Your region, ${activeStateLabel(job.state)}`}
+                  aria-label={`Your region, ${jobStateLabel(job.state)}`}
                 >
-                  <span>you · {activeStateLabel(job.state)}</span>
+                  <span>you · {jobStateLabel(job.state)}</span>
                 </div>
               ) : null}
             </div>
@@ -2137,7 +2173,11 @@ export default function Palimpsest() {
                 ) : null}
                 {referenceImage && step === 3 && !submitted ? (
                   <div className="mono-reference-on-canvas" aria-hidden="true">
-                    <img src={referenceImage.previewUrl} alt="" />
+                    <img
+                      src={referenceImage.previewUrl}
+                      alt=""
+                      style={referencePreviewStyle()}
+                    />
                     <span>reference</span>
                   </div>
                 ) : null}
