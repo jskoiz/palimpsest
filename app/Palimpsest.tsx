@@ -13,6 +13,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ARTWORK_SIZE,
   REFERENCE_TARGET_FILL,
+  generationMaskInset,
   referenceImagePlacement,
 } from "@/lib/palimpsest/domain.mjs";
 import {
@@ -727,11 +728,12 @@ async function providerMask(
   context.globalCompositeOperation = "destination-out";
   const frameRegion = regionRelativeToFrame(region, frame);
   if (fill) {
+    const inset = generationMaskInset(region);
     context.clearRect(
-      frameRegion.x,
-      frameRegion.y,
-      region.width,
-      region.height,
+      frameRegion.x + inset,
+      frameRegion.y + inset,
+      region.width - inset * 2,
+      region.height - inset * 2,
     );
   } else {
     context.lineCap = "round";
