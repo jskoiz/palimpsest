@@ -302,6 +302,7 @@ test("live image prompts keep random objects whole without forcing an art style"
 
 test("reference-image prompts use the second input without pasting its frame", () => {
   const prompt = buildOpenAiEditPrompt("Add the flower from my reference.", true);
+  assert.match(prompt, /blank transparent first image/i);
   assert.match(prompt, /second supplied image as a direct visual reference/i);
   assert.match(prompt, /already been centered and scaled/i);
   assert.match(prompt, /do not enlarge it/i);
@@ -399,6 +400,11 @@ test("reference images stay optional, visible in the patch, and reach live gener
   assert.match(clientSource, /form\.append\("reference", referenceImage\.blob/);
   assert.match(clientSource, /mono-reference-on-canvas/);
   assert.match(clientSource, /image\/png,image\/jpeg,image\/webp/);
+  assert.match(clientSource, /async function transparentGenerationFrame\(\)/);
+  assert.match(
+    clientSource,
+    /referenceImage\s*\?\s*transparentGenerationFrame\(\)\s*:\s*flattenArtworkFrame\(editBase\.state, frame\)/,
+  );
   assert.match(routeSource, /referenceValue instanceof File/);
   assert.match(routeSource, /referenceBytes/);
   assert.match(storeSource, /reference_blob_id/);
