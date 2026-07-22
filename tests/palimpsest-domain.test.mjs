@@ -357,6 +357,7 @@ test("reference generations receive structured whole-subject containment review"
   });
   assert.equal(request.model, "gpt-5.6");
   assert.equal(request.store, false);
+  assert.equal(request.max_output_tokens, 500);
   assert.equal(request.input[0].content[1].type, "input_image");
   assert.equal(request.input[0].content[2].image_url, "data:image/png;base64,mask");
   assert.equal(request.text.format.type, "json_schema");
