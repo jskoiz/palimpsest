@@ -9,6 +9,7 @@ import {
   extractContainmentReview,
   extractEditPlan,
 } from "./ai-planner.mjs";
+import { imageEditProviderPolicy } from "./image-edit-policy.mjs";
 import type { AppEnv } from "./runtime";
 import { readPngDimensions, sha256Hex } from "./runtime";
 import {
@@ -608,8 +609,9 @@ async function generateOpenAiPatch(
       : Promise.resolve(null),
   ]);
 
+  const imagePolicy = imageEditProviderPolicy(Boolean(referenceBytes));
   const form = new FormData();
-  form.append("model", "gpt-image-2");
+  form.append("model", imagePolicy.model);
   form.append(
     "image[]",
     new File([sourceBytes], "palimpsest-context.png", {
@@ -629,8 +631,12 @@ async function generateOpenAiPatch(
         type: "image/png",
       }),
     );
-    form.append("background", "transparent");
-    form.append("input_fidelity", "high");
+  }
+  if (imagePolicy.background) {
+    form.append("background", imagePolicy.background);
+  }
+  if (imagePolicy.inputFidelity) {
+    form.append("input_fidelity", imagePolicy.inputFidelity);
   }
   form.append("prompt", buildOpenAiEditPrompt(plannedPrompt, Boolean(reference)));
   form.append("size", "1024x1024");
