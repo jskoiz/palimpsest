@@ -684,10 +684,10 @@ test("adaptive generation frames give small edits a high-resolution working crop
   );
 
   const corners = [
-    [{ x: 0, y: 0, width: 64, height: 64 }, { x: 0, y: 0, width: 256, height: 256 }],
-    [{ x: 1984, y: 0, width: 64, height: 64 }, { x: 1792, y: 0, width: 256, height: 256 }],
-    [{ x: 0, y: 1984, width: 64, height: 64 }, { x: 0, y: 1792, width: 256, height: 256 }],
-    [{ x: 1984, y: 1984, width: 64, height: 64 }, { x: 1792, y: 1792, width: 256, height: 256 }],
+    [{ x: 0, y: 0, width: 64, height: 64 }, { x: -96, y: -96, width: 256, height: 256 }],
+    [{ x: 1984, y: 0, width: 64, height: 64 }, { x: 1888, y: -96, width: 256, height: 256 }],
+    [{ x: 0, y: 1984, width: 64, height: 64 }, { x: -96, y: 1888, width: 256, height: 256 }],
+    [{ x: 1984, y: 1984, width: 64, height: 64 }, { x: 1888, y: 1888, width: 256, height: 256 }],
   ];
   for (const [region, expectedFrame] of corners) {
     assert.deepEqual(generationFrameForRegion(region), expectedFrame);
@@ -697,6 +697,16 @@ test("adaptive generation frames give small edits a high-resolution working crop
     generationFrameForRegion({ x: 167, y: 1035, width: 161, height: 305 }),
     { x: 4, y: 944, width: 488, height: 488 },
   );
+
+  const edgeRegion = { x: 1888, y: 1472, width: 160, height: 320 };
+  const edgeFrame = generationFrameForRegion(edgeRegion);
+  assert.deepEqual(edgeFrame, { x: 1712, y: 1376, width: 512, height: 512 });
+  assert.deepEqual(regionInGenerationFrame(edgeRegion, edgeFrame), {
+    x: 352,
+    y: 192,
+    width: 320,
+    height: 640,
+  });
 });
 
 test("global masks scale into provider pixels without losing stroke geometry", () => {

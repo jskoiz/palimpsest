@@ -790,16 +790,141 @@ async function flattenArtworkFrame(state: ArtworkState, frame: Region): Promise<
   source.height = GENERATION_FRAME_SIZE;
   const sourceContext = source.getContext("2d");
   if (!sourceContext) throw new Error("This browser cannot prepare image edits.");
+  sourceContext.imageSmoothingEnabled = true;
+  sourceContext.imageSmoothingQuality = "high";
+
+  const sourceLeft = Math.max(0, frame.x);
+  const sourceTop = Math.max(0, frame.y);
+  const sourceRight = Math.min(state.artwork.width, frame.x + frame.width);
+  const sourceBottom = Math.min(state.artwork.height, frame.y + frame.height);
+  const sourceWidth = sourceRight - sourceLeft;
+  const sourceHeight = sourceBottom - sourceTop;
+  if (sourceWidth <= 0 || sourceHeight <= 0) {
+    throw new Error("The artwork frame does not intersect the canvas.");
+  }
+
+  const scaleX = GENERATION_FRAME_SIZE / frame.width;
+  const scaleY = GENERATION_FRAME_SIZE / frame.height;
+  const destinationLeft = Math.round((sourceLeft - frame.x) * scaleX);
+  const destinationTop = Math.round((sourceTop - frame.y) * scaleY);
+  const destinationRight = Math.round((sourceRight - frame.x) * scaleX);
+  const destinationBottom = Math.round((sourceBottom - frame.y) * scaleY);
+  const destinationWidth = destinationRight - destinationLeft;
+  const destinationHeight = destinationBottom - destinationTop;
+
   sourceContext.drawImage(
     composite,
-    frame.x,
-    frame.y,
-    frame.width,
-    frame.height,
+    sourceLeft,
+    sourceTop,
+    sourceWidth,
+    sourceHeight,
+    destinationLeft,
+    destinationTop,
+    destinationWidth,
+    destinationHeight,
+  );
+
+  // Keep edge-aligned edit regions centered in the provider frame. Any virtual
+  // context outside the 2048px artwork repeats the nearest canvas pixels rather
+  // than becoming transparent, so the image model sees continuous surroundings.
+  if (destinationLeft > 0) {
+    sourceContext.drawImage(
+      composite,
+      sourceLeft,
+      sourceTop,
+      1,
+      sourceHeight,
+      0,
+      destinationTop,
+      destinationLeft,
+      destinationHeight,
+    );
+  }
+  if (destinationRight < GENERATION_FRAME_SIZE) {
+    sourceContext.drawImage(
+      composite,
+      sourceRight - 1,
+      sourceTop,
+      1,
+      sourceHeight,
+      destinationRight,
+      destinationTop,
+      GENERATION_FRAME_SIZE - destinationRight,
+      destinationHeight,
+    );
+  }
+  if (destinationTop > 0) {
+    sourceContext.drawImage(
+      composite,
+      sourceLeft,
+      sourceTop,
+      sourceWidth,
+      1,
+      destinationLeft,
+      0,
+      destinationWidth,
+      destinationTop,
+    );
+  }
+  if (destinationBottom < GENERATION_FRAME_SIZE) {
+    sourceContext.drawImage(
+      composite,
+      sourceLeft,
+      sourceBottom - 1,
+      sourceWidth,
+      1,
+      destinationLeft,
+      destinationBottom,
+      destinationWidth,
+      GENERATION_FRAME_SIZE - destinationBottom,
+    );
+  }
+
+  const fillCorner = (
+    sourceX: number,
+    sourceY: number,
+    destinationX: number,
+    destinationY: number,
+    width: number,
+    height: number,
+  ) => {
+    if (width <= 0 || height <= 0) return;
+    sourceContext.drawImage(
+      composite,
+      sourceX,
+      sourceY,
+      1,
+      1,
+      destinationX,
+      destinationY,
+      width,
+      height,
+    );
+  };
+  fillCorner(sourceLeft, sourceTop, 0, 0, destinationLeft, destinationTop);
+  fillCorner(
+    sourceRight - 1,
+    sourceTop,
+    destinationRight,
     0,
+    GENERATION_FRAME_SIZE - destinationRight,
+    destinationTop,
+  );
+  fillCorner(
+    sourceLeft,
+    sourceBottom - 1,
     0,
-    GENERATION_FRAME_SIZE,
-    GENERATION_FRAME_SIZE,
+    destinationBottom,
+    destinationLeft,
+    GENERATION_FRAME_SIZE - destinationBottom,
+  );
+  fillCorner(
+    sourceRight - 1,
+    sourceBottom - 1,
+    destinationRight,
+    destinationBottom,
+    GENERATION_FRAME_SIZE - destinationRight,
+    GENERATION_FRAME_SIZE - destinationBottom,
   );
   return canvasBlob(source, "The artwork frame could not be encoded.");
 }
