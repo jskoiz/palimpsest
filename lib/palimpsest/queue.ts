@@ -537,6 +537,9 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
       job.prompt,
       Boolean(job.referenceBlobId),
     );
+    const region = jobRegion(job);
+    const frame = jobFrame(job);
+    const editableRegion = regionInGenerationFrame(region, frame);
     await updateStage(env, job, "moderating", "generating");
     let patch = await generateOpenAiPatch(
       env,
@@ -558,6 +561,7 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
           patch.bytes,
           referenceBytes,
           patch.providerMaskBytes,
+          editableRegion,
         );
         console.info(`[palimpsest:${job.id}] reference edit review`, {
           attempt: attempt + 1,
@@ -586,9 +590,6 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
         );
       }
     } else {
-      const region = jobRegion(job);
-      const frame = jobFrame(job);
-      const editableRegion = regionInGenerationFrame(region, frame);
       for (let attempt = 0; attempt < MAX_GENERAL_EDIT_ATTEMPTS; attempt += 1) {
         await updateStage(env, job, "generating", "generating");
         const review = await reviewEditOutput(
@@ -1015,6 +1016,7 @@ async function reviewReferenceEdit(
   generatedBytes: Uint8Array,
   referenceBytes: Uint8Array,
   providerMaskBytes: Uint8Array,
+  editableRegion: GlobalRegion,
 ) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), EDIT_REVIEW_TIMEOUT_MS);
@@ -1032,6 +1034,7 @@ async function reviewReferenceEdit(
         generatedImageUrl: imageDataUrl(generatedBytes),
         referenceImageUrl: imageDataUrl(referenceBytes),
         providerMaskUrl: imageDataUrl(providerMaskBytes),
+        editableRegion,
       })),
       signal: controller.signal,
     });

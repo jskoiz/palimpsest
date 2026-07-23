@@ -447,6 +447,7 @@ test("reference generations receive structured fidelity and blending review", ()
     generatedImageUrl: "data:image/png;base64,generated",
     referenceImageUrl: "data:image/png;base64,reference",
     providerMaskUrl: "data:image/png;base64,mask",
+    editableRegion: { x: 120, y: 220, width: 320, height: 400 },
   });
   assert.equal(request.model, "gpt-5.6");
   assert.equal(request.store, false);
@@ -460,6 +461,10 @@ test("reference generations receive structured fidelity and blending review", ()
   assert.match(request.instructions, /no visible rectangular patch/i);
   assert.match(request.input[0].content[0].text, /visually faithful/i);
   assert.match(request.input[0].content[0].text, /naturally blended/i);
+  assert.match(
+    request.input[0].content[0].text,
+    /x=120, y=220, width=320, height=400; its right edge is x=440 and bottom edge is y=620/i,
+  );
   assert.deepEqual(request.text.format.schema.required, [
     "contained",
     "faithful",
