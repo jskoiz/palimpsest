@@ -572,7 +572,7 @@ test("live generation uses one image pass with one bounded reference containment
   assert.match(clientSource, /const normalized = await normalizeReferenceImage\(file\)/);
   assert.match(clientSource, /referenceSafeEditRegion/);
   assert.match(clientSource, /REFERENCE_EDIT_MIN_EDGE/);
-  assert.match(clientSource, /centered preview is the exact placement area/);
+  assert.match(clientSource, /drag the outer patch to position the exact preview/);
   assert.match(clientSource, /sourceBlob: file/);
   assert.match(clientSource, /REFERENCE_IMAGE_SIZE \/ image\.width/);
   assert.match(clientSource, /flattenArtworkFrame\(editBase\.state, frame\)/);
@@ -813,6 +813,24 @@ test("collaboration UI never silently relocates a selected patch", async () => {
   assert.doesNotMatch(source, /patch moved to open space/);
   assert.match(source, /your patch stayed exactly where you placed it/);
   assert.match(source, /!conflictingRegion/);
+});
+
+test("reference preview remains movable during the prompt step", async () => {
+  const source = await readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8");
+
+  assert.match(
+    source,
+    /const patchCanMove =\s*!submitted && \(step === 1 \|\| \(step === 3 && Boolean\(referenceImage\)\)\)/,
+  );
+  assert.match(source, /referenceActive: Boolean\(referenceImage\)/);
+  assert.match(
+    source,
+    /current\.step === 1 \|\| \(current\.step === 3 && current\.referenceActive\)/,
+  );
+  assert.match(source, /if \(!patchCanMove\) return/);
+  assert.match(source, /tabIndex=\{patchCanMove \? 0 : -1\}/);
+  assert.match(source, /Drag to reposition the exact preview/);
+  assert.match(source, /drag to position · exact preview/);
 });
 
 test("adaptive generation frames give small edits a high-resolution working crop", () => {

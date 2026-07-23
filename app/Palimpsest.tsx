@@ -1075,6 +1075,8 @@ export default function Palimpsest() {
     historyOpen && !queueOpen && !editOpen && !welcomeOpen && revisions.length > 0;
   const notCurrent = Boolean(selectedRevision && history && selectedRevision.id !== history.headRevisionId);
   const validMask = fillMask || strokes.length > 0;
+  const patchCanMove =
+    !submitted && (step === 1 || (step === 3 && Boolean(referenceImage)));
   const patchMinimumEdge = referenceImage
     ? REFERENCE_EDIT_MIN_EDGE
     : EDIT_REGION_MIN_EDGE;
@@ -1112,6 +1114,7 @@ export default function Palimpsest() {
     editOpen,
     step,
     submitted,
+    referenceActive: Boolean(referenceImage),
     jobActive,
     history,
     currentState,
@@ -1130,6 +1133,7 @@ export default function Palimpsest() {
       editOpen,
       step,
       submitted,
+      referenceActive: Boolean(referenceImage),
       jobActive,
       history,
       currentState,
@@ -1893,7 +1897,9 @@ export default function Palimpsest() {
             break;
           }
           if (current.editOpen) {
-            if (current.step === 1 && !current.submitted) {
+            const canMovePatch =
+              current.step === 1 || (current.step === 3 && current.referenceActive);
+            if (canMovePatch && !current.submitted) {
               const amount = event.shiftKey ? 32 : 8;
               const deltas: Record<string, [number, number]> = {
                 ArrowLeft: [-amount, 0],
@@ -2110,7 +2116,7 @@ export default function Palimpsest() {
   };
 
   const patchDown = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (step !== 1 || submitted) return;
+    if (!patchCanMove) return;
     if (event.pointerType === "mouse" && event.button !== 0) return;
     if ((event.target as HTMLElement).closest("[data-patch-resize]")) return;
     const point = artworkPoint(event);
@@ -2326,8 +2332,8 @@ export default function Palimpsest() {
       });
       showToast(
         expanded
-          ? `Reference context expanded to ${safeRegion.width} × ${safeRegion.height}; the centered preview is the exact placement area.`
-          : "Reference placement ready — the centered preview is the exact visible area.",
+          ? `Reference context expanded to ${safeRegion.width} × ${safeRegion.height}; drag the outer patch to position the exact preview.`
+          : "Reference placement ready — drag the outer patch to position the exact preview.",
       );
     } catch (error) {
       event.currentTarget.value = "";
@@ -2670,12 +2676,16 @@ export default function Palimpsest() {
             </div>
             {editOpen ? (
               <div
-                className={`mono-patch${step === 1 && !submitted ? " is-draggable" : " is-set"}${step === 2 && !submitted ? " is-masking" : ""}${conflictingRegion ? " is-unavailable" : ""}`}
+                className={`mono-patch${patchCanMove ? " is-draggable" : " is-set"}${step === 2 && !submitted ? " is-masking" : ""}${conflictingRegion ? " is-unavailable" : ""}`}
                 style={patchStyle}
                 data-testid="edit-patch"
                 role="group"
-                tabIndex={step === 1 && !submitted ? 0 : -1}
-                aria-label={`Selected edit patch, ${editRegion.width} by ${editRegion.height} pixels. Drag to move it, pull the lower-right corner to resize it, or use the arrow keys to nudge it.`}
+                tabIndex={patchCanMove ? 0 : -1}
+                aria-label={
+                  step === 3 && referenceImage && !submitted
+                    ? `Selected reference placement patch, ${editRegion.width} by ${editRegion.height} pixels. Drag to reposition the exact preview, or use the arrow keys to nudge it.`
+                    : `Selected edit patch, ${editRegion.width} by ${editRegion.height} pixels. Drag to move it, pull the lower-right corner to resize it, or use the arrow keys to nudge it.`
+                }
                 aria-describedby={conflictingRegion ? "overlap-note" : undefined}
                 onPointerDown={patchDown}
                 onPointerMove={patchMove}
@@ -2711,7 +2721,7 @@ export default function Palimpsest() {
                     >
                       <img src={referenceImage.previewUrl} alt="" />
                     </div>
-                    <span>exact placement · prior art protected</span>
+                    <span>drag to position · exact preview</span>
                   </div>
                 ) : null}
                 {step >= 2 && !submitted ? (
