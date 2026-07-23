@@ -11,7 +11,7 @@ Multiple people can work at once. A live reservation locks only the region curre
 1. **Place** a free-position patch anywhere on the 2048×2048 artwork.
 2. **Mask** the pixels that may change, or choose the entire patch.
 3. **Describe** the edit and optionally attach a PNG, JPEG, or WebP reference.
-4. **Render and review.** GPT Image edits the current masked context frame. A reference uses the centered preview as its exact placement mask while the surrounding patch remains protected context; the original upload and unmodified source frame are retained for an independent fidelity, placement, and preservation review.
+4. **Render and review.** GPT Image edits the current masked context frame. A positioned reference preview is supplied as a second visual input, and the original source frame is retained for an independent fidelity, preview-alignment, blending, and preservation review.
 5. **Remember.** The accepted patch is appended as a new revision. The timeline can scrub, compare, replay, share, and restore earlier states without erasing history.
 
 ## Why it is different
@@ -23,7 +23,7 @@ Multiple people can work at once. A live reservation locks only the region curre
 
 ## OpenAI in the product
 
-- **GPT-5.6 (`gpt-5.6`)** reviews generated subjects for framing and blending. Reference placements additionally require fidelity, preview-scale alignment, and preservation of uncovered prior artwork.
+- **GPT-5.6 (`gpt-5.6`)** reviews generated subjects for framing and blending. Reference-guided edits additionally require fidelity, preview-scale alignment, and preservation of uncovered prior artwork.
 - **GPT Image (`gpt-image-2`)** performs the masked image edit on a 1024×1024 crop of the current canvas. Reference subjects are already positioned in that input at the exact on-canvas footprint.
 - **OpenAI Moderation (`omni-moderation-latest`)** checks the contributor's original request before planning or generation.
 

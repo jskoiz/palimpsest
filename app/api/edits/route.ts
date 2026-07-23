@@ -12,8 +12,8 @@ import {
   readPngDimensions,
 } from "@/lib/palimpsest/runtime";
 import {
-  MAX_PLACEMENT_PNG_BYTES,
-  validatePlacementPng,
+  MAX_REFERENCE_PNG_BYTES,
+  validateReferencePng,
 } from "@/lib/palimpsest/png.mjs";
 import { contributionRatePolicy } from "@/lib/palimpsest/rate-policy.mjs";
 import {
@@ -60,7 +60,7 @@ export async function POST(request: Request) {
     }
 
     const form = await request.formData();
-    const allowedFields = new Set(["meta", "source", "mask", "placement"]);
+    const allowedFields = new Set(["meta", "source", "mask", "reference"]);
     if ([...form.keys()].some((name) => !allowedFields.has(name))) {
       throw new DomainError(
         "INVALID_REQUEST",
@@ -70,12 +70,12 @@ export async function POST(request: Request) {
     const metaValues = form.getAll("meta");
     const sourceValues = form.getAll("source");
     const maskValues = form.getAll("mask");
-    const placementValues = form.getAll("placement");
+    const referenceValues = form.getAll("reference");
     if (
       metaValues.length !== 1 ||
-      sourceValues.length > 1 ||
-      maskValues.length > 1 ||
-      placementValues.length > 1
+      sourceValues.length !== 1 ||
+      maskValues.length !== 1 ||
+      referenceValues.length > 1
     ) {
       throw new DomainError(
         "INVALID_REQUEST",
@@ -83,13 +83,13 @@ export async function POST(request: Request) {
       );
     }
     const metaValue = metaValues[0];
-    const sourceValue = sourceValues[0] ?? null;
-    const maskValue = maskValues[0] ?? null;
-    const placementValue = placementValues[0] ?? null;
+    const sourceValue = sourceValues[0];
+    const maskValue = maskValues[0];
+    const referenceValue = referenceValues[0] ?? null;
     if (typeof metaValue !== "string") {
       throw new DomainError("INVALID_REQUEST", "Edit metadata is required.");
     }
-    for (const value of [sourceValue, maskValue, placementValue]) {
+    for (const value of [sourceValue, maskValue, referenceValue]) {
       if (value !== null && !(value instanceof File)) {
         throw new DomainError(
           "INVALID_REQUEST",
@@ -97,17 +97,10 @@ export async function POST(request: Request) {
         );
       }
     }
-    const hasPromptInputs =
-      sourceValue instanceof File && maskValue instanceof File;
-    const hasPlacement = placementValue instanceof File;
-    if (
-      hasPlacement
-        ? sourceValue !== null || maskValue !== null
-        : !hasPromptInputs
-    ) {
+    if (!(sourceValue instanceof File) || !(maskValue instanceof File)) {
       throw new DomainError(
         "INVALID_REQUEST",
-        "Submit exactly one placement PNG, or one source PNG with one mask PNG.",
+        "Submit exactly one source PNG and one mask PNG.",
       );
     }
     if (!env.OPENAI_API_KEY?.trim()) {
@@ -116,23 +109,22 @@ export async function POST(request: Request) {
         "Safety-checked image editing is temporarily unavailable.",
       );
     }
-    if (hasPlacement && placementValue.type !== "image/png") {
-      throw new DomainError("INVALID_REQUEST", "The placement must be a PNG file.");
-    }
-    if (
-      hasPromptInputs &&
-      (sourceValue.type !== "image/png" || maskValue.type !== "image/png")
-    ) {
+    if (sourceValue.type !== "image/png" || maskValue.type !== "image/png") {
       throw new DomainError("INVALID_MASK", "Source and mask files must be PNG images.");
     }
+    if (referenceValue instanceof File && referenceValue.type !== "image/png") {
+      throw new DomainError("INVALID_REQUEST", "The reference must be a PNG file.");
+    }
     if (
-      hasPromptInputs &&
       (sourceValue.size > 8 * 1024 * 1024 || maskValue.size > 2 * 1024 * 1024)
     ) {
       throw new DomainError("PAYLOAD_TOO_LARGE", "The source frame or mask is too large.");
     }
-    if (hasPlacement && placementValue.size > MAX_PLACEMENT_PNG_BYTES) {
-      throw new DomainError("PAYLOAD_TOO_LARGE", "The placement image is too large.");
+    if (
+      referenceValue instanceof File &&
+      referenceValue.size > MAX_REFERENCE_PNG_BYTES
+    ) {
+      throw new DomainError("PAYLOAD_TOO_LARGE", "The reference image is too large.");
     }
 
     let meta: EditMeta;
@@ -166,20 +158,18 @@ export async function POST(request: Request) {
     }
     const validated = validateRegion({
       region: meta.region,
-      fill: hasPlacement ? true : meta.fill,
-      strokes: hasPlacement ? [] : meta.strokes,
+      fill: meta.fill,
+      strokes: meta.strokes,
     });
-    let sourceBytes: Uint8Array | undefined;
-    let maskBytes: Uint8Array | undefined;
-    let placementBytes: Uint8Array | undefined;
-    if (hasPlacement) {
-      placementBytes = new Uint8Array(await placementValue.arrayBuffer());
-      await validatePlacementPng(placementBytes);
-    } else if (hasPromptInputs) {
-      [sourceBytes, maskBytes] = await Promise.all([
-        sourceValue.arrayBuffer().then((value) => new Uint8Array(value)),
-        maskValue.arrayBuffer().then((value) => new Uint8Array(value)),
-      ]);
+    const [sourceBytes, maskBytes, referenceBytes] = await Promise.all([
+      sourceValue.arrayBuffer().then((value) => new Uint8Array(value)),
+      maskValue.arrayBuffer().then((value) => new Uint8Array(value)),
+      referenceValue instanceof File
+        ? referenceValue.arrayBuffer().then((value) => new Uint8Array(value))
+        : Promise.resolve(undefined),
+    ]);
+    if (referenceBytes) {
+      await validateReferencePng(referenceBytes);
     }
     for (const bytes of [sourceBytes, maskBytes]) {
       if (!bytes) continue;
@@ -202,14 +192,14 @@ export async function POST(request: Request) {
       requesterHash: hash,
       sourceBytes,
       maskBytes,
-      placementBytes,
+      referenceBytes,
       rateLimits: ratePolicy.limits,
       requestId,
       retryToken,
     });
     console.info(`[palimpsest:${requestId}] contribution accepted`, {
       kind: "edit",
-      mode: hasPlacement ? "placement" : "openai",
+      mode: referenceBytes ? "openai-reference" : "openai",
       ratePolicy: ratePolicy.name,
     });
     return Response.json(

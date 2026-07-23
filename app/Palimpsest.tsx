@@ -102,7 +102,6 @@ type HistoryPayload = {
   headRevisionId: string;
   editing: {
     generationAvailable: boolean;
-    placementAvailable: boolean;
   };
 };
 
@@ -216,6 +215,7 @@ const DEFAULT_REGION = { x: 800, y: 832, width: 448, height: 384 };
 const WELCOME_STORAGE_KEY = "palimpsest:welcome:v1";
 const RETRY_CAPABILITIES_STORAGE_KEY = "palimpsest:retry-capabilities:v1";
 const REFERENCE_IMAGE_SIZE = 1024;
+const REFERENCE_PREVIEW_FILL = 0.72;
 const REFERENCE_DECODE_MAX_EDGE = 1536;
 const REFERENCE_MAX_ASPECT_RATIO = 8;
 const MAX_REFERENCE_UPLOAD_BYTES = 10 * 1024 * 1024;
@@ -251,6 +251,17 @@ function regionStyle(region: Region): CSSProperties {
     top: `${(region.y / ARTWORK_SIZE) * 100}%`,
     width: `${(region.width / ARTWORK_SIZE) * 100}%`,
     height: `${(region.height / ARTWORK_SIZE) * 100}%`,
+  };
+}
+
+function referencePreviewStyle(): CSSProperties {
+  const offset = ((1 - REFERENCE_PREVIEW_FILL) / 2) * 100;
+  return {
+    position: "absolute",
+    width: `${REFERENCE_PREVIEW_FILL * 100}%`,
+    height: `${REFERENCE_PREVIEW_FILL * 100}%`,
+    left: `${offset}%`,
+    top: `${offset}%`,
   };
 }
 
@@ -639,9 +650,10 @@ function WelcomeDrawer({
                   Place and resize the patch, then paint what may change. GPT Image
                   makes one masked image pass; GPT-5.6 checks it once before acceptance.
                   Each submission is time-bounded and never silently replays a second generation.
-                  Uploaded images skip generation and review: the transparent preview is
-                  placed exactly as shown, while every uncovered canvas pixel remains
-                  protected. Live outlines lock only active work.
+                  Uploaded images become positioned visual references for the same
+                  generation and review path, so GPT Image can preserve their identity
+                  while blending them into the surrounding canvas. Live outlines lock
+                  only active work.
                 </p>
               </section>
             </div>
@@ -783,7 +795,7 @@ async function normalizeReferenceImage(
   }
 }
 
-async function referencePlacementLayer(
+async function referenceGuideLayer(
   reference: Blob,
   region: Region,
   frame: Region,
@@ -792,25 +804,27 @@ async function referencePlacementLayer(
   try {
     image = await createImageBitmap(reference);
   } catch {
-    throw new Error("The prepared reference could not be placed.");
+    throw new Error("The prepared reference guide could not be opened.");
   }
   try {
     const canvas = document.createElement("canvas");
     canvas.width = REFERENCE_IMAGE_SIZE;
     canvas.height = REFERENCE_IMAGE_SIZE;
     const context = canvas.getContext("2d");
-    if (!context) throw new Error("This browser cannot place reference images.");
+    if (!context) throw new Error("This browser cannot prepare reference guides.");
     context.imageSmoothingEnabled = true;
     context.imageSmoothingQuality = "high";
-    const placement = maskInGenerationFrame(region, [], frame).region;
+    const editableArea = maskInGenerationFrame(region, [], frame).region;
+    const width = Math.max(1, Math.round(editableArea.width * REFERENCE_PREVIEW_FILL));
+    const height = Math.max(1, Math.round(editableArea.height * REFERENCE_PREVIEW_FILL));
     context.drawImage(
       image,
-      placement.x,
-      placement.y,
-      placement.width,
-      placement.height,
+      editableArea.x + Math.round((editableArea.width - width) / 2),
+      editableArea.y + Math.round((editableArea.height - height) / 2),
+      width,
+      height,
     );
-    return canvasBlob(canvas, "The exact reference placement could not be encoded.");
+    return canvasBlob(canvas, "The positioned reference guide could not be encoded.");
   } finally {
     image.close();
   }
@@ -1172,10 +1186,7 @@ export default function Palimpsest() {
     activity.queue.queued > 0 ||
     activity.activeRegions.some((active) => !active.reservationActive);
   const generationAvailable = Boolean(history?.editing.generationAvailable);
-  const placementAvailable = Boolean(history?.editing.placementAvailable);
-  const requestedModeAvailable = referenceImage
-    ? placementAvailable
-    : generationAvailable;
+  const requestedModeAvailable = generationAvailable;
   const canPanCanvas = canvasViewCanPan(view, viewport.width, viewport.height);
   const otherActiveRegions = activity.activeRegions.filter(
     (active) => active.jobId !== pendingEdit?.jobId,
@@ -1882,7 +1893,7 @@ export default function Palimpsest() {
   const openEditor = useCallback(async () => {
     const initial = latest.current;
     if (!initial.history || !initial.currentState || initial.jobActive) return;
-    if (!initial.history.editing.placementAvailable) {
+    if (!initial.history.editing.generationAvailable) {
       showToast("image contributions are temporarily unavailable");
       return;
     }
@@ -2449,8 +2460,8 @@ export default function Palimpsest() {
       });
       showToast(
         normalized.backgroundRemoved
-          ? "Background removed — drag or resize the exact image before placing it."
-          : "Exact image ready — drag or resize it before placing it.",
+          ? "Background removed — position the reference preview for GPT Image to blend."
+          : "Reference preview ready — position it for GPT Image to blend.",
       );
     } catch (error) {
       event.currentTarget.value = "";
@@ -2509,23 +2520,19 @@ export default function Palimpsest() {
         ? localSubmissionFailure.retryToken
         : crypto.randomUUID();
     try {
-      const placement =
+      const [source, mask, reference] = await Promise.all([
+        flattenArtworkFrame(editBase.state, frame),
+        providerMask(editRegion, frame, strokes, fillMask),
         referenceImage && activeReferenceBlob
-          ? await referencePlacementLayer(activeReferenceBlob, editRegion, frame)
-          : null;
-      const generationInputs = placement
-        ? null
-        : await Promise.all([
-            flattenArtworkFrame(editBase.state, frame),
-            providerMask(editRegion, frame, strokes, fillMask),
-          ]);
+          ? referenceGuideLayer(activeReferenceBlob, editRegion, frame)
+          : Promise.resolve(null),
+      ]);
       const form = new FormData();
       form.append("meta", JSON.stringify(meta));
-      if (placement) {
-        form.append("placement", placement, "placement.png");
-      } else if (generationInputs) {
-        form.append("source", generationInputs[0], "source.png");
-        form.append("mask", generationInputs[1], "mask.png");
+      form.append("source", source, "source.png");
+      form.append("mask", mask, "mask.png");
+      if (reference) {
+        form.append("reference", reference, "reference.png");
       }
       const payload = await fetchJson<{ job: Job }>("/api/edits", {
         method: "POST",
@@ -2671,14 +2678,12 @@ export default function Palimpsest() {
       ? "preparing…"
       : jobActive
         ? referenceImage
-          ? "placing image…"
+          ? "blending reference…"
           : "your edit is making…"
         : !requestedModeAvailable
-          ? referenceImage
-            ? "image placement unavailable"
-            : "live AI unavailable"
+          ? "live AI unavailable"
           : referenceImage
-            ? "place image →"
+            ? "blend reference →"
             : "generate live →";
 
   return (
@@ -2807,7 +2812,7 @@ export default function Palimpsest() {
                 tabIndex={patchCanMove ? 0 : -1}
                 aria-label={
                   step === 3 && referenceImage && !submitted
-                    ? `${referenceImage.fileName}, exact image placement at ${editRegion.x}, ${editRegion.y}, ${editRegion.width} by ${editRegion.height} pixels. Drag to move, pull the lower-right corner to resize, or use the arrow keys to nudge it.`
+                    ? `${referenceImage.fileName}, reference preview at ${editRegion.x}, ${editRegion.y}, ${editRegion.width} by ${editRegion.height} pixels. GPT Image will blend the generated result into this area. Drag to move, pull the lower-right corner to resize, or use the arrow keys to nudge it.`
                     : `Selected edit patch, ${editRegion.width} by ${editRegion.height} pixels. Drag to move it, pull the lower-right corner to resize it, or use the arrow keys to nudge it.`
                 }
                 aria-describedby={conflictingRegion ? "overlap-note" : undefined}
@@ -2841,10 +2846,13 @@ export default function Palimpsest() {
                 ) : null}
                 {referenceImage && step === 3 && !submitted ? (
                   <div className="mono-reference-on-canvas" aria-hidden="true">
-                    <div className="mono-reference-safe-zone">
+                    <div
+                      className="mono-reference-safe-zone"
+                      style={referencePreviewStyle()}
+                    >
                       <img src={activeReferencePreviewUrl ?? ""} alt="" />
                     </div>
-                    <span>exact pixels · drag or resize</span>
+                    <span>reference preview · drag or resize</span>
                   </div>
                 ) : null}
                 {step >= 2 && !submitted && !(step === 3 && referenceImage) ? (
@@ -2950,11 +2958,11 @@ export default function Palimpsest() {
           aria-label={
             jobActive
               ? "Your contribution is still being made"
-              : placementAvailable
+              : generationAvailable
                 ? "Contribute an image or live AI edit"
                 : "Image contributions are temporarily unavailable"
           }
-          disabled={jobActive || !placementAvailable}
+          disabled={jobActive || !generationAvailable}
           onClick={openEditor}
         >
           contribute
@@ -3340,7 +3348,7 @@ export default function Palimpsest() {
                   referenceInputRef.current.click();
                 }}
               >
-                {isPreparing ? "preparing…" : "place an image →"}
+                {isPreparing ? "preparing…" : "reference an image →"}
               </button>
               <button
                 type="button"
@@ -3475,7 +3483,7 @@ export default function Palimpsest() {
                 maxLength={500}
                 placeholder={
                   referenceImage
-                    ? "describe this placement for history…"
+                    ? "describe how GPT Image should blend this reference…"
                     : "describe the change…"
                 }
                 aria-label="Describe the change"
