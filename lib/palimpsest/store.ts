@@ -10,8 +10,10 @@ import {
 } from "./domain.mjs";
 import {
   generationFrameForRegion,
-  regionRelativeToFrame,
+  maskInGenerationFrame,
 } from "./geometry.mjs";
+import { isRetryableD1Reset, retryIdempotentD1 } from "./d1.mjs";
+import { serializeRecentJobPayload } from "./activity.mjs";
 import type { AppEnv } from "./runtime";
 import { publicJobMessage, sha256Hex } from "./runtime";
 
@@ -48,9 +50,11 @@ const seedRevisions: SeedRevision[] = [
 ];
 
 export async function ensurePalimpsest(env: AppEnv, requestUrl: string): Promise<void> {
-  const existing = await env.DB.prepare("SELECT id FROM artworks WHERE id = ?")
-    .bind(ARTWORK_ID)
-    .first();
+  const existing = await runIdempotentD1(() =>
+    env.DB.prepare("SELECT id FROM artworks WHERE id = ?")
+      .bind(ARTWORK_ID)
+      .first(),
+  );
   if (existing) return;
 
   const origin = new URL(requestUrl).origin;
@@ -162,7 +166,7 @@ export async function ensurePalimpsest(env: AppEnv, requestUrl: string): Promise
     ).bind(ARTWORK_ID),
   );
 
-  await env.DB.batch(statements);
+  await runIdempotentD1(() => env.DB.batch(statements));
 }
 
 type RevisionRow = {
@@ -218,7 +222,7 @@ export async function listHistory(env: AppEnv, requestUrl: string) {
     revisions,
     headRevisionId: head?.id ?? null,
     editing: {
-      available: Boolean(env.OPENAI_API_KEY?.trim()),
+      generationAvailable: Boolean(env.OPENAI_API_KEY?.trim()),
     },
   };
 }
@@ -346,6 +350,17 @@ type ActiveRegionRow = {
   updatedAt: number;
 };
 
+type RecentJobRow = ActiveRegionRow & {
+  kind: string;
+  prompt: string;
+  errorCode: string | null;
+  publicErrorMessage: string | null;
+  startedAt: number | null;
+  completedAt: number | null;
+  retryable: number;
+  requestId: string | null;
+};
+
 function serializeActiveRegion(row: ActiveRegionRow) {
   return {
     jobId: row.jobId,
@@ -391,29 +406,100 @@ export async function getActiveRegions(env: AppEnv, now = Date.now()) {
   return rows.results.map(serializeActiveRegion);
 }
 
+export const RECENT_JOBS_SQL = `SELECT
+  j.id AS jobId,
+  j.kind AS kind,
+  a.display_name AS author,
+  j.state AS state,
+  j.prompt AS prompt,
+  j.region_x AS regionX,
+  j.region_y AS regionY,
+  j.region_width AS regionWidth,
+  j.region_height AS regionHeight,
+  CASE
+    WHEN j.state IN ('queued', 'moderating', 'generating', 'committing')
+      AND j.lease_expires_at > ? THEN 1
+    ELSE 0
+  END AS reservationActive,
+  j.error_code AS errorCode,
+  j.public_error_message AS publicErrorMessage,
+  j.created_at AS createdAt,
+  j.updated_at AS updatedAt,
+  j.started_at AS startedAt,
+  j.completed_at AS completedAt,
+  j.request_id AS requestId,
+  CASE WHEN
+    j.kind = 'edit'
+    AND j.state = 'failed'
+    AND (
+      j.error_code IN (
+        'PROVIDER_TEMPORARY',
+        'SUBJECT_OUT_OF_FRAME',
+        'REFERENCE_REVIEW_FAILED'
+      )
+      OR (j.error_code = 'QUEUE_LEASE_EXPIRED' AND j.started_at IS NULL)
+    )
+    AND j.display_mask_blob_id IS NOT NULL
+    AND EXISTS (SELECT 1 FROM blobs display WHERE display.id = j.display_mask_blob_id)
+    AND j.execution_mode = 'openai'
+    AND j.source_blob_id IS NOT NULL
+    AND j.mask_blob_id IS NOT NULL
+    AND EXISTS (SELECT 1 FROM blobs source WHERE source.id = j.source_blob_id)
+    AND EXISTS (SELECT 1 FROM blobs mask WHERE mask.id = j.mask_blob_id)
+    AND (
+      j.reference_blob_id IS NULL
+      OR EXISTS (SELECT 1 FROM blobs reference WHERE reference.id = j.reference_blob_id)
+    )
+    AND NOT EXISTS (SELECT 1 FROM edit_jobs retry WHERE retry.retry_of_job_id = j.id)
+    THEN 1 ELSE 0
+  END AS retryable
+FROM edit_jobs j
+JOIN authors a ON a.id = j.author_id
+WHERE j.artwork_id = ?
+  AND (
+    j.state IN ('queued', 'moderating', 'generating', 'committing')
+    OR j.id IN (
+      SELECT terminal.id
+      FROM edit_jobs terminal
+      WHERE terminal.artwork_id = ?
+        AND terminal.state IN ('succeeded', 'stale', 'rejected', 'failed')
+      ORDER BY terminal.created_at DESC, terminal.id DESC
+      LIMIT 24
+    )
+  )
+ORDER BY j.created_at DESC, j.id DESC
+`;
+
+function serializeRecentJob(row: RecentJobRow) {
+  return serializeRecentJobPayload(row);
+}
+
 export async function getActivity(env: AppEnv, requestUrl: string) {
   await ensurePalimpsest(env, requestUrl);
   const now = Date.now();
-  const [counts, activeRegions] = await Promise.all([
+  const results = await runIdempotentD1(() => env.DB.batch([
     env.DB.prepare(
       `SELECT
          SUM(CASE WHEN state = 'queued' AND lease_expires_at > ? THEN 1 ELSE 0 END) AS queued,
          SUM(CASE WHEN state IN ('moderating','generating','committing') AND lease_expires_at > ? THEN 1 ELSE 0 END) AS active
        FROM edit_jobs WHERE artwork_id = ?`,
     )
-      .bind(now, now, ARTWORK_ID)
-      .first<{ queued: number | null; active: number | null }>(),
-    getActiveRegions(env, now),
-  ]);
-  const recent = await env.DB.prepare(
-    `${revisionSelect} WHERE r.artwork_id = ? ORDER BY r.sequence DESC LIMIT 8`,
-  )
-    .bind(ARTWORK_ID)
-    .all<RevisionRow>();
+      .bind(now, now, ARTWORK_ID),
+    env.DB.prepare(ACTIVE_REGIONS_SQL).bind(now, ARTWORK_ID),
+    env.DB.prepare(RECENT_JOBS_SQL).bind(now, ARTWORK_ID, ARTWORK_ID),
+    env.DB.prepare(
+      `${revisionSelect} WHERE r.artwork_id = ? ORDER BY r.sequence DESC LIMIT 8`,
+    ).bind(ARTWORK_ID),
+  ]));
+  const counts = firstResult<{ queued: number | null; active: number | null }>(results[0]);
+  const activeRegions = (results[1]?.results ?? []) as unknown as ActiveRegionRow[];
+  const jobs = (results[2]?.results ?? []) as unknown as RecentJobRow[];
+  const recent = (results[3]?.results ?? []) as unknown as RevisionRow[];
   return {
     queue: { queued: Number(counts?.queued ?? 0), active: Number(counts?.active ?? 0) },
-    activeRegions,
-    recent: recent.results.map(serializeRevision),
+    activeRegions: activeRegions.map(serializeActiveRegion),
+    jobs: jobs.map(serializeRecentJob),
+    recent: recent.map(serializeRevision),
   };
 }
 
@@ -449,29 +535,247 @@ export async function requesterHash(env: AppEnv, request: Request): Promise<stri
   return sha256Hex(`${env.RATE_LIMIT_SALT ?? "palimpsest-v1"}:${address}`);
 }
 
-export async function enforceRateLimit(
-  env: AppEnv,
-  hash: string,
-  scope: string,
-  limit: number,
-  windowMs: number,
-) {
-  const now = Date.now();
-  const windowStart = Math.floor(now / windowMs) * windowMs;
-  const row = await env.DB.prepare(
-    `INSERT INTO rate_windows (requester_hash, scope, window_start, count, updated_at)
-     VALUES (?, ?, ?, 1, ?)
-     ON CONFLICT (requester_hash, scope, window_start)
-     DO UPDATE SET count = count + 1, updated_at = excluded.updated_at
-     RETURNING count`,
-  )
-    .bind(hash, scope, windowStart, now)
-    .first<{ count: number }>();
-  if (Number(row?.count ?? 1) > limit) {
-    throw new DomainError("RATE_LIMITED", "Too many contributions from this connection. Try again later.");
-  }
-  return Math.max(1, Math.ceil((windowStart + windowMs - now) / 1000));
+export const VISITOR_INTERACTION_TYPES = [
+  "guide_opened",
+  "queue_opened",
+  "history_opened",
+  "contribution_opened",
+  "patch_confirmed",
+  "mask_confirmed",
+  "reference_added",
+] as const;
+
+export type VisitorInteractionType = (typeof VISITOR_INTERACTION_TYPES)[number];
+export type VisitorEventType = VisitorInteractionType | "page_view" | "generation_requested" | "restore_requested";
+
+const VISITOR_EVENT_TYPES = new Set<VisitorEventType>([
+  "page_view",
+  "generation_requested",
+  "restore_requested",
+  ...VISITOR_INTERACTION_TYPES,
+]);
+
+type VisitorEventRow = {
+  visitorHash: string;
+  sessionId: string | null;
+  eventType: VisitorEventType;
+  path: string;
+  country: string | null;
+  userAgent: string | null;
+  jobId: string | null;
+  createdAt: number;
+};
+
+const VISITOR_EVENT_DEDUPE_MS = 5_000;
+const VISITOR_EVENT_LIMIT = 120;
+const VISITOR_EVENT_LIMIT_WINDOW_MS = 10 * 60 * 1000;
+const VISITOR_EVENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+function normalizedSessionId(value: string | null | undefined): string | null {
+  if (!value || !/^[A-Za-z0-9_-]{20,128}$/u.test(value)) return null;
+  return value;
 }
+
+function normalizedCountry(value: string | null): string | null {
+  return value && /^[A-Z]{2}$/u.test(value) ? value : null;
+}
+
+function compactUserAgent(value: string | null): string | null {
+  if (!value) return null;
+  return value.replace(/\s+/gu, " ").trim().slice(0, 320) || null;
+}
+
+async function visitorHash(env: AppEnv, request: Request): Promise<string> {
+  const address = request.headers.get("CF-Connecting-IP") ?? "local-preview";
+  const salt = env.VISITOR_LOG_SALT ?? env.RATE_LIMIT_SALT;
+  if (!salt) {
+    throw new DomainError(
+      "SERVICE_UNAVAILABLE",
+      "Visitor logging requires a configured VISITOR_LOG_SALT.",
+    );
+  }
+  return sha256Hex(`${salt}:visitor:${address}`);
+}
+
+export function isVisitorInteractionType(value: unknown): value is VisitorInteractionType {
+  return typeof value === "string" && VISITOR_INTERACTION_TYPES.includes(value as VisitorInteractionType);
+}
+
+export async function recordVisitorEvent(
+  env: AppEnv,
+  request: Request,
+  eventType: VisitorEventType,
+  options: { sessionId?: string | null; jobId?: string | null } = {},
+) {
+  if (!VISITOR_EVENT_TYPES.has(eventType)) {
+    throw new DomainError("INVALID_REQUEST", "That visitor event is not supported.");
+  }
+  const url = new URL(request.url);
+  const now = Date.now();
+  const hash = await visitorHash(env, request);
+  const recent = await env.DB.prepare(
+    `SELECT COUNT(*) AS count
+     FROM visitor_events
+     WHERE visitor_hash = ? AND created_at >= ?`,
+  )
+    .bind(hash, now - VISITOR_EVENT_LIMIT_WINDOW_MS)
+    .first<{ count: number }>();
+  if (Number(recent?.count ?? 0) >= VISITOR_EVENT_LIMIT) {
+    throw new DomainError("RATE_LIMITED", "Too many visitor events. Try again later.");
+  }
+  await env.DB.prepare(
+    `DELETE FROM visitor_events
+     WHERE id IN (
+       SELECT id FROM visitor_events
+       WHERE created_at < ?
+       ORDER BY created_at ASC
+       LIMIT 250
+     )`,
+  )
+    .bind(now - VISITOR_EVENT_RETENTION_MS)
+    .run();
+  await env.DB.prepare(
+    `INSERT INTO visitor_events
+      (id, visitor_hash, session_id, event_type, path, country, user_agent, job_id, created_at)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+     WHERE NOT EXISTS (
+       SELECT 1
+       FROM visitor_events
+       WHERE visitor_hash = ?
+         AND event_type = ?
+         AND path = ?
+         AND COALESCE(session_id, '') = COALESCE(?, '')
+         AND created_at >= ?
+     )`,
+  )
+    .bind(
+      crypto.randomUUID(),
+      hash,
+      normalizedSessionId(options.sessionId),
+      eventType,
+      url.pathname,
+      normalizedCountry(request.headers.get("CF-IPCountry")),
+      compactUserAgent(request.headers.get("User-Agent")),
+      options.jobId ?? null,
+      now,
+      hash,
+      eventType,
+      url.pathname,
+      normalizedSessionId(options.sessionId),
+      now - VISITOR_EVENT_DEDUPE_MS,
+    )
+    .run();
+}
+
+export async function getVisitorActivity(env: AppEnv, limit = 160) {
+  const boundedLimit = Math.max(1, Math.min(250, Math.floor(limit)));
+  const since = Date.now() - 24 * 60 * 60 * 1000;
+  const [summary, events] = await Promise.all([
+    env.DB.prepare(
+      `SELECT
+        COUNT(DISTINCT visitor_hash) AS visitors,
+        SUM(CASE WHEN event_type = 'page_view' THEN 1 ELSE 0 END) AS pageViews,
+        SUM(CASE WHEN event_type = 'generation_requested' THEN 1 ELSE 0 END) AS generations,
+        SUM(CASE WHEN event_type <> 'page_view' THEN 1 ELSE 0 END) AS interactions
+       FROM visitor_events
+       WHERE created_at >= ?`,
+    )
+      .bind(since)
+      .first<{
+        visitors: number | null;
+        pageViews: number | null;
+        generations: number | null;
+        interactions: number | null;
+      }>(),
+    env.DB.prepare(
+      `SELECT
+        visitor_hash AS visitorHash,
+        session_id AS sessionId,
+        event_type AS eventType,
+        path AS path,
+        country AS country,
+        user_agent AS userAgent,
+        job_id AS jobId,
+        created_at AS createdAt
+       FROM visitor_events
+       ORDER BY created_at DESC
+       LIMIT ?`,
+    )
+      .bind(boundedLimit)
+      .all<VisitorEventRow>(),
+  ]);
+
+  return {
+    summary: {
+      visitors: Number(summary?.visitors ?? 0),
+      pageViews: Number(summary?.pageViews ?? 0),
+      generations: Number(summary?.generations ?? 0),
+      interactions: Number(summary?.interactions ?? 0),
+    },
+    events: events.results.map((event) => ({
+      visitor: event.visitorHash.slice(0, 12),
+      session: event.sessionId?.slice(0, 12) ?? null,
+      type: event.eventType,
+      path: event.path,
+      country: event.country,
+      userAgent: event.userAgent,
+      jobId: event.jobId,
+      createdAt: new Date(Number(event.createdAt)).toISOString(),
+    })),
+  };
+}
+
+export type ContributionRateLimit = {
+  scope: string;
+  limit: number;
+  windowMs: number;
+};
+
+type PreparedRateLimit = ContributionRateLimit & { windowStart: number };
+
+function prepareRateLimits(
+  limits: readonly ContributionRateLimit[],
+  expected: readonly ContributionRateLimit[],
+  now: number,
+): { enforced: number; values: PreparedRateLimit[] } {
+  if (limits.length === 0) {
+    return {
+      enforced: 0,
+      values: expected.map((limit) => ({
+        ...limit,
+        windowStart: Math.floor(now / limit.windowMs) * limit.windowMs,
+      })),
+    };
+  }
+  if (
+    limits.length !== expected.length ||
+    expected.some((rule) =>
+      !limits.some(
+        (limit) =>
+          limit.scope === rule.scope &&
+          limit.limit === rule.limit &&
+          limit.windowMs === rule.windowMs,
+      ),
+    )
+  ) {
+    throw new DomainError("INTERNAL_ERROR", "The contribution rate policy is invalid.");
+  }
+  return {
+    enforced: 1,
+    values: expected.map((rule) => ({
+      ...rule,
+      windowStart: Math.floor(now / rule.windowMs) * rule.windowMs,
+    })),
+  };
+}
+
+const EDIT_RATE_RULES = [
+  { scope: "edit-10m", limit: 3, windowMs: 10 * 60 * 1000 },
+  { scope: "edit-day", limit: 12, windowMs: 24 * 60 * 60 * 1000 },
+] as const;
+const REVERT_RATE_RULES = [
+  { scope: "revert-10m", limit: 2, windowMs: 10 * 60 * 1000 },
+] as const;
 
 type InsertEditInput = {
   baseRevisionId: string;
@@ -485,11 +789,21 @@ type InsertEditInput = {
   sourceBytes: Uint8Array;
   maskBytes: Uint8Array;
   referenceBytes?: Uint8Array;
+  rateLimits: readonly ContributionRateLimit[];
+  requestId: string;
+  retryToken: string;
 };
 
 type ExistingIdempotencyRow = {
   id: string;
   requestFingerprint: string;
+  state: string;
+  availableAt: number;
+  sourceBlobId: string | null;
+  maskBlobId: string | null;
+  displayMaskBlobId: string | null;
+  referenceBlobId: string | null;
+  retryTokenHash: string | null;
 };
 
 type RevisionConflictRow = {
@@ -503,6 +817,20 @@ type RevisionConflictRow = {
 
 function firstResult<T>(result: D1Result<unknown> | undefined): T | null {
   return (result?.results?.[0] as T | undefined) ?? null;
+}
+
+async function runIdempotentD1<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await retryIdempotentD1(operation);
+  } catch (error) {
+    if (isRetryableD1Reset(error)) {
+      throw new DomainError(
+        "SERVICE_UNAVAILABLE",
+        "Palimpsest storage is briefly overloaded. Retry this same submission in a moment.",
+      );
+    }
+    throw error;
+  }
 }
 
 function regionBusyError(conflict: ActiveRegionRow): DomainError {
@@ -541,14 +869,17 @@ export const INSERT_EDIT_RESERVATION_SQL = `WITH candidate(
   prompt, region_x, region_y, region_width, region_height,
   frame_x, frame_y, frame_width, frame_height,
   source_blob_id, mask_blob_id, display_mask_blob_id, reference_blob_id,
-  idempotency_key, request_fingerprint, available_at, lease_expires_at, now_ms
-) AS (VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?))
+  idempotency_key, request_fingerprint, available_at, lease_expires_at, now_ms,
+  retry_token_hash, request_id, rate_enforced,
+  short_window_start, short_limit, daily_window_start, daily_limit
+) AS (VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?))
 INSERT OR IGNORE INTO edit_jobs (
   id, artwork_id, kind, state, execution_mode, author_id, requester_hash,
   base_revision_id, prompt, region_x, region_y, region_width, region_height,
   frame_x, frame_y, frame_width, frame_height,
   source_blob_id, mask_blob_id, display_mask_blob_id, reference_blob_id,
-  idempotency_key, request_fingerprint, available_at, lease_expires_at,
+  idempotency_key, request_fingerprint, retry_token_hash, request_id,
+  available_at, lease_expires_at,
   created_at, updated_at
 )
 SELECT
@@ -557,12 +888,26 @@ SELECT
   c.region_x, c.region_y, c.region_width, c.region_height,
   c.frame_x, c.frame_y, c.frame_width, c.frame_height,
   c.source_blob_id, c.mask_blob_id, c.display_mask_blob_id, c.reference_blob_id,
-  c.idempotency_key, c.request_fingerprint, c.available_at, c.lease_expires_at,
+  c.idempotency_key, c.request_fingerprint, c.retry_token_hash, c.request_id,
+  c.available_at, c.lease_expires_at,
   c.now_ms, c.now_ms
 FROM candidate c
 WHERE EXISTS (
   SELECT 1 FROM revisions base
   WHERE base.artwork_id = c.artwork_id AND base.id = c.base_revision_id
+)
+AND (
+  c.rate_enforced = 0 OR (
+    (SELECT COUNT(*) FROM rate_limit_claims claim
+     WHERE claim.requester_hash = c.requester_hash
+       AND claim.scope = 'edit-10m'
+       AND claim.window_start = c.short_window_start) < c.short_limit
+    AND
+    (SELECT COUNT(*) FROM rate_limit_claims claim
+     WHERE claim.requester_hash = c.requester_hash
+       AND claim.scope = 'edit-day'
+       AND claim.window_start = c.daily_window_start) < c.daily_limit
+  )
 )
 AND NOT EXISTS (
   SELECT 1 FROM edit_jobs active
@@ -592,20 +937,23 @@ AND NOT EXISTS (
 export const INSERT_REVERT_RESERVATION_SQL = `WITH candidate(
   job_id, artwork_id, author_id, requester_hash, base_revision_id,
   target_revision_id, prompt, idempotency_key, request_fingerprint,
-  available_at, lease_expires_at, now_ms
-) AS (VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?))
+  available_at, lease_expires_at, now_ms, retry_token_hash, request_id,
+  rate_enforced, rate_window_start, rate_limit
+) AS (VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?))
 INSERT OR IGNORE INTO edit_jobs (
   id, artwork_id, kind, state, execution_mode, author_id, requester_hash,
   base_revision_id, target_revision_id, prompt,
   region_x, region_y, region_width, region_height,
-  idempotency_key, request_fingerprint, available_at, lease_expires_at,
+  idempotency_key, request_fingerprint, retry_token_hash, request_id,
+  available_at, lease_expires_at,
   created_at, updated_at
 )
 SELECT
   c.job_id, c.artwork_id, 'revert', 'queued', 'none', c.author_id,
   c.requester_hash, c.base_revision_id, c.target_revision_id, c.prompt,
   0, 0, 2048, 2048,
-  c.idempotency_key, c.request_fingerprint, c.available_at, c.lease_expires_at,
+  c.idempotency_key, c.request_fingerprint, c.retry_token_hash, c.request_id,
+  c.available_at, c.lease_expires_at,
   c.now_ms, c.now_ms
 FROM candidate c
 JOIN artworks artwork
@@ -621,6 +969,13 @@ WHERE NOT EXISTS (
   WHERE active.artwork_id = c.artwork_id
     AND active.state IN ('queued', 'moderating', 'generating', 'committing')
     AND active.lease_expires_at > c.now_ms
+)
+AND (
+  c.rate_enforced = 0 OR
+  (SELECT COUNT(*) FROM rate_limit_claims claim
+   WHERE claim.requester_hash = c.requester_hash
+     AND claim.scope = 'revert-10m'
+     AND claim.window_start = c.rate_window_start) < c.rate_limit
 )`;
 
 async function markPreparationFailed(
@@ -630,30 +985,60 @@ async function markPreparationFailed(
   message: string,
 ) {
   const now = Date.now();
-  await env.DB.prepare(
-    `UPDATE edit_jobs
-     SET state = 'failed', error_code = ?, public_error_message = ?,
-         lease_expires_at = NULL, updated_at = ?, completed_at = ?
-     WHERE id = ? AND artwork_id = ? AND state = 'queued' AND worker_token IS NULL`,
-  )
-    .bind(code, message, now, now, jobId, ARTWORK_ID)
-    .run();
+  await runIdempotentD1(() =>
+    env.DB.batch([
+      env.DB.prepare(
+        `UPDATE edit_jobs
+         SET state = 'failed', error_code = ?, public_error_message = ?,
+             lease_expires_at = NULL, updated_at = ?, completed_at = ?
+         WHERE id = ? AND artwork_id = ? AND state = 'queued'
+           AND available_at = ? AND worker_token IS NULL`,
+      ).bind(code, message, now, now, jobId, ARTWORK_ID, PREPARING_AVAILABLE_AT),
+      env.DB.prepare(
+        `DELETE FROM rate_limit_claims
+         WHERE job_id = ?
+           AND EXISTS (
+             SELECT 1 FROM edit_jobs
+             WHERE id = ? AND state = 'failed' AND completed_at = ?
+           )`,
+      ).bind(jobId, jobId, now),
+    ]),
+  );
 }
 
 async function getIdempotentJob(
   env: AppEnv,
   idempotencyKey: string,
 ): Promise<ExistingIdempotencyRow | null> {
-  return env.DB.prepare(
-    `SELECT id, request_fingerprint AS requestFingerprint
-     FROM edit_jobs WHERE artwork_id = ? AND idempotency_key = ? LIMIT 1`,
-  )
-    .bind(ARTWORK_ID, idempotencyKey)
-    .first<ExistingIdempotencyRow>();
+  return runIdempotentD1(() =>
+    env.DB.prepare(
+      `SELECT id, request_fingerprint AS requestFingerprint, state,
+              available_at AS availableAt,
+              source_blob_id AS sourceBlobId,
+              mask_blob_id AS maskBlobId,
+              display_mask_blob_id AS displayMaskBlobId,
+              reference_blob_id AS referenceBlobId,
+              retry_token_hash AS retryTokenHash
+       FROM edit_jobs WHERE artwork_id = ? AND idempotency_key = ? LIMIT 1`,
+    )
+      .bind(ARTWORK_ID, idempotencyKey)
+      .first<ExistingIdempotencyRow>(),
+  );
 }
 
 export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
+  if (
+    !(input.sourceBytes instanceof Uint8Array) ||
+    !(input.maskBytes instanceof Uint8Array)
+  ) {
+    throw new DomainError(
+      "INTERNAL_ERROR",
+      "The edit reservation received an invalid immutable input set.",
+    );
+  }
+
   const frame = generationFrameForRegion(input.region);
+  const executionMode = "openai";
   const normalizedMeta = JSON.stringify({
     baseRevisionId: input.baseRevisionId,
     prompt: input.prompt,
@@ -661,12 +1046,14 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
     frame,
     fill: input.fill,
     strokes: input.strokes,
-    generation: "live-ai",
+    executionMode,
   });
   const [sourceHash, maskHash, referenceHash] = await Promise.all([
     sha256Hex(input.sourceBytes),
     sha256Hex(input.maskBytes),
-    input.referenceBytes ? sha256Hex(input.referenceBytes) : Promise.resolve(null),
+    input.referenceBytes
+      ? sha256Hex(input.referenceBytes)
+      : Promise.resolve(null),
   ]);
   const fingerprint = await sha256Hex(
     `${normalizedMeta}:${sourceHash}:${maskHash}:${referenceHash ?? "none"}`,
@@ -680,24 +1067,32 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
   const referenceBlobId = input.referenceBytes ? crypto.randomUUID() : null;
   const now = Date.now();
   const leaseExpiresAt = now + RESERVATION_LEASE_MS;
+  const rate = prepareRateLimits(input.rateLimits, EDIT_RATE_RULES, now);
+  const [shortRate, dailyRate] = rate.values;
+  const retryTokenHash = await sha256Hex(input.retryToken);
+  const generationMask = maskInGenerationFrame(
+    input.region,
+    input.strokes,
+    frame,
+  );
   const displayMask = new TextEncoder().encode(
     createDisplayMaskSvg({
-      region: regionRelativeToFrame(input.region, frame),
+      region: generationMask.region,
       fill: input.fill,
-      strokes: input.strokes,
+      strokes: generationMask.strokes,
     }),
   );
   const displayMaskHash = await sha256Hex(displayMask);
-  const sourceKey = `artworks/palimpsest/inputs/${jobId}/source-${sourceHash}.png`;
-  const maskKey = `artworks/palimpsest/masks/${jobId}/provider-${maskHash}.png`;
-  const displayMaskKey = `artworks/palimpsest/masks/${jobId}/display-${displayMaskHash}.svg`;
-  const referenceKey = referenceHash
-    ? `artworks/palimpsest/inputs/${jobId}/reference-${referenceHash}.png`
-    : null;
 
-  const reservation = await env.DB.batch([
+  const reservation = await runIdempotentD1(() => env.DB.batch([
     env.DB.prepare(
-      `SELECT id, request_fingerprint AS requestFingerprint
+      `SELECT id, request_fingerprint AS requestFingerprint, state,
+              available_at AS availableAt,
+              source_blob_id AS sourceBlobId,
+              mask_blob_id AS maskBlobId,
+              display_mask_blob_id AS displayMaskBlobId,
+              reference_blob_id AS referenceBlobId,
+              retry_token_hash AS retryTokenHash
        FROM edit_jobs WHERE artwork_id = ? AND idempotency_key = ? LIMIT 1`,
     ).bind(ARTWORK_ID, input.idempotencyKey),
     env.DB.prepare(activeConflictSql).bind(
@@ -745,12 +1140,29 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
       "SELECT id FROM revisions WHERE artwork_id = ? AND id = ? LIMIT 1",
     ).bind(ARTWORK_ID, input.baseRevisionId),
     env.DB.prepare(
-      "INSERT INTO authors (id, display_name, source, created_at) VALUES (?, ?, 'visitor', ?)",
+      `SELECT CASE WHEN ? = 0 OR (
+         (SELECT COUNT(*) FROM rate_limit_claims
+          WHERE requester_hash = ? AND scope = 'edit-10m' AND window_start = ?) < ?
+         AND
+         (SELECT COUNT(*) FROM rate_limit_claims
+          WHERE requester_hash = ? AND scope = 'edit-day' AND window_start = ?) < ?
+       ) THEN 1 ELSE 0 END AS allowed`,
+    ).bind(
+      rate.enforced,
+      input.requesterHash,
+      shortRate.windowStart,
+      shortRate.limit,
+      input.requesterHash,
+      dailyRate.windowStart,
+      dailyRate.limit,
+    ),
+    env.DB.prepare(
+      "INSERT OR IGNORE INTO authors (id, display_name, source, created_at) VALUES (?, ?, 'visitor', ?)",
     ).bind(authorId, input.displayName, now),
     env.DB.prepare(INSERT_EDIT_RESERVATION_SQL).bind(
       jobId,
       ARTWORK_ID,
-      "openai",
+      executionMode,
       authorId,
       input.requesterHash,
       input.baseRevisionId,
@@ -772,34 +1184,66 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
       PREPARING_AVAILABLE_AT,
       leaseExpiresAt,
       now,
+      retryTokenHash,
+      input.requestId,
+      rate.enforced,
+      shortRate.windowStart,
+      shortRate.limit,
+      dailyRate.windowStart,
+      dailyRate.limit,
+    ),
+    env.DB.prepare(
+      `INSERT OR IGNORE INTO rate_limit_claims
+       (requester_hash, scope, window_start, idempotency_key, job_id, created_at)
+       SELECT ?, 'edit-10m', ?, ?, ?, ?
+       WHERE ? = 1 AND EXISTS (SELECT 1 FROM edit_jobs WHERE id = ?)`,
+    ).bind(
+      input.requesterHash,
+      shortRate.windowStart,
+      input.idempotencyKey,
+      jobId,
+      now,
+      rate.enforced,
+      jobId,
+    ),
+    env.DB.prepare(
+      `INSERT OR IGNORE INTO rate_limit_claims
+       (requester_hash, scope, window_start, idempotency_key, job_id, created_at)
+       SELECT ?, 'edit-day', ?, ?, ?, ?
+       WHERE ? = 1 AND EXISTS (SELECT 1 FROM edit_jobs WHERE id = ?)`,
+    ).bind(
+      input.requesterHash,
+      dailyRate.windowStart,
+      input.idempotencyKey,
+      jobId,
+      now,
+      rate.enforced,
+      jobId,
     ),
     env.DB.prepare(
       `DELETE FROM authors
        WHERE id = ? AND NOT EXISTS (SELECT 1 FROM edit_jobs WHERE id = ?)`,
     ).bind(authorId, jobId),
-  ]);
+  ]));
 
-  const existing = firstResult<ExistingIdempotencyRow>(reservation[0]);
-  if (existing) {
-    if (existing.requestFingerprint !== fingerprint) {
-      throw new DomainError(
-        "IDEMPOTENCY_CONFLICT",
-        "That submission key was already used for a different edit.",
-      );
-    }
-    return getPublicJob(env, existing.id);
+  let selected = firstResult<ExistingIdempotencyRow>(reservation[0]);
+  const inserted = Number(reservation[6]?.meta.changes ?? 0) === 1;
+  if (!selected && !inserted) {
+    selected = await getIdempotentJob(env, input.idempotencyKey);
+  }
+  if (selected && selected.requestFingerprint !== fingerprint) {
+    throw new DomainError(
+      "IDEMPOTENCY_CONFLICT",
+      "That submission key was already used for a different edit.",
+    );
   }
 
-  if (Number(reservation[5]?.meta.changes ?? 0) === 0) {
-    const racedIdempotency = await getIdempotentJob(env, input.idempotencyKey);
-    if (racedIdempotency) {
-      if (racedIdempotency.requestFingerprint !== fingerprint) {
-        throw new DomainError(
-          "IDEMPOTENCY_CONFLICT",
-          "That submission key was already used for a different edit.",
-        );
-      }
-      return getPublicJob(env, racedIdempotency.id);
+  if (!selected && !inserted) {
+    if (!Boolean(firstResult<{ allowed: number }>(reservation[4])?.allowed)) {
+      throw new DomainError(
+        "RATE_LIMITED",
+        "Too many contributions from this connection. Try again later.",
+      );
     }
     const conflict = firstResult<ActiveRegionRow>(reservation[1]);
     if (conflict) throw regionBusyError(conflict);
@@ -822,7 +1266,52 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
     );
   }
 
-  const blobWrites = [
+  selected ??= {
+    id: jobId,
+    requestFingerprint: fingerprint,
+    state: "queued",
+    availableAt: PREPARING_AVAILABLE_AT,
+    sourceBlobId,
+    maskBlobId,
+    displayMaskBlobId,
+    referenceBlobId,
+    retryTokenHash,
+  };
+  const selectedRetryToken =
+    selected.retryTokenHash === retryTokenHash
+      ? input.retryToken
+      : null;
+  if (selected.state !== "queued" || selected.availableAt !== PREPARING_AVAILABLE_AT) {
+    const publicJob = await getPublicJob(env, selected.id);
+    return selectedRetryToken ? { ...publicJob, retryToken: selectedRetryToken } : publicJob;
+  }
+  if (
+    !selected.displayMaskBlobId ||
+    !selected.sourceBlobId ||
+    !selected.maskBlobId ||
+    (Boolean(input.referenceBytes) !== Boolean(selected.referenceBlobId))
+  ) {
+    throw new DomainError(
+      "INTERNAL_ERROR",
+      "The reserved edit is missing its immutable input identifiers.",
+    );
+  }
+  const selectedJobId = selected.id;
+  const selectedSourceBlobId = selected.sourceBlobId;
+  const selectedMaskBlobId = selected.maskBlobId;
+  const selectedDisplayMaskBlobId = selected.displayMaskBlobId;
+  const selectedReferenceBlobId = selected.referenceBlobId;
+  const sourceKey =
+    `artworks/palimpsest/inputs/${selectedJobId}/source-${sourceHash}.png`;
+  const maskKey =
+    `artworks/palimpsest/masks/${selectedJobId}/provider-${maskHash}.png`;
+  const displayMaskKey = `artworks/palimpsest/masks/${selectedJobId}/display-${displayMaskHash}.svg`;
+  const referenceKey = referenceHash
+    ? `artworks/palimpsest/inputs/${selectedJobId}/reference-${referenceHash}.png`
+    : null;
+
+  const blobWrites: Array<Promise<R2Object | null>> = [];
+  blobWrites.push(
     env.BLOBS.put(sourceKey, input.sourceBytes, {
       httpMetadata: { contentType: "image/png" },
       customMetadata: { sha256: sourceHash, private: "true" },
@@ -831,7 +1320,7 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
       httpMetadata: { contentType: "image/png" },
       customMetadata: { sha256: maskHash, private: "true" },
     }),
-  ];
+  );
   if (input.referenceBytes && referenceHash && referenceKey) {
     blobWrites.push(
       env.BLOBS.put(referenceKey, input.referenceBytes, {
@@ -849,7 +1338,7 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
   } catch (error) {
     await markPreparationFailed(
       env,
-      jobId,
+      selectedJobId,
       "STORAGE_WRITE_FAILED",
       "The edit inputs could not be stored safely. Nothing was added to history.",
     );
@@ -857,28 +1346,50 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
   }
 
   const readyAt = Date.now();
-  const statements = [
-    env.DB.prepare(
-      `INSERT INTO blobs
-       (id, artwork_id, kind, r2_key, content_type, byte_length, sha256, width, height, created_at)
-       VALUES (?, ?, 'input', ?, 'image/png', ?, ?, 1024, 1024, ?)`,
-    ).bind(sourceBlobId, ARTWORK_ID, sourceKey, input.sourceBytes.byteLength, sourceHash, now),
-    env.DB.prepare(
-      `INSERT INTO blobs
-       (id, artwork_id, kind, r2_key, content_type, byte_length, sha256, width, height, created_at)
-       VALUES (?, ?, 'mask', ?, 'image/png', ?, ?, 1024, 1024, ?)`,
-    ).bind(maskBlobId, ARTWORK_ID, maskKey, input.maskBytes.byteLength, maskHash, now),
-  ];
-  if (input.referenceBytes && referenceBlobId && referenceHash && referenceKey) {
+  const statements: D1PreparedStatement[] = [];
+  if (selectedSourceBlobId && selectedMaskBlobId) {
+    statements.push(
+      env.DB.prepare(
+        `INSERT OR IGNORE INTO blobs
+         (id, artwork_id, kind, r2_key, content_type, byte_length, sha256, width, height, created_at)
+         VALUES (?, ?, 'input', ?, 'image/png', ?, ?, 1024, 1024, ?)`,
+      ).bind(
+        selectedSourceBlobId,
+        ARTWORK_ID,
+        sourceKey,
+        input.sourceBytes.byteLength,
+        sourceHash,
+        now,
+      ),
+      env.DB.prepare(
+        `INSERT OR IGNORE INTO blobs
+         (id, artwork_id, kind, r2_key, content_type, byte_length, sha256, width, height, created_at)
+         VALUES (?, ?, 'mask', ?, 'image/png', ?, ?, 1024, 1024, ?)`,
+      ).bind(
+        selectedMaskBlobId,
+        ARTWORK_ID,
+        maskKey,
+        input.maskBytes.byteLength,
+        maskHash,
+        now,
+      ),
+    );
+  }
+  if (
+    input.referenceBytes &&
+    selectedReferenceBlobId &&
+    referenceHash &&
+    referenceKey
+  ) {
     statements.push(
       env.DB
         .prepare(
-          `INSERT INTO blobs
+          `INSERT OR IGNORE INTO blobs
            (id, artwork_id, kind, r2_key, content_type, byte_length, sha256, width, height, created_at)
            VALUES (?, ?, 'input', ?, 'image/png', ?, ?, 1024, 1024, ?)`,
         )
         .bind(
-          referenceBlobId,
+          selectedReferenceBlobId,
           ARTWORK_ID,
           referenceKey,
           input.referenceBytes.byteLength,
@@ -890,12 +1401,12 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
   statements.push(
     env.DB
       .prepare(
-        `INSERT INTO blobs
+        `INSERT OR IGNORE INTO blobs
          (id, artwork_id, kind, r2_key, content_type, byte_length, sha256, width, height, created_at)
          VALUES (?, ?, 'display_mask', ?, 'image/svg+xml', ?, ?, 1024, 1024, ?)`,
       )
       .bind(
-        displayMaskBlobId,
+        selectedDisplayMaskBlobId,
         ARTWORK_ID,
         displayMaskKey,
         displayMask.byteLength,
@@ -925,18 +1436,28 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
       readyAt,
       readyAt,
       readyAt + RESERVATION_LEASE_MS,
-      jobId,
+      selectedJobId,
       ARTWORK_ID,
       readyAt,
       readyAt,
     ),
   );
   try {
-    const metadata = await env.DB.batch(statements);
+    const metadata = await runIdempotentD1(() => env.DB.batch(statements));
     if (Number(metadata.at(-1)?.meta.changes ?? 0) !== 1) {
+      const current = await getIdempotentJob(env, input.idempotencyKey);
+      if (
+        current &&
+        (current.state !== "queued" || current.availableAt !== PREPARING_AVAILABLE_AT)
+      ) {
+        const publicJob = await getPublicJob(env, current.id);
+        return selectedRetryToken
+          ? { ...publicJob, retryToken: selectedRetryToken }
+          : publicJob;
+      }
       await markPreparationFailed(
         env,
-        jobId,
+        selectedJobId,
         "QUEUE_LEASE_EXPIRED",
         "The edit reservation expired while its inputs were being stored. Nothing was added to history.",
       );
@@ -952,7 +1473,7 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
           input.region.y,
         )
         .first<ActiveRegionRow>();
-      if (conflict && conflict.jobId !== jobId) throw regionBusyError(conflict);
+      if (conflict && conflict.jobId !== selectedJobId) throw regionBusyError(conflict);
       throw new DomainError(
         "QUEUE_LEASE_EXPIRED",
         "The edit reservation expired before the upload became ready.",
@@ -962,14 +1483,15 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
     if (error instanceof DomainError) throw error;
     await markPreparationFailed(
       env,
-      jobId,
+      selectedJobId,
       "STORAGE_METADATA_FAILED",
       "The edit inputs could not be recorded safely. Nothing was added to history.",
     );
     throw error;
   }
 
-  return getPublicJob(env, jobId);
+  const publicJob = await getPublicJob(env, selectedJobId);
+  return selectedRetryToken ? { ...publicJob, retryToken: selectedRetryToken } : publicJob;
 }
 
 export async function insertRevertJob(
@@ -980,13 +1502,17 @@ export async function insertRevertJob(
     displayName: string;
     requesterHash: string;
     idempotencyKey: string;
+    rateLimits: readonly ContributionRateLimit[];
+    requestId: string;
   },
 ) {
-  const targetRevision = await env.DB.prepare(
-    "SELECT sequence FROM revisions WHERE artwork_id = ? AND id = ? LIMIT 1",
-  )
-    .bind(ARTWORK_ID, input.targetRevisionId)
-    .first<{ sequence: number }>();
+  const targetRevision = await runIdempotentD1(() =>
+    env.DB.prepare(
+      "SELECT sequence FROM revisions WHERE artwork_id = ? AND id = ? LIMIT 1",
+    )
+      .bind(ARTWORK_ID, input.targetRevisionId)
+      .first<{ sequence: number }>(),
+  );
   if (!targetRevision) {
     throw new DomainError("INVALID_REQUEST", "Choose an earlier revision to restore.");
   }
@@ -997,7 +1523,9 @@ export async function insertRevertJob(
   const jobId = crypto.randomUUID();
   const now = Date.now();
   const leaseExpiresAt = now + RESERVATION_LEASE_MS;
-  const reservation = await env.DB.batch([
+  const rate = prepareRateLimits(input.rateLimits, REVERT_RATE_RULES, now);
+  const [revertRate] = rate.values;
+  const reservation = await runIdempotentD1(() => env.DB.batch([
     env.DB.prepare(
       `SELECT id, request_fingerprint AS requestFingerprint
        FROM edit_jobs WHERE artwork_id = ? AND idempotency_key = ? LIMIT 1`,
@@ -1025,7 +1553,18 @@ export async function insertRevertJob(
        WHERE artwork.id = ?`,
     ).bind(input.baseRevisionId, input.targetRevisionId, ARTWORK_ID),
     env.DB.prepare(
-      "INSERT INTO authors (id, display_name, source, created_at) VALUES (?, ?, 'visitor', ?)",
+      `SELECT CASE WHEN ? = 0 OR (
+         SELECT COUNT(*) FROM rate_limit_claims
+         WHERE requester_hash = ? AND scope = 'revert-10m' AND window_start = ?
+       ) < ? THEN 1 ELSE 0 END AS allowed`,
+    ).bind(
+      rate.enforced,
+      input.requesterHash,
+      revertRate.windowStart,
+      revertRate.limit,
+    ),
+    env.DB.prepare(
+      "INSERT OR IGNORE INTO authors (id, display_name, source, created_at) VALUES (?, ?, 'visitor', ?)",
     ).bind(authorId, input.displayName, now),
     env.DB.prepare(INSERT_REVERT_RESERVATION_SQL).bind(
       jobId,
@@ -1040,12 +1579,31 @@ export async function insertRevertJob(
       now,
       leaseExpiresAt,
       now,
+      null,
+      input.requestId,
+      rate.enforced,
+      revertRate.windowStart,
+      revertRate.limit,
+    ),
+    env.DB.prepare(
+      `INSERT OR IGNORE INTO rate_limit_claims
+       (requester_hash, scope, window_start, idempotency_key, job_id, created_at)
+       SELECT ?, 'revert-10m', ?, ?, ?, ?
+       WHERE ? = 1 AND EXISTS (SELECT 1 FROM edit_jobs WHERE id = ?)`,
+    ).bind(
+      input.requesterHash,
+      revertRate.windowStart,
+      input.idempotencyKey,
+      jobId,
+      now,
+      rate.enforced,
+      jobId,
     ),
     env.DB.prepare(
       `DELETE FROM authors
        WHERE id = ? AND NOT EXISTS (SELECT 1 FROM edit_jobs WHERE id = ?)`,
     ).bind(authorId, jobId),
-  ]);
+  ]));
 
   const existing = firstResult<ExistingIdempotencyRow>(reservation[0]);
   if (existing) {
@@ -1058,7 +1616,7 @@ export async function insertRevertJob(
     return getPublicJob(env, existing.id);
   }
 
-  if (Number(reservation[4]?.meta.changes ?? 0) === 0) {
+  if (Number(reservation[5]?.meta.changes ?? 0) === 0) {
     const racedIdempotency = await getIdempotentJob(env, input.idempotencyKey);
     if (racedIdempotency) {
       if (racedIdempotency.requestFingerprint !== fingerprint) {
@@ -1068,6 +1626,12 @@ export async function insertRevertJob(
         );
       }
       return getPublicJob(env, racedIdempotency.id);
+    }
+    if (!Boolean(firstResult<{ allowed: number }>(reservation[3])?.allowed)) {
+      throw new DomainError(
+        "RATE_LIMITED",
+        "Too many contributions from this connection. Try again later.",
+      );
     }
     const conflict = firstResult<ActiveRegionRow>(reservation[1]);
     if (conflict) throw regionBusyError(conflict);
@@ -1087,8 +1651,302 @@ export async function insertRevertJob(
   return getPublicJob(env, jobId);
 }
 
+type RetryCandidateRow = {
+  id: string;
+  state: string;
+  executionMode: "openai" | "placement" | "none";
+  referenceBlobId: string | null;
+  errorCode: string | null;
+  startedAt: number | null;
+  sourceKey: string | null;
+  maskKey: string | null;
+  displayMaskKey: string | null;
+  referenceKey: string | null;
+  successorId: string | null;
+};
+
+export const INSERT_RETRY_JOB_SQL = `WITH candidate(
+  job_id, parent_job_id, artwork_id, requester_hash, retry_token_hash,
+  idempotency_key, request_id, now_ms, lease_expires_at,
+  rate_enforced, short_window_start, short_limit, daily_window_start, daily_limit
+) AS (VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?))
+INSERT OR IGNORE INTO edit_jobs (
+  id, artwork_id, kind, state, execution_mode, author_id, requester_hash,
+  base_revision_id, target_revision_id, prompt,
+  region_x, region_y, region_width, region_height,
+  frame_x, frame_y, frame_width, frame_height,
+  source_blob_id, mask_blob_id, display_mask_blob_id, reference_blob_id,
+  idempotency_key, request_fingerprint, retry_of_job_id, retry_token_hash,
+  request_id, attempt_count, available_at, lease_fence, lease_expires_at,
+  created_at, updated_at
+)
+SELECT
+  c.job_id, parent.artwork_id, parent.kind, 'queued', parent.execution_mode,
+  parent.author_id, parent.requester_hash, parent.base_revision_id,
+  parent.target_revision_id, parent.prompt,
+  parent.region_x, parent.region_y, parent.region_width, parent.region_height,
+  parent.frame_x, parent.frame_y, parent.frame_width, parent.frame_height,
+  parent.source_blob_id, parent.mask_blob_id, parent.display_mask_blob_id,
+  parent.reference_blob_id, c.idempotency_key, parent.request_fingerprint,
+  parent.id, parent.retry_token_hash, c.request_id, 0, c.now_ms, 0,
+  c.lease_expires_at, c.now_ms, c.now_ms
+FROM candidate c
+JOIN edit_jobs parent ON parent.id = c.parent_job_id
+WHERE parent.artwork_id = c.artwork_id
+  AND parent.kind = 'edit'
+  AND parent.state = 'failed'
+  AND parent.requester_hash = c.requester_hash
+  AND parent.retry_token_hash = c.retry_token_hash
+  AND (
+    parent.error_code IN (
+      'PROVIDER_TEMPORARY',
+      'SUBJECT_OUT_OF_FRAME',
+      'REFERENCE_REVIEW_FAILED'
+    )
+    OR (parent.error_code = 'QUEUE_LEASE_EXPIRED' AND parent.started_at IS NULL)
+  )
+  AND parent.display_mask_blob_id IS NOT NULL
+  AND EXISTS (SELECT 1 FROM blobs display WHERE display.id = parent.display_mask_blob_id)
+  AND parent.execution_mode = 'openai'
+  AND parent.source_blob_id IS NOT NULL
+  AND parent.mask_blob_id IS NOT NULL
+  AND EXISTS (SELECT 1 FROM blobs source WHERE source.id = parent.source_blob_id)
+  AND EXISTS (SELECT 1 FROM blobs mask WHERE mask.id = parent.mask_blob_id)
+  AND (
+    parent.reference_blob_id IS NULL
+    OR EXISTS (
+      SELECT 1 FROM blobs reference WHERE reference.id = parent.reference_blob_id
+    )
+  )
+  AND EXISTS (
+    SELECT 1 FROM revisions base
+    WHERE base.artwork_id = parent.artwork_id AND base.id = parent.base_revision_id
+  )
+  AND NOT EXISTS (SELECT 1 FROM edit_jobs child WHERE child.retry_of_job_id = parent.id)
+  AND NOT EXISTS (
+    SELECT 1 FROM edit_jobs active
+    WHERE active.artwork_id = parent.artwork_id
+      AND active.state IN ('queued', 'moderating', 'generating', 'committing')
+      AND active.lease_expires_at > c.now_ms
+      AND active.region_x < parent.region_x + parent.region_width
+      AND active.region_x + active.region_width > parent.region_x
+      AND active.region_y < parent.region_y + parent.region_height
+      AND active.region_y + active.region_height > parent.region_y
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM revisions base
+    JOIN revisions accepted
+      ON accepted.artwork_id = base.artwork_id
+     AND accepted.sequence > base.sequence
+    WHERE base.artwork_id = parent.artwork_id
+      AND base.id = parent.base_revision_id
+      AND accepted.region_x IS NOT NULL
+      AND accepted.region_x < parent.region_x + parent.region_width
+      AND accepted.region_x + accepted.region_width > parent.region_x
+      AND accepted.region_y < parent.region_y + parent.region_height
+      AND accepted.region_y + accepted.region_height > parent.region_y
+  )
+  AND (
+    c.rate_enforced = 0 OR (
+      (SELECT COUNT(*) FROM rate_limit_claims claim
+       WHERE claim.requester_hash = c.requester_hash
+         AND claim.scope = 'edit-10m'
+         AND claim.window_start = c.short_window_start) < c.short_limit
+      AND
+      (SELECT COUNT(*) FROM rate_limit_claims claim
+       WHERE claim.requester_hash = c.requester_hash
+         AND claim.scope = 'edit-day'
+         AND claim.window_start = c.daily_window_start) < c.daily_limit
+    )
+  )`;
+
+export async function retryFailedEditJob(
+  env: AppEnv,
+  input: {
+    jobId: string;
+    requesterHash: string;
+    retryToken: string;
+    idempotencyKey: string;
+    rateLimits: readonly ContributionRateLimit[];
+    requestId: string;
+  },
+) {
+  const retryTokenHash = await sha256Hex(input.retryToken);
+  const candidate = await runIdempotentD1(() =>
+    env.DB.prepare(
+      `SELECT j.id, j.state, j.execution_mode AS executionMode,
+              j.reference_blob_id AS referenceBlobId,
+              j.error_code AS errorCode, j.started_at AS startedAt,
+              source.r2_key AS sourceKey, mask.r2_key AS maskKey,
+              display.r2_key AS displayMaskKey, reference.r2_key AS referenceKey,
+              (SELECT child.id FROM edit_jobs child
+               WHERE child.retry_of_job_id = j.id LIMIT 1) AS successorId
+       FROM edit_jobs j
+       LEFT JOIN blobs source ON source.id = j.source_blob_id
+       LEFT JOIN blobs mask ON mask.id = j.mask_blob_id
+       LEFT JOIN blobs display ON display.id = j.display_mask_blob_id
+       LEFT JOIN blobs reference ON reference.id = j.reference_blob_id
+       WHERE j.id = ? AND j.artwork_id = ? AND j.kind = 'edit'
+         AND j.requester_hash = ? AND j.retry_token_hash = ?`,
+    )
+      .bind(input.jobId, ARTWORK_ID, input.requesterHash, retryTokenHash)
+      .first<RetryCandidateRow>(),
+  );
+  if (!candidate) {
+    throw new DomainError("NOT_FOUND", "That retryable contribution could not be found.");
+  }
+  const hasCanonicalInputShape = candidate.executionMode === "openai";
+  if (!hasCanonicalInputShape) {
+    throw new DomainError(
+      "JOB_NOT_RETRYABLE",
+      "This attempt used a retired contribution format. Submit a new contribution instead.",
+    );
+  }
+  if (candidate.successorId) {
+    return { ...(await getPublicJob(env, candidate.successorId)), retryToken: input.retryToken };
+  }
+  const technicallyRetryable =
+    candidate.state === "failed" &&
+    ([
+      "PROVIDER_TEMPORARY",
+      "SUBJECT_OUT_OF_FRAME",
+      "REFERENCE_REVIEW_FAILED",
+    ].includes(candidate.errorCode ?? "") ||
+      (candidate.errorCode === "QUEUE_LEASE_EXPIRED" && candidate.startedAt == null));
+  const requiredKeys =
+    candidate.executionMode === "openai"
+      ? [
+          candidate.sourceKey,
+          candidate.maskKey,
+          candidate.displayMaskKey,
+          ...(candidate.referenceBlobId ? [candidate.referenceKey] : []),
+        ]
+      : [];
+  if (
+    !technicallyRetryable ||
+    requiredKeys.length === 0 ||
+    requiredKeys.some((key) => typeof key !== "string")
+  ) {
+    throw new DomainError(
+      "JOB_NOT_RETRYABLE",
+      "This attempt cannot be retried safely. Submit a new contribution instead.",
+    );
+  }
+  const objects = await Promise.all(
+    requiredKeys.map((key) => env.BLOBS.head(key as string)),
+  );
+  if (objects.some((object) => object == null)) {
+    throw new DomainError(
+      "JOB_NOT_RETRYABLE",
+      "The original edit inputs are no longer available. Submit a new contribution instead.",
+    );
+  }
+
+  const now = Date.now();
+  const rate = prepareRateLimits(input.rateLimits, EDIT_RATE_RULES, now);
+  const [shortRate, dailyRate] = rate.values;
+  const successorId = crypto.randomUUID();
+  const successorKey = input.idempotencyKey;
+  const results = await runIdempotentD1(() =>
+    env.DB.batch([
+      env.DB.prepare(
+        "SELECT id FROM edit_jobs WHERE retry_of_job_id = ? LIMIT 1",
+      ).bind(input.jobId),
+      env.DB.prepare(
+        `SELECT CASE WHEN ? = 0 OR (
+           (SELECT COUNT(*) FROM rate_limit_claims
+            WHERE requester_hash = ? AND scope = 'edit-10m' AND window_start = ?) < ?
+           AND
+           (SELECT COUNT(*) FROM rate_limit_claims
+            WHERE requester_hash = ? AND scope = 'edit-day' AND window_start = ?) < ?
+         ) THEN 1 ELSE 0 END AS allowed`,
+      ).bind(
+        rate.enforced,
+        input.requesterHash,
+        shortRate.windowStart,
+        shortRate.limit,
+        input.requesterHash,
+        dailyRate.windowStart,
+        dailyRate.limit,
+      ),
+      env.DB.prepare(INSERT_RETRY_JOB_SQL).bind(
+        successorId,
+        input.jobId,
+        ARTWORK_ID,
+        input.requesterHash,
+        retryTokenHash,
+        successorKey,
+        input.requestId,
+        now,
+        now + RESERVATION_LEASE_MS,
+        rate.enforced,
+        shortRate.windowStart,
+        shortRate.limit,
+        dailyRate.windowStart,
+        dailyRate.limit,
+      ),
+      env.DB.prepare(
+        `INSERT OR IGNORE INTO rate_limit_claims
+         (requester_hash, scope, window_start, idempotency_key, job_id, created_at)
+         SELECT ?, 'edit-10m', ?, ?, ?, ?
+         WHERE ? = 1 AND EXISTS (SELECT 1 FROM edit_jobs WHERE id = ?)`,
+      ).bind(
+        input.requesterHash,
+        shortRate.windowStart,
+        successorKey,
+        successorId,
+        now,
+        rate.enforced,
+        successorId,
+      ),
+      env.DB.prepare(
+        `INSERT OR IGNORE INTO rate_limit_claims
+         (requester_hash, scope, window_start, idempotency_key, job_id, created_at)
+         SELECT ?, 'edit-day', ?, ?, ?, ?
+         WHERE ? = 1 AND EXISTS (SELECT 1 FROM edit_jobs WHERE id = ?)`,
+      ).bind(
+        input.requesterHash,
+        dailyRate.windowStart,
+        successorKey,
+        successorId,
+        now,
+        rate.enforced,
+        successorId,
+      ),
+    ]),
+  );
+  let resolvedId = firstResult<{ id: string }>(results[0])?.id ?? null;
+  if (!resolvedId && Number(results[2]?.meta.changes ?? 0) === 1) {
+    resolvedId = successorId;
+  }
+  if (!resolvedId) {
+    resolvedId = (
+      await runIdempotentD1(() =>
+        env.DB.prepare("SELECT id FROM edit_jobs WHERE retry_of_job_id = ? LIMIT 1")
+          .bind(input.jobId)
+          .first<{ id: string }>(),
+      )
+    )?.id ?? null;
+  }
+  if (!resolvedId) {
+    if (!Boolean(firstResult<{ allowed: number }>(results[1])?.allowed)) {
+      throw new DomainError(
+        "RATE_LIMITED",
+        "Too many contributions from this connection. Try again later.",
+      );
+    }
+    throw new DomainError(
+      "JOB_NOT_RETRYABLE",
+      "The original region is no longer safe to retry. Submit against the latest canvas instead.",
+    );
+  }
+  return { ...(await getPublicJob(env, resolvedId)), retryToken: input.retryToken };
+}
+
 export async function getPublicJob(env: AppEnv, jobId: string) {
-  const row = await env.DB.prepare(
+  const now = Date.now();
+  const row = await runIdempotentD1(() => env.DB.prepare(
     `SELECT
        j.id AS id, j.kind AS kind, j.state AS state,
        result_revision_id AS resultRevisionId,
@@ -1101,12 +1959,46 @@ export async function getPublicJob(env: AppEnv, jobId: string) {
        j.lease_expires_at AS leaseExpiresAt,
        j.created_at AS createdAt,
        j.updated_at AS updatedAt,
+       j.started_at AS startedAt,
+       j.completed_at AS completedAt,
+       j.request_id AS requestId,
+       CASE WHEN j.state = 'queued' AND j.lease_expires_at > ? THEN 1 + (
+         SELECT COUNT(*) FROM edit_jobs ahead
+         WHERE ahead.artwork_id = j.artwork_id AND ahead.state = 'queued'
+           AND ahead.lease_expires_at > ? AND ahead.created_at < j.created_at
+       ) ELSE NULL END AS position,
+       CASE WHEN
+         j.kind = 'edit' AND j.state = 'failed'
+         AND (
+           j.error_code IN (
+             'PROVIDER_TEMPORARY',
+             'SUBJECT_OUT_OF_FRAME',
+             'REFERENCE_REVIEW_FAILED'
+           )
+           OR (j.error_code = 'QUEUE_LEASE_EXPIRED' AND j.started_at IS NULL)
+         )
+         AND j.display_mask_blob_id IS NOT NULL
+         AND EXISTS (SELECT 1 FROM blobs display WHERE display.id = j.display_mask_blob_id)
+         AND j.execution_mode = 'openai'
+         AND j.source_blob_id IS NOT NULL
+         AND j.mask_blob_id IS NOT NULL
+         AND EXISTS (SELECT 1 FROM blobs source WHERE source.id = j.source_blob_id)
+         AND EXISTS (SELECT 1 FROM blobs mask WHERE mask.id = j.mask_blob_id)
+         AND (
+           j.reference_blob_id IS NULL
+           OR EXISTS (
+             SELECT 1 FROM blobs reference WHERE reference.id = j.reference_blob_id
+           )
+         )
+         AND NOT EXISTS (SELECT 1 FROM edit_jobs retry WHERE retry.retry_of_job_id = j.id)
+         THEN 1 ELSE 0
+       END AS retryable,
        a.display_name AS author
      FROM edit_jobs j
      JOIN authors a ON a.id = j.author_id
      WHERE j.id = ? AND j.artwork_id = ?`,
   )
-    .bind(jobId, ARTWORK_ID)
+    .bind(now, now, jobId, ARTWORK_ID)
     .first<{
       id: string;
       kind: string;
@@ -1121,23 +2013,17 @@ export async function getPublicJob(env: AppEnv, jobId: string) {
       leaseExpiresAt: number | null;
       createdAt: number;
       updatedAt: number;
+      startedAt: number | null;
+      completedAt: number | null;
+      requestId: string | null;
+      retryable: number;
+      position: number | null;
       author: string;
-    }>();
+    }>());
   if (!row) throw new DomainError("NOT_FOUND", "That queue item could not be found.");
-  const now = Date.now();
   const reservationActive =
     ["queued", "moderating", "generating", "committing"].includes(row.state) &&
     Number(row.leaseExpiresAt ?? 0) > now;
-  const ahead =
-    row.state === "queued" && reservationActive
-      ? await env.DB.prepare(
-          `SELECT COUNT(*) AS count FROM edit_jobs
-           WHERE artwork_id = ? AND state = 'queued'
-             AND lease_expires_at > ? AND created_at < ?`,
-        )
-          .bind(ARTWORK_ID, now, row.createdAt)
-          .first<{ count: number }>()
-      : null;
   return {
     id: row.id,
     kind: row.kind,
@@ -1155,14 +2041,19 @@ export async function getPublicJob(env: AppEnv, jobId: string) {
     reservationActive,
     position:
       row.state === "queued" && reservationActive
-        ? Number(ahead?.count ?? 0) + 1
+        ? Number(row.position ?? 1)
         : null,
     resultRevisionId: row.resultRevisionId,
     message: publicJobMessage(row.state),
     error: row.errorCode
       ? { code: row.errorCode, message: row.publicErrorMessage }
       : null,
+    requestId: row.requestId,
+    retryable: Boolean(row.retryable),
     submittedAt: new Date(Number(row.createdAt)).toISOString(),
     updatedAt: new Date(Number(row.updatedAt)).toISOString(),
+    startedAt: row.startedAt == null ? null : new Date(Number(row.startedAt)).toISOString(),
+    completedAt:
+      row.completedAt == null ? null : new Date(Number(row.completedAt)).toISOString(),
   };
 }

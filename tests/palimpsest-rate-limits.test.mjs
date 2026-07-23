@@ -60,6 +60,28 @@ test("verified admins bypass every edit and restore limit", () => {
   }
 });
 
+test("visitor activity endpoint relies on the dispatcher-authenticated admin gate", async () => {
+  const source = await readFile(
+    new URL("../app/api/visitors/route.ts", import.meta.url),
+    "utf8",
+  );
+  assert.match(source, /isVerifiedAdminRequest\(env, request\)/u);
+  assert.match(source, /status:\s*403/u);
+  assert.doesNotMatch(source, /x-palimpsest-admin/i);
+});
+
+test("public visitor events are bounded before storage", async () => {
+  const [route, store] = await Promise.all([
+    readFile(new URL("../app/api/visitors/events/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/palimpsest/store.ts", import.meta.url), "utf8"),
+  ]);
+  assert.match(route, /application\/json/u);
+  assert.match(route, /PAYLOAD_TOO_LARGE/u);
+  assert.match(store, /VISITOR_EVENT_LIMIT_WINDOW_MS/u);
+  assert.match(store, /VISITOR_EVENT_RETENTION_MS/u);
+  assert.match(store, /WHERE NOT EXISTS/u);
+});
+
 test("both contribution routes consume the centralized server policy", async () => {
   const [editRoute, revertRoute] = await Promise.all([
     readFile(new URL("../app/api/edits/route.ts", import.meta.url), "utf8"),
@@ -68,7 +90,8 @@ test("both contribution routes consume the centralized server policy", async () 
 
   for (const route of [editRoute, revertRoute]) {
     assert.match(route, /contributionRatePolicy\(env, request, "(?:edit|revert)"\)/);
-    assert.match(route, /for \(const limit of ratePolicy\.limits\)/);
+    assert.match(route, /rateLimits: ratePolicy\.limits/);
+    assert.doesNotMatch(route, /enforceRateLimit/);
     assert.doesNotMatch(route, /x-palimpsest-admin/i);
   }
 });

@@ -8,6 +8,7 @@ export interface AppEnv {
   OPENAI_API_KEY?: string;
   ADMIN_EMAIL_ALLOWLIST?: string;
   RATE_LIMIT_SALT?: string;
+  VISITOR_LOG_SALT?: string;
 }
 
 export function getRuntimeEnv(): AppEnv {
@@ -85,6 +86,12 @@ export function jsonError(
     });
   }
   const code = domainError?.code ?? "INTERNAL_ERROR";
+  if (code === "SERVICE_UNAVAILABLE") {
+    console.warn(`[palimpsest:${requestId}] dependency temporarily unavailable`, {
+      code,
+      message: domainError?.message,
+    });
+  }
   const status =
     code === "STALE_BASE_REVISION" ||
     code === "IDEMPOTENCY_CONFLICT" ||
@@ -106,7 +113,7 @@ export function jsonError(
     "Palimpsest could not complete that request. Nothing was added to history.";
   const publicDetails = details ?? (domainError ? safeRegionBusyDetails(domainError) : undefined);
 
-  return Response.json(
+  const response = Response.json(
     {
       error: {
         code,
@@ -117,6 +124,10 @@ export function jsonError(
     },
     { status },
   );
+  if (code === "SERVICE_UNAVAILABLE") {
+    response.headers.set("Retry-After", "3");
+  }
+  return response;
 }
 
 export async function sha256Hex(value: ArrayBuffer | Uint8Array | string): Promise<string> {
@@ -151,7 +162,7 @@ export function readPngDimensions(bytes: Uint8Array): {
 
 export function publicJobMessage(state: string): string | null {
   if (state === "queued") return "Your contribution is in the queue.";
-  if (state === "moderating") return "GPT-5.6 is checking and planning this edit.";
+  if (state === "moderating") return "Checking this contribution for safety.";
   if (state === "generating") return "Making the next revision.";
   if (state === "committing") return "Adding the revision to permanent history.";
   if (state === "succeeded") return "This revision is now part of Palimpsest.";

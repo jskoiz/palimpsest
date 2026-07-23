@@ -2,7 +2,7 @@
 
 **One canvas. Many hands. No collisions.**
 
-Palimpsest is a live communal artwork with a permanent memory. Anyone can place an edit region anywhere on the canvas, paint exactly what may change, optionally attach a reference image, and describe an idea. GPT-5.6 turns that intent into a faithful edit plan; GPT Image renders only the masked area. Every accepted contribution becomes the next immutable revision.
+Palimpsest is a live communal artwork with a permanent memory. Anyone can place an edit region anywhere on the canvas, paint exactly what may change, optionally attach a reference image, and describe an idea. GPT Image renders only the masked area, and GPT-5.6 checks the result before acceptance. Every accepted contribution becomes the next immutable revision.
 
 Multiple people can work at once. A live reservation locks only the region currently being generated, so the rest of the canvas remains open.
 
@@ -11,7 +11,7 @@ Multiple people can work at once. A live reservation locks only the region curre
 1. **Place** a free-position patch anywhere on the 2048×2048 artwork.
 2. **Mask** the pixels that may change, or choose the entire patch.
 3. **Describe** the edit and optionally attach a PNG, JPEG, or WebP reference.
-4. **Plan and render.** OpenAI moderation checks the request, GPT-5.6 creates a concise visual plan without inventing new intent, and GPT Image edits the masked context frame.
+4. **Render and review.** GPT Image edits the current masked context frame. A positioned reference preview is supplied as a second visual input, and the original source frame is retained for an independent fidelity, preview-alignment, blending, and preservation review.
 5. **Remember.** The accepted patch is appended as a new revision. The timeline can scrub, compare, replay, share, and restore earlier states without erasing history.
 
 ## Why it is different
@@ -23,8 +23,8 @@ Multiple people can work at once. A live reservation locks only the region curre
 
 ## OpenAI in the product
 
-- **GPT-5.6 (`gpt-5.6`)** is the edit planner. It preserves the contributor's request, accounts for an optional reference image, and produces a short instruction for the renderer.
-- **GPT Image (`gpt-image-2`)** performs the masked image edit on a 1024×1024 context frame.
+- **GPT-5.6 (`gpt-5.6`)** reviews generated subjects for framing and blending. Reference-guided edits additionally require fidelity, preview-scale alignment, and preservation of uncovered prior artwork.
+- **GPT Image (`gpt-image-2`)** performs the masked image edit on a 1024×1024 crop of the current canvas. Reference subjects are already positioned in that input at the exact on-canvas footprint.
 - **OpenAI Moderation (`omni-moderation-latest`)** checks the contributor's original request before planning or generation.
 
 The queue fails closed if any required OpenAI step is unavailable. The original contributor prompt—not the generated plan—remains the public historical record.
@@ -32,7 +32,7 @@ The queue fails closed if any required OpenAI step is unavailable. The original 
 ## Architecture
 
 - Next.js-compatible React UI on vinext and Cloudflare Workers
-- D1 for artworks, revisions, edit reservations, commit fencing, rate windows, and blob metadata
+- D1 for artworks, revisions, edit reservations, visitor activity, commit fencing, rate windows, and blob metadata
 - R2 for canonical tiles, masks, references, patches, and keyframes
 - Generated D1 migrations as the authoritative schema
 - Atomic global-coordinate reservations with lease recovery and overlap rejection
@@ -65,6 +65,12 @@ npm run dev
 Open `http://localhost:4317/` (or the port printed by the development server). No sample download is required: local D1 is initialized with one plain white 2048×2048 seed revision.
 
 Without `OPENAI_API_KEY`, the archive remains viewable but new contributions are disabled. Configure the same name as a production secret before deployment.
+
+## Visitor activity
+
+`/visitors` is a private activity dashboard for an authenticated administrator. It shows page views, key canvas interactions, and server-confirmed generation or restore requests. The dashboard calls a fail-closed API guarded by the existing `ADMIN_EMAIL_ALLOWLIST` dispatcher identity.
+
+Visitor records contain a salted, pseudonymous network ID, an opaque per-tab session ID when JavaScript is available, country code, and a truncated user agent. They deliberately exclude raw IP addresses, prompts, reference uploads, and image data. Configure `VISITOR_LOG_SALT` as a production secret (or retain the existing `RATE_LIMIT_SALT` as a temporary fallback) before deployment.
 
 ## Validation
 

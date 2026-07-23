@@ -57,6 +57,41 @@
       "when": 1784693817000,
       "tag": "0007_current_live_canvas_reset",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1784746104000,
+      "tag": "0008_clear_live_archive",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1784750400000,
+      "tag": "0009_durable_job_attempts",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1784774061000,
+      "tag": "0010_reset_framing_test_archive",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1784825202000,
+      "tag": "0011_clear_canvas_and_history",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1784839324633,
+      "tag": "0012_visitor_activity",
+      "breakpoints": true
     }
   ]
 }

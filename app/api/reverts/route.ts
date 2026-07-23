@@ -5,9 +5,9 @@ import {
 import { contributionRatePolicy } from "@/lib/palimpsest/rate-policy.mjs";
 import { createRequestId, getRuntimeEnv, jsonError } from "@/lib/palimpsest/runtime";
 import {
-  enforceRateLimit,
   ensurePalimpsest,
   insertRevertJob,
+  recordVisitorEvent,
   requesterHash,
 } from "@/lib/palimpsest/store";
 
@@ -35,16 +35,23 @@ export async function POST(request: Request) {
     }
     const hash = await requesterHash(env, request);
     const ratePolicy = contributionRatePolicy(env, request, "revert");
-    for (const limit of ratePolicy.limits) {
-      await enforceRateLimit(env, hash, limit.scope, limit.limit, limit.windowMs);
-    }
     const job = await insertRevertJob(env, {
       baseRevisionId: body.baseRevisionId,
       targetRevisionId: body.targetRevisionId,
       displayName: normalizeDisplayName(body.displayName),
       requesterHash: hash,
       idempotencyKey,
+      rateLimits: ratePolicy.limits,
+      requestId,
     });
+    try {
+      await recordVisitorEvent(env, request, "restore_requested", {
+        sessionId: request.headers.get("X-Palimpsest-Session"),
+        jobId: job.id,
+      });
+    } catch (logError) {
+      console.warn(`[palimpsest:${requestId}] visitor activity logging failed`, logError);
+    }
     console.info(`[palimpsest:${requestId}] contribution accepted`, {
       kind: "revert",
       ratePolicy: ratePolicy.name,

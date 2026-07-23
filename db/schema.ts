@@ -74,7 +74,7 @@ export const revisions = sqliteTable(
     parentRevisionId: text("parent_revision_id"),
     jobId: text("job_id").unique(),
     origin: text("origin", {
-      enum: ["seed", "demo", "openai", "revert"],
+      enum: ["seed", "demo", "openai", "placement", "revert"],
     }).notNull(),
     status: text("status", { enum: ["accepted"] }).notNull(),
     authorId: text("author_id")
@@ -175,7 +175,7 @@ export const editJobs = sqliteTable(
       ],
     }).notNull(),
     executionMode: text("execution_mode", {
-      enum: ["openai", "none"],
+      enum: ["openai", "placement", "none"],
     }).notNull(),
     authorId: text("author_id")
       .notNull()
@@ -198,6 +198,9 @@ export const editJobs = sqliteTable(
     referenceBlobId: text("reference_blob_id"),
     idempotencyKey: text("idempotency_key").notNull(),
     requestFingerprint: text("request_fingerprint").notNull(),
+    retryOfJobId: text("retry_of_job_id"),
+    retryTokenHash: text("retry_token_hash"),
+    requestId: text("request_id"),
     attemptCount: integer("attempt_count").notNull().default(0),
     availableAt: integer("available_at").notNull(),
     workerToken: text("worker_token"),
@@ -229,6 +232,12 @@ export const editJobs = sqliteTable(
       table.state,
       table.leaseExpiresAt,
     ),
+    uniqueIndex("edit_jobs_retry_of_uq").on(table.retryOfJobId),
+    index("edit_jobs_activity_idx").on(
+      table.artworkId,
+      table.createdAt,
+      table.id,
+    ),
   ],
 );
 
@@ -243,18 +252,59 @@ export const commitLocks = sqliteTable("artwork_commit_locks", {
   leaseExpiresAt: integer("lease_expires_at"),
 });
 
-export const rateWindows = sqliteTable(
-  "rate_windows",
+export const rateLimitClaims = sqliteTable(
+  "rate_limit_claims",
   {
     requesterHash: text("requester_hash").notNull(),
     scope: text("scope").notNull(),
     windowStart: integer("window_start").notNull(),
-    count: integer("count").notNull(),
-    updatedAt: integer("updated_at").notNull(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    jobId: text("job_id").notNull(),
+    createdAt,
   },
   (table) => [
     primaryKey({
-      columns: [table.requesterHash, table.scope, table.windowStart],
+      columns: [
+        table.requesterHash,
+        table.scope,
+        table.windowStart,
+        table.idempotencyKey,
+      ],
     }),
+  ],
+);
+
+export const visitorEvents = sqliteTable(
+  "visitor_events",
+  {
+    id: text("id").primaryKey(),
+    // A salted, non-reversible network identifier. Raw IP addresses are never
+    // persisted in the activity log.
+    visitorHash: text("visitor_hash").notNull(),
+    // A browser-generated opaque value used only to group one visit.
+    sessionId: text("session_id"),
+    eventType: text("event_type", {
+      enum: [
+        "page_view",
+        "guide_opened",
+        "queue_opened",
+        "history_opened",
+        "contribution_opened",
+        "patch_confirmed",
+        "mask_confirmed",
+        "reference_added",
+        "generation_requested",
+        "restore_requested",
+      ],
+    }).notNull(),
+    path: text("path").notNull(),
+    country: text("country"),
+    userAgent: text("user_agent"),
+    jobId: text("job_id").references(() => editJobs.id, { onDelete: "set null" }),
+    createdAt,
+  },
+  (table) => [
+    index("visitor_events_created_idx").on(table.createdAt),
+    index("visitor_events_visitor_created_idx").on(table.visitorHash, table.createdAt),
   ],
 );

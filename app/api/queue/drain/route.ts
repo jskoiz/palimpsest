@@ -7,13 +7,13 @@ export async function POST(request: Request) {
   try {
     const env = getRuntimeEnv();
     await ensurePalimpsest(env, request.url);
-    const result = await processQueue(env, 4);
+    const result = await processQueue(env, 1);
     return Response.json(
       {
         processed: result.claimed,
         completed: result.completed,
         workerFailures: result.workerFailures,
-        message: "Independent reservations were processed concurrently.",
+        message: result.claimed ? "One reservation was processed." : "The queue is idle.",
       },
       { headers: { "Cache-Control": "no-store", "X-Request-Id": requestId } },
     );
