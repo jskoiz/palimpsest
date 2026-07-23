@@ -6,7 +6,10 @@ import test from "node:test";
 import {
   ARTWORK_SIZE,
   DomainError,
+  REFERENCE_EDIT_MIN_EDGE,
+  REFERENCE_TARGET_FILL,
   assertFreshBase,
+  assertReferenceEditRegion,
   buildOpenAiEditPrompt,
   createDisplayMaskSvg,
   displayMaskForLayer,
@@ -22,6 +25,7 @@ import {
   maskInGenerationFrame,
   nudgeEditRegion,
   positionEditRegion,
+  referenceSafeEditRegion,
   regionInGenerationFrame,
   resizeEditRegion,
   regionsOverlap,
@@ -33,6 +37,7 @@ import {
   extractEditOutputReview,
   buildReferenceEditReviewRequest,
   extractReferenceEditReview,
+  referenceReviewOutcome,
 } from "../lib/palimpsest/ai-review.mjs";
 import {
   activityJobCounts,
@@ -364,6 +369,17 @@ test("reference-image prompts preserve the positioned subject while blending its
   assert.match(prompt, /Add the flower from my reference\./);
 });
 
+test("reference containment retry asks for one materially smaller subject", () => {
+  const prompt = buildOpenAiEditPrompt(
+    "Add the flower from my reference.",
+    true,
+    true,
+  );
+  assert.match(prompt, /single containment retry/i);
+  assert.match(prompt, /no more than 70% of the prepared guide/i);
+  assert.match(prompt, /do not enlarge the subject/i);
+});
+
 test("every generated subject receives a structured framing review", () => {
   const request = buildEditOutputReviewRequest({
     requestedChange: "handwritten note that says 'Codex is awesome'",
@@ -460,7 +476,33 @@ test("reference generations receive structured fidelity and blending review", ()
   assert.equal(extractReferenceEditReview({ output: [] }), null);
 });
 
-test("live generation uses one medium image pass followed by one quality review", async () => {
+test("reference review retries only a clean containment miss and only once", () => {
+  assert.equal(
+    referenceReviewOutcome({ contained: true, faithful: true, blended: true }),
+    "accept",
+  );
+  assert.equal(
+    referenceReviewOutcome({ contained: false, faithful: true, blended: true }),
+    "retry-containment",
+  );
+  assert.equal(
+    referenceReviewOutcome(
+      { contained: false, faithful: true, blended: true },
+      true,
+    ),
+    "reject-containment",
+  );
+  assert.equal(
+    referenceReviewOutcome({ contained: true, faithful: false, blended: true }),
+    "reject-reference",
+  );
+  assert.equal(
+    referenceReviewOutcome({ contained: true, faithful: true, blended: false }),
+    "reject-reference",
+  );
+});
+
+test("live generation uses one image pass with one bounded reference containment retry", async () => {
   const [routeSource, clientSource, queueSource, storeSource] = await Promise.all([
     readFile(new URL("../app/api/edits/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8"),
@@ -474,7 +516,10 @@ test("live generation uses one medium image pass followed by one quality review"
   assert.match(clientSource, /makes one masked image pass/);
   assert.doesNotMatch(clientSource, /plans the request/);
   assert.doesNotMatch(clientSource, /REFERENCE_MASK_INSET/);
-  assert.match(clientSource, /const blob = await normalizeReferenceImage\(file\)/);
+  assert.match(clientSource, /const normalized = await normalizeReferenceImage\(file\)/);
+  assert.match(clientSource, /referenceSafeEditRegion/);
+  assert.match(clientSource, /REFERENCE_EDIT_MIN_EDGE/);
+  assert.match(clientSource, /33% margin on every side/);
   assert.match(clientSource, /sourceBlob: file/);
   assert.match(clientSource, /REFERENCE_IMAGE_SIZE \/ image\.width/);
   assert.match(clientSource, /flattenArtworkFrame\(editBase\.state, frame\)/);
@@ -488,14 +533,16 @@ test("live generation uses one medium image pass followed by one quality review"
   assert.doesNotMatch(clientSource, /normalizeReferenceImage\(file, editRegion\)/);
   assert.doesNotMatch(clientSource, /referenceImage \? REFERENCE_MASK_INSET : 0/);
   assert.match(routeSource, /referenceValue instanceof File/);
+  assert.match(routeSource, /assertReferenceEditRegion\(validated\.region\)/);
   assert.match(routeSource, /referenceBytes/);
   assert.match(storeSource, /reference_blob_id/);
   assert.match(storeSource, /SUBJECT_OUT_OF_FRAME[\s\S]*REFERENCE_REVIEW_FAILED/);
   assert.doesNotMatch(storeSource, /kind[^\n]*'reference'|VALUES \([^\n]*'reference'/);
   assert.match(storeSource, /referenceBlobId,[\s\S]*VALUES \(\?, \?, 'input'/);
   assert.match(queueSource, /palimpsest-reference\.png/);
-  assert.equal(queueSource.match(/await generateOpenAiPatch\(/gu)?.length, 1);
-  assert.match(queueSource, /job\.prompt,\s*"medium"/);
+  assert.equal(queueSource.match(/await generateOpenAiPatch\(/gu)?.length, 2);
+  assert.match(queueSource, /job\.prompt,\s*"medium",\s*false/);
+  assert.match(queueSource, /job\.prompt,\s*"medium",\s*true/);
   assert.doesNotMatch(queueSource, /planEditPrompt|generalRetryPrompt|referenceRetryPrompt/);
   assert.doesNotMatch(queueSource, /MAX_GENERAL_EDIT_ATTEMPTS|MAX_REFERENCE_ATTEMPTS/);
   assert.doesNotMatch(queueSource, /\/v1\/moderations|omni-moderation/);
@@ -505,9 +552,12 @@ test("live generation uses one medium image pass followed by one quality review"
   assert.doesNotMatch(queueSource, /gpt-image-1\.5/);
   assert.doesNotMatch(queueSource, /form\.append\("background", "transparent"\)/);
   assert.doesNotMatch(queueSource, /form\.append\("input_fidelity"/);
-  assert.match(queueSource, /buildOpenAiEditPrompt\(requestedPrompt, Boolean\(reference\)\)/);
+  assert.match(queueSource, /buildOpenAiEditPrompt\([\s\S]*Boolean\(reference\) && containmentRetry/);
   assert.match(queueSource, /reviewReferenceEdit/);
-  assert.match(queueSource, /!review\.contained \|\| !review\.faithful \|\| !review\.blended/);
+  assert.match(queueSource, /referenceReviewOutcome\(review\)/);
+  assert.match(queueSource, /referenceReviewOutcome\(review, true\)/);
+  assert.match(queueSource, /outcome === "retry-containment"/);
+  assert.match(queueSource, /outcome === "reject-containment"/);
   assert.match(queueSource, /reviewEditOutput/);
   assert.match(queueSource, /!review\.contained \|\| !review\.blended/);
   assert.match(queueSource, /use retry for one fresh attempt/);
@@ -631,6 +681,44 @@ test("patch resizing stays useful, bounded, and inside the artwork", () => {
   assert.deepEqual(
     resizeEditRegion({ x: 1960, y: 1930, width: 88, height: 118 }, 500, 500, 64),
     { x: 1960, y: 1930, width: 88, height: 118 },
+  );
+});
+
+test("reference patches expand around the intended placement with aspect-aware room", () => {
+  assert.equal(REFERENCE_EDIT_MIN_EDGE, 320);
+  assert.equal(REFERENCE_TARGET_FILL, 0.35);
+  assert.deepEqual(
+    referenceSafeEditRegion(
+      { x: 326, y: 733, width: 193, height: 228 },
+      1,
+    ),
+    { x: 263, y: 687, width: 320, height: 320 },
+  );
+  assert.deepEqual(
+    referenceSafeEditRegion(
+      { x: 326, y: 733, width: 193, height: 228 },
+      1.5,
+    ),
+    { x: 183, y: 687, width: 480, height: 320 },
+  );
+  assert.deepEqual(
+    referenceSafeEditRegion(
+      { x: 1900, y: 1800, width: 160, height: 160 },
+      1,
+    ),
+    { x: 1728, y: 1720, width: 320, height: 320 },
+  );
+});
+
+test("server-side reference sizing rejects undersized patches", () => {
+  assert.equal(assertReferenceEditRegion({ width: 320, height: 320 }), true);
+  expectCode(
+    () => assertReferenceEditRegion({ width: 319, height: 512 }),
+    "REFERENCE_REGION_TOO_SMALL",
+  );
+  expectCode(
+    () => assertReferenceEditRegion({ width: 512, height: 319 }),
+    "REFERENCE_REGION_TOO_SMALL",
   );
 });
 

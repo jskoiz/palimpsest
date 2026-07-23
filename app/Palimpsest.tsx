@@ -21,6 +21,7 @@ import {
 } from "@/app/activity-ui.mjs";
 import {
   ARTWORK_SIZE,
+  REFERENCE_EDIT_MIN_EDGE,
   REFERENCE_TARGET_FILL,
 } from "@/lib/palimpsest/domain.mjs";
 import {
@@ -32,6 +33,7 @@ import {
   generationFrameForRegion,
   maskInGenerationFrame,
   positionEditRegion,
+  referenceSafeEditRegion,
   regionInGenerationFrame,
   resizeEditRegion,
   regionsOverlap,
@@ -192,8 +194,10 @@ type Stroke = {
 type ReferenceImage = {
   blob: Blob;
   fileName: string;
+  height: number;
   previewUrl: string;
   sourceBlob: Blob;
+  width: number;
 };
 
 const terminalJobStates = new Set(["succeeded", "stale", "rejected", "failed"]);
@@ -638,8 +642,8 @@ function WelcomeDrawer({
                 <p>
                   Place and resize the patch, then paint what may change. GPT Image
                   makes one masked image pass; GPT-5.6 checks it before acceptance.
-                  If it does not pass, you decide whether to retry. References are
-                  optional. Live outlines lock only active work.
+                  A reference-only framing miss gets one smaller automatic retry.
+                  References use a protected safe area. Live outlines lock only active work.
                 </p>
               </section>
             </div>
@@ -700,7 +704,9 @@ function canvasBlob(canvas: HTMLCanvasElement, message: string): Promise<Blob> {
   });
 }
 
-async function normalizeReferenceImage(file: File): Promise<Blob> {
+async function normalizeReferenceImage(
+  file: File,
+): Promise<{ blob: Blob; height: number; width: number }> {
   let image: ImageBitmap;
   try {
     image = await createImageBitmap(file);
@@ -731,7 +737,11 @@ async function normalizeReferenceImage(file: File): Promise<Blob> {
       width,
       height,
     );
-    return canvasBlob(canvas, "The reference image could not be encoded.");
+    return {
+      blob: await canvasBlob(canvas, "The reference image could not be encoded."),
+      height: image.height,
+      width: image.width,
+    };
   } finally {
     image.close();
   }
@@ -1115,6 +1125,13 @@ export default function Palimpsest() {
     historyOpen && !queueOpen && !editOpen && !welcomeOpen && revisions.length > 0;
   const notCurrent = Boolean(selectedRevision && history && selectedRevision.id !== history.headRevisionId);
   const validMask = fillMask || strokes.length > 0;
+  const patchMinimumEdge = referenceImage
+    ? REFERENCE_EDIT_MIN_EDGE
+    : EDIT_REGION_MIN_EDGE;
+  const referenceRegionIsSafe =
+    !referenceImage ||
+    (editRegion.width >= REFERENCE_EDIT_MIN_EDGE &&
+      editRegion.height >= REFERENCE_EDIT_MIN_EDGE);
   const jobActive = Boolean(job && !terminalJobStates.has(job.state));
   const activityCounts = activityJobCounts(activity.jobs);
   const queueTotal = activityCounts.inProcess;
@@ -2197,13 +2214,23 @@ export default function Palimpsest() {
 
   const resizePatch = (desiredWidth: number, desiredHeight: number) => {
     setEditRegion((region) =>
-      resizeEditRegion(region, desiredWidth, desiredHeight),
+      resizeEditRegion(
+        region,
+        desiredWidth,
+        desiredHeight,
+        patchMinimumEdge,
+      ),
     );
   };
 
   const resizePatchBy = (amount: number) => {
     setEditRegion((region) =>
-      resizeEditRegion(region, region.width + amount, region.height + amount),
+      resizeEditRegion(
+        region,
+        region.width + amount,
+        region.height + amount,
+        patchMinimumEdge,
+      ),
     );
     wake();
   };
@@ -2234,6 +2261,7 @@ export default function Palimpsest() {
         region,
         point.x + resize.edgeOffsetX - region.x,
         point.y + resize.edgeOffsetY - region.y,
+        patchMinimumEdge,
       ),
     );
     event.stopPropagation();
@@ -2257,7 +2285,7 @@ export default function Palimpsest() {
     else if (event.key === "ArrowUp") heightDelta = -amount;
     else if (event.key === "ArrowDown") heightDelta = amount;
     else if (event.key === "Home") {
-      resizePatch(EDIT_REGION_MIN_EDGE, EDIT_REGION_MIN_EDGE);
+      resizePatch(patchMinimumEdge, patchMinimumEdge);
     } else if (event.key === "End") {
       resizePatch(EDIT_REGION_MAX_EDGE, EDIT_REGION_MAX_EDGE);
     } else {
@@ -2269,6 +2297,7 @@ export default function Palimpsest() {
           region,
           region.width + widthDelta,
           region.height + heightDelta,
+          patchMinimumEdge,
         ),
       );
     }
@@ -2338,13 +2367,37 @@ export default function Palimpsest() {
     setSubmitError(null);
     setIsPreparing(true);
     try {
-      const blob = await normalizeReferenceImage(file);
+      const normalized = await normalizeReferenceImage(file);
+      const safeRegion = referenceSafeEditRegion(
+        editRegion,
+        normalized.width / normalized.height,
+      );
+      const expanded =
+        safeRegion.x !== editRegion.x ||
+        safeRegion.y !== editRegion.y ||
+        safeRegion.width !== editRegion.width ||
+        safeRegion.height !== editRegion.height;
       if (referencePreviewUrlRef.current) {
         URL.revokeObjectURL(referencePreviewUrlRef.current);
       }
       const previewUrl = URL.createObjectURL(file);
       referencePreviewUrlRef.current = previewUrl;
-      setReferenceImage({ blob, fileName: file.name, previewUrl, sourceBlob: file });
+      setEditRegion(safeRegion);
+      setStrokes([]);
+      setFillMask(true);
+      setReferenceImage({
+        blob: normalized.blob,
+        fileName: file.name,
+        height: normalized.height,
+        previewUrl,
+        sourceBlob: file,
+        width: normalized.width,
+      });
+      showToast(
+        expanded
+          ? `Reference safe area expanded to ${safeRegion.width} × ${safeRegion.height}.`
+          : "Reference safe area ready — 33% margin on every side.",
+      );
     } catch (error) {
       event.currentTarget.value = "";
       setSubmitError(
@@ -2361,6 +2414,7 @@ export default function Palimpsest() {
     !jobActive &&
     liveEditingAvailable &&
     !conflictingRegion &&
+    referenceRegionIsSafe &&
     prompt.trim().length >= 3 &&
     validMask &&
     step === 3;
@@ -2728,12 +2782,13 @@ export default function Palimpsest() {
                 ) : null}
                 {referenceImage && step === 3 && !submitted ? (
                   <div className="mono-reference-on-canvas" aria-hidden="true">
-                    <img
-                      src={referenceImage.previewUrl}
-                      alt=""
+                    <div
+                      className="mono-reference-safe-zone"
                       style={referencePreviewStyle()}
-                    />
-                    <span>reference</span>
+                    >
+                      <img src={referenceImage.previewUrl} alt="" />
+                    </div>
+                    <span>safe subject area · 33% margin</span>
                   </div>
                 ) : null}
                 {step >= 2 && !submitted ? (
@@ -3226,8 +3281,8 @@ export default function Palimpsest() {
                   type="button"
                   aria-label="Make edit patch smaller"
                   disabled={
-                    editRegion.width <= EDIT_REGION_MIN_EDGE &&
-                    editRegion.height <= EDIT_REGION_MIN_EDGE
+                    editRegion.width <= patchMinimumEdge &&
+                    editRegion.height <= patchMinimumEdge
                   }
                   onClick={() => resizePatchBy(-PATCH_SIZE_STEP)}
                 >

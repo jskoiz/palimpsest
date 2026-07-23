@@ -496,7 +496,15 @@ body {
   pointer-events: none;
 }
 
-.mono-reference-on-canvas > img {
+.mono-reference-safe-zone {
+  overflow: hidden;
+  border: 1px dashed rgba(255, 255, 255, 0.88);
+  box-shadow:
+    0 0 0 1px rgba(16, 14, 24, 0.35),
+    0 0 24px rgba(255, 255, 255, 0.12);
+}
+
+.mono-reference-safe-zone > img {
   width: 100%;
   height: 100%;
   display: block;
@@ -508,7 +516,11 @@ body {
   position: absolute;
   top: 5px;
   right: 5px;
+  max-width: calc(100% - 10px);
   padding: 2px 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   background: rgba(var(--ink), 0.72);
   color: #fff;
   font-family: var(--font-mono);

@@ -8,6 +8,7 @@ import {
   extractEditOutputReview,
   buildReferenceEditReviewRequest,
   extractReferenceEditReview,
+  referenceReviewOutcome,
 } from "./ai-review.mjs";
 import { isRetryableD1Reset, retryIdempotentD1 } from "./d1.mjs";
 import type { AppEnv } from "./runtime";
@@ -490,20 +491,21 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
     const frame = jobFrame(job);
     const editableRegion = regionInGenerationFrame(region, frame);
     await updateStage(env, job, "moderating", "generating");
-    const patch = await generateOpenAiPatch(
+    let patch = await generateOpenAiPatch(
       env,
       job,
       apiKey,
       job.prompt,
       "medium",
+      false,
     );
     if (job.referenceBlobId) {
-      const referenceBytes = patch.referenceBytes;
+      let referenceBytes = patch.referenceBytes;
       if (!referenceBytes) {
         throw new DomainError("INTERNAL_ERROR", "The reference image could not be reviewed.");
       }
       await updateStage(env, job, "generating", "generating");
-      const review = await reviewReferenceEdit(
+      let review = await reviewReferenceEdit(
         apiKey,
         job.prompt,
         patch.bytes,
@@ -512,12 +514,58 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
         editableRegion,
       );
       console.info(`[palimpsest:${job.id}] reference edit review`, {
+        attempt: "initial",
         subjectContained: review?.contained ?? null,
         referenceFaithful: review?.faithful ?? null,
         surroundingsBlended: review?.blended ?? null,
         reviewerReason: review?.reason.slice(0, 240) ?? null,
       });
-      if (!review.contained || !review.faithful || !review.blended) {
+      let outcome = referenceReviewOutcome(review);
+      if (outcome === "retry-containment") {
+        console.info(`[palimpsest:${job.id}] reference containment retry`, {
+          reviewerReason: review.reason.slice(0, 240),
+        });
+        await updateStage(env, job, "generating", "generating");
+        patch = await generateOpenAiPatch(
+          env,
+          job,
+          apiKey,
+          job.prompt,
+          "medium",
+          true,
+        );
+        referenceBytes = patch.referenceBytes;
+        if (!referenceBytes) {
+          throw new DomainError("INTERNAL_ERROR", "The reference image could not be reviewed.");
+        }
+        await updateStage(env, job, "generating", "generating");
+        review = await reviewReferenceEdit(
+          apiKey,
+          job.prompt,
+          patch.bytes,
+          referenceBytes,
+          patch.providerMaskBytes,
+          editableRegion,
+        );
+        console.info(`[palimpsest:${job.id}] reference edit review`, {
+          attempt: "containment-retry",
+          subjectContained: review.contained,
+          referenceFaithful: review.faithful,
+          surroundingsBlended: review.blended,
+          reviewerReason: review.reason.slice(0, 240),
+        });
+        outcome = referenceReviewOutcome(review, true);
+      }
+      if (outcome === "reject-containment") {
+        throw new DomainError(
+          "SUBJECT_OUT_OF_FRAME",
+          reviewFailureMessage(
+            "The generated reference subject still crossed the safe area after one automatic smaller-scale retry. Nothing was added to history; choose a larger patch or submit again.",
+            review.reason,
+          ),
+        );
+      }
+      if (outcome === "reject-reference") {
         throw new DomainError(
           "REFERENCE_REVIEW_FAILED",
           reviewFailureMessage(
@@ -602,6 +650,7 @@ async function generateOpenAiPatch(
   apiKey: string,
   requestedPrompt: string,
   quality: "medium" | "high",
+  containmentRetry: boolean,
 ): Promise<{
   bytes: Uint8Array;
   contentType: string;
@@ -665,7 +714,14 @@ async function generateOpenAiPatch(
       type: "image/png",
     }),
   );
-  form.append("prompt", buildOpenAiEditPrompt(requestedPrompt, Boolean(reference)));
+  form.append(
+    "prompt",
+    buildOpenAiEditPrompt(
+      requestedPrompt,
+      Boolean(reference),
+      Boolean(reference) && containmentRetry,
+    ),
+  );
   form.append("size", "1024x1024");
   form.append("quality", quality);
   form.append("output_format", "png");

@@ -1,5 +1,6 @@
 import {
   DomainError,
+  assertReferenceEditRegion,
   normalizeDisplayName,
   normalizePrompt,
   validateRegion,
@@ -122,6 +123,9 @@ export async function POST(request: Request) {
       fill: meta.fill,
       strokes: meta.strokes,
     });
+    if (referenceValue instanceof File) {
+      assertReferenceEditRegion(validated.region);
+    }
     const [sourceBytes, maskBytes, referenceBytes] = await Promise.all([
       sourceValue.arrayBuffer().then((value) => new Uint8Array(value)),
       maskValue.arrayBuffer().then((value) => new Uint8Array(value)),
