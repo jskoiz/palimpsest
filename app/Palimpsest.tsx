@@ -641,8 +641,8 @@ function WelcomeDrawer({
                 <h2>Contribute</h2>
                 <p>
                   Place and resize the patch, then paint what may change. GPT Image
-                  makes one masked image pass; GPT-5.6 checks it before acceptance.
-                  A reference-only placement miss gets one automatic retry.
+                  makes one masked image pass; GPT-5.6 checks it once before acceptance.
+                  Each submission is time-bounded and never silently replays a second generation.
                   References use the preview as an exact protected placement area, so
                   prior artwork outside it cannot be replaced. Live outlines lock only active work.
                 </p>
@@ -1293,7 +1293,7 @@ export default function Palimpsest() {
       if (!response.ok) throw new Error("The queue could not be reached.");
       return true;
     } catch {
-      // The durable job remains queued; bounded recovery retries with backoff.
+      // The durable job remains visible; bounded recovery clears a stopped worker.
       return false;
     } finally {
       drainInFlight.current = false;

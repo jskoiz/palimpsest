@@ -73,7 +73,7 @@ export function publicActivityJobs(jobs) {
  */
 export function queueRecoveryDelay(attempt, randomValue = Math.random()) {
   const safeAttempt = Number.isFinite(attempt) ? Math.max(0, Math.floor(attempt)) : 0;
-  const base = Math.min(60_000, 12_000 * 2 ** safeAttempt);
+  const base = Math.min(15_000, 2_000 * 2 ** safeAttempt);
   const random = Number.isFinite(randomValue)
     ? Math.max(0, Math.min(1, randomValue))
     : 0.5;

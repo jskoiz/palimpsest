@@ -48,6 +48,14 @@ import {
   queueRecoveryDelay,
   viewForActivityRegion,
 } from "../app/activity-ui.mjs";
+import {
+  EDIT_REVIEW_TIMEOUT_MS,
+  IMAGE_EDIT_TIMEOUT_MS,
+  WORKER_HEARTBEAT_MS,
+  WORKER_LEASE_MS,
+  WORKER_TOTAL_BUDGET_MS,
+  boundedStageTimeout,
+} from "../lib/palimpsest/worker-policy.mjs";
 
 function expectCode(callback, code) {
   assert.throws(callback, (error) => error instanceof DomainError && error.code === code);
@@ -78,16 +86,28 @@ test("activity jobs use stable visitor-facing states and separate failures from 
 });
 
 test("queue recovery and collaboration polling back off with bounded jitter", () => {
-  assert.equal(queueRecoveryDelay(0, 0.5), 12_000);
-  assert.equal(queueRecoveryDelay(1, 0.5), 24_000);
-  assert.equal(queueRecoveryDelay(8, 0.5), 60_000);
-  assert.equal(queueRecoveryDelay(0, 0), 10_200);
-  assert.equal(queueRecoveryDelay(0, 1), 13_800);
+  assert.equal(queueRecoveryDelay(0, 0.5), 2_000);
+  assert.equal(queueRecoveryDelay(1, 0.5), 4_000);
+  assert.equal(queueRecoveryDelay(8, 0.5), 15_000);
+  assert.equal(queueRecoveryDelay(0, 0), 1_700);
+  assert.equal(queueRecoveryDelay(0, 1), 2_300);
 
   assert.equal(collaborationPollDelay(true, false, 0.5), 3_000);
   assert.equal(collaborationPollDelay(false, false, 0.5), 15_000);
   assert.equal(collaborationPollDelay(true, true, 0.5), 8_000);
   assert.equal(collaborationPollDelay(false, true, 0.5), 30_000);
+});
+
+test("worker timing stays bounded and renews well before expiry", () => {
+  assert.equal(WORKER_LEASE_MS, 60_000);
+  assert.equal(WORKER_HEARTBEAT_MS, 15_000);
+  assert.ok(WORKER_HEARTBEAT_MS * 3 < WORKER_LEASE_MS);
+  assert.equal(IMAGE_EDIT_TIMEOUT_MS, 120_000);
+  assert.equal(EDIT_REVIEW_TIMEOUT_MS, 45_000);
+  assert.equal(WORKER_TOTAL_BUDGET_MS, 180_000);
+  assert.ok(IMAGE_EDIT_TIMEOUT_MS + EDIT_REVIEW_TIMEOUT_MS < WORKER_TOTAL_BUDGET_MS);
+  assert.equal(boundedStageTimeout(10_000, 45_000, 1_000), 9_000);
+  assert.equal(boundedStageTimeout(10_000, 45_000, 12_000), 0);
 });
 
 test("activity region focus places the target above the queue panel", () => {
@@ -373,15 +393,11 @@ test("reference-image prompts preserve the positioned subject while blending its
   assert.match(prompt, /Add the flower from my reference\./);
 });
 
-test("reference placement retry preserves the selected scale without cropping", () => {
-  const prompt = buildOpenAiEditPrompt(
-    "Add the flower from my reference.",
-    true,
-    true,
-  );
-  assert.match(prompt, /single placement retry/i);
+test("reference placement prompt is strict enough for one bounded image pass", () => {
+  const prompt = buildOpenAiEditPrompt("Add the flower from my reference.", true);
   assert.match(prompt, /Match the reference preview's scale and center exactly/i);
   assert.match(prompt, /without shrinking it below half/i);
+  assert.doesNotMatch(prompt, /retry/i);
 });
 
 test("every generated subject receives a structured framing review", () => {
@@ -489,7 +505,7 @@ test("reference generations receive structured fidelity and blending review", ()
   assert.equal(extractReferenceEditReview({ output: [] }), null);
 });
 
-test("reference review retries only a clean containment miss and only once", () => {
+test("reference review returns one terminal outcome without another image pass", () => {
   assert.equal(
     referenceReviewOutcome({
       contained: true,
@@ -508,19 +524,6 @@ test("reference review retries only a clean containment miss and only once", () 
       blended: true,
       sourcePreserved: true,
     }),
-    "retry-containment",
-  );
-  assert.equal(
-    referenceReviewOutcome(
-      {
-        contained: false,
-        faithful: true,
-        placementMatched: false,
-        blended: true,
-        sourcePreserved: true,
-      },
-      true,
-    ),
     "reject-containment",
   );
   assert.equal(
@@ -555,7 +558,7 @@ test("reference review retries only a clean containment miss and only once", () 
   );
 });
 
-test("live generation uses one image pass with one bounded reference containment retry", async () => {
+test("live generation uses one bounded image pass and one review pass", async () => {
   const [routeSource, clientSource, queueSource, storeSource] = await Promise.all([
     readFile(new URL("../app/api/edits/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8"),
@@ -567,6 +570,7 @@ test("live generation uses one image pass with one bounded reference containment
   assert.match(clientSource, /mono-reference-on-canvas/);
   assert.match(clientSource, /image\/png,image\/jpeg,image\/webp/);
   assert.match(clientSource, /makes one masked image pass/);
+  assert.doesNotMatch(clientSource, /automatic retry/);
   assert.doesNotMatch(clientSource, /plans the request/);
   assert.doesNotMatch(clientSource, /REFERENCE_MASK_INSET/);
   assert.match(clientSource, /const normalized = await normalizeReferenceImage\(file\)/);
@@ -594,28 +598,30 @@ test("live generation uses one image pass with one bounded reference containment
   assert.doesNotMatch(storeSource, /kind[^\n]*'reference'|VALUES \([^\n]*'reference'/);
   assert.match(storeSource, /referenceBlobId,[\s\S]*VALUES \(\?, \?, 'input'/);
   assert.match(queueSource, /palimpsest-reference\.png/);
-  assert.equal(queueSource.match(/await generateOpenAiPatch\(/gu)?.length, 2);
-  assert.match(queueSource, /job\.prompt,\s*"medium",\s*false/);
-  assert.match(queueSource, /job\.prompt,\s*"medium",\s*true/);
+  assert.equal(queueSource.match(/await generateOpenAiPatch\(/gu)?.length, 1);
+  assert.match(queueSource, /job\.prompt,\s*deadlineAt/);
   assert.doesNotMatch(queueSource, /planEditPrompt|generalRetryPrompt|referenceRetryPrompt/);
   assert.doesNotMatch(queueSource, /MAX_GENERAL_EDIT_ATTEMPTS|MAX_REFERENCE_ATTEMPTS/);
   assert.doesNotMatch(queueSource, /\/v1\/moderations|omni-moderation/);
-  assert.match(queueSource, /form\.append\("quality", quality\)/);
+  assert.match(queueSource, /form\.append\("quality", "medium"\)/);
   assert.match(queueSource, /form\.append\("model", "gpt-image-2"\)/);
   assert.match(queueSource, /form\.append\("moderation", "auto"\)/);
   assert.doesNotMatch(queueSource, /gpt-image-1\.5/);
   assert.doesNotMatch(queueSource, /form\.append\("background", "transparent"\)/);
   assert.doesNotMatch(queueSource, /form\.append\("input_fidelity"/);
-  assert.match(queueSource, /buildOpenAiEditPrompt\([\s\S]*Boolean\(reference\) && containmentRetry/);
+  assert.match(queueSource, /buildOpenAiEditPrompt\([\s\S]*Boolean\(reference\)/);
+  assert.doesNotMatch(queueSource, /containmentRetry|retry-containment|containment-retry/);
   assert.match(queueSource, /reviewReferenceEdit/);
   assert.match(queueSource, /sourceImageUrl: imageDataUrl\(sourceBytes\)/);
   assert.match(queueSource, /referencePlacementRegion\(generationRegion\)/);
   assert.match(queueSource, /referenceReviewOutcome\(review\)/);
-  assert.match(queueSource, /referenceReviewOutcome\(review, true\)/);
-  assert.match(queueSource, /outcome === "retry-containment"/);
   assert.match(queueSource, /outcome === "reject-containment"/);
   assert.match(queueSource, /reviewEditOutput/);
   assert.match(queueSource, /!review\.contained \|\| !review\.blended/);
+  assert.match(queueSource, /startWorkerHeartbeat/);
+  assert.match(queueSource, /WORKER_TOTAL_BUDGET_MS/);
+  assert.match(queueSource, /providerStageTimeout\(deadlineAt, IMAGE_EDIT_TIMEOUT_MS\)/);
+  assert.match(queueSource, /providerStageTimeout\(deadlineAt, EDIT_REVIEW_TIMEOUT_MS\)/);
   assert.match(queueSource, /use retry for one fresh attempt/);
   assert.match(queueSource, /Last review:/);
   assert.match(queueSource, /SUBJECT_OUT_OF_FRAME/);

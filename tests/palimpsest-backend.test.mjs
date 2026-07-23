@@ -915,19 +915,15 @@ test("expired ready reservations become terminal and cannot be claimed", async (
   db.close();
 });
 
-test("expired active work cannot be revived over a newer reservation", async () => {
+test("expired active work is superseded by a newer overlapping reservation", async () => {
   const db = await migratedDatabase();
   seedArtwork(db);
-  const [insertSql, claimSql, supersedeSql, requeueSql] = await Promise.all([
+  const [insertSql, claimSql, supersedeSql] = await Promise.all([
     readSqlConstant("lib/palimpsest/store.ts", "INSERT_EDIT_RESERVATION_SQL"),
     readSqlConstant("lib/palimpsest/queue.ts", "CLAIM_NEXT_JOB_SQL"),
     readSqlConstant(
       "lib/palimpsest/queue.ts",
       "SUPERSEDE_EXPIRED_ACTIVE_RESERVATION_SQL",
-    ),
-    readSqlConstant(
-      "lib/palimpsest/queue.ts",
-      "REQUEUE_EXPIRED_ACTIVE_RESERVATION_SQL",
     ),
   ]);
   const now = 19_000;
@@ -959,18 +955,6 @@ test("expired active work cannot be revived over a newer reservation", async () 
     db.prepare(supersedeSql).run(now, now, "palimpsest", now, now).changes,
     1,
   );
-  assert.equal(
-    db.prepare(requeueSql).run(
-      now,
-      now + 60_000,
-      now,
-      "palimpsest",
-      now,
-      2,
-      now,
-    ).changes,
-    0,
-  );
   assert.deepEqual(
     {
       ...db.prepare(
@@ -998,6 +982,200 @@ test("expired active work cannot be revived over a newer reservation", async () 
     now,
   );
   assert.equal(claimed.id, "newer-live");
+  db.close();
+});
+
+test("worker heartbeats renew only the current fenced lease", async () => {
+  const db = await migratedDatabase();
+  seedArtwork(db);
+  const [insertSql, renewSql] = await Promise.all([
+    readSqlConstant("lib/palimpsest/store.ts", "INSERT_EDIT_RESERVATION_SQL"),
+    readSqlConstant("lib/palimpsest/queue.ts", "RENEW_WORKER_LEASE_SQL"),
+  ]);
+  const now = 19_500;
+  assert.equal(
+    db.prepare(insertSql).run(...reservationValues({
+      jobId: "heartbeat-worker",
+      authorId: "author-a",
+      region: { x: 0, y: 0, width: 100, height: 100 },
+      now,
+    })).changes,
+    1,
+  );
+  db.prepare(
+    `UPDATE edit_jobs
+     SET state = 'generating', worker_token = 'worker-current',
+         lease_fence = 3, started_at = ?
+     WHERE id = 'heartbeat-worker'`,
+  ).run(now);
+
+  assert.equal(
+    db.prepare(renewSql).run(
+      now + 10_000,
+      now + 70_000,
+      "heartbeat-worker",
+      "palimpsest",
+      "worker-current",
+      3,
+      now + 10_000,
+    ).changes,
+    1,
+  );
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        "SELECT updated_at, lease_expires_at FROM edit_jobs WHERE id = 'heartbeat-worker'",
+      ).get(),
+    },
+    { updated_at: now + 10_000, lease_expires_at: now + 70_000 },
+  );
+  assert.equal(
+    db.prepare(renewSql).run(
+      now + 20_000,
+      now + 80_000,
+      "heartbeat-worker",
+      "palimpsest",
+      "worker-current",
+      2,
+      now + 20_000,
+    ).changes,
+    0,
+  );
+  db.exec("UPDATE edit_jobs SET lease_expires_at = 1 WHERE id = 'heartbeat-worker'");
+  assert.equal(
+    db.prepare(renewSql).run(
+      now + 30_000,
+      now + 90_000,
+      "heartbeat-worker",
+      "palimpsest",
+      "worker-current",
+      3,
+      now + 30_000,
+    ).changes,
+    0,
+  );
+  db.close();
+});
+
+test("an expired worker fails once without a hidden generation replay", async () => {
+  const db = await migratedDatabase();
+  seedArtwork(db);
+  const [insertSql, expireSql] = await Promise.all([
+    readSqlConstant("lib/palimpsest/store.ts", "INSERT_EDIT_RESERVATION_SQL"),
+    readSqlConstant("lib/palimpsest/queue.ts", "EXPIRE_ACTIVE_WORKER_SQL"),
+  ]);
+  const now = 19_750;
+  assert.equal(
+    db.prepare(insertSql).run(...reservationValues({
+      jobId: "stopped-worker",
+      authorId: "author-a",
+      region: { x: 0, y: 0, width: 100, height: 100 },
+      now: now - 100,
+    })).changes,
+    1,
+  );
+  db.prepare(
+    `UPDATE edit_jobs
+     SET state = 'generating', worker_token = 'worker-stopped',
+         lease_fence = 1, lease_expires_at = ?, started_at = ?
+     WHERE id = 'stopped-worker'`,
+  ).run(now - 1, now - 100);
+
+  assert.equal(
+    db.prepare(expireSql).run(now, now, "palimpsest", now).changes,
+    1,
+  );
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        `SELECT state, error_code, public_error_message, worker_token,
+                lease_expires_at, attempt_count, completed_at
+         FROM edit_jobs WHERE id = 'stopped-worker'`,
+      ).get(),
+    },
+    {
+      state: "failed",
+      error_code: "QUEUE_LEASE_EXPIRED",
+      public_error_message:
+        "The generation worker stopped before finishing. Nothing was added to history.",
+      worker_token: null,
+      lease_expires_at: null,
+      attempt_count: 0,
+      completed_at: now,
+    },
+  );
+  assert.equal(
+    db.prepare(expireSql).run(now + 1, now + 1, "palimpsest", now + 1).changes,
+    0,
+  );
+  db.close();
+});
+
+test("a fenced worker can record failure after its lease lapses", async () => {
+  const db = await migratedDatabase();
+  seedArtwork(db);
+  const [insertSql, failSql] = await Promise.all([
+    readSqlConstant("lib/palimpsest/store.ts", "INSERT_EDIT_RESERVATION_SQL"),
+    readSqlConstant("lib/palimpsest/queue.ts", "FAIL_CLAIMED_JOB_SQL"),
+  ]);
+  const now = 19_900;
+  assert.equal(
+    db.prepare(insertSql).run(...reservationValues({
+      jobId: "late-failure",
+      authorId: "author-a",
+      region: { x: 0, y: 0, width: 100, height: 100 },
+      now: now - 100,
+    })).changes,
+    1,
+  );
+  db.prepare(
+    `UPDATE edit_jobs
+     SET state = 'generating', worker_token = 'worker-late',
+         lease_fence = 4, lease_expires_at = ?, started_at = ?
+     WHERE id = 'late-failure'`,
+  ).run(now - 1, now - 100);
+
+  assert.equal(
+    db.prepare(failSql).run(
+      "failed",
+      "PROVIDER_TEMPORARY",
+      "The provider timed out. Nothing was added to history.",
+      now,
+      now,
+      "late-failure",
+      "worker-late",
+      4,
+    ).changes,
+    1,
+  );
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        `SELECT state, error_code, worker_token, lease_expires_at, completed_at
+         FROM edit_jobs WHERE id = 'late-failure'`,
+      ).get(),
+    },
+    {
+      state: "failed",
+      error_code: "PROVIDER_TEMPORARY",
+      worker_token: null,
+      lease_expires_at: null,
+      completed_at: now,
+    },
+  );
+  assert.equal(
+    db.prepare(failSql).run(
+      "failed",
+      "PROVIDER_TEMPORARY",
+      "stale",
+      now + 1,
+      now + 1,
+      "late-failure",
+      "worker-late",
+      4,
+    ).changes,
+    0,
+  );
   db.close();
 });
 

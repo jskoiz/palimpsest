@@ -16,7 +16,6 @@ import type { AppEnv } from "./runtime";
 import { readPngDimensions, sha256Hex } from "./runtime";
 import {
   PREPARING_AVAILABLE_AT,
-  RESERVATION_LEASE_MS,
   getBlobRecord,
   type GenerationFrame,
   type GlobalRegion,
@@ -26,6 +25,14 @@ import {
   GENERATION_FRAME_SIZE,
   regionInGenerationFrame,
 } from "./geometry.mjs";
+import {
+  EDIT_REVIEW_TIMEOUT_MS,
+  IMAGE_EDIT_TIMEOUT_MS,
+  WORKER_HEARTBEAT_MS,
+  WORKER_LEASE_MS,
+  WORKER_TOTAL_BUDGET_MS,
+  boundedStageTimeout,
+} from "./worker-policy.mjs";
 
 type QueueJob = {
   id: string;
@@ -57,12 +64,9 @@ type CommitLock = {
   fence: number;
 };
 
-const MAX_WORKER_RECOVERY_ATTEMPTS = 1;
 const COMMIT_LOCK_LEASE_MS = 15_000;
 const COMMIT_LOCK_ATTEMPTS = 40;
 const COMMIT_LOCK_RETRY_MS = 25;
-const IMAGE_EDIT_TIMEOUT_MS = 150_000;
-const EDIT_REVIEW_TIMEOUT_MS = 75_000;
 
 function cleanReviewReason(reason: string) {
   return reason.replace(/\s+/g, " ").trim().slice(0, 320);
@@ -269,7 +273,7 @@ async function claimNextJob(env: AppEnv): Promise<QueueJob | null> {
     return await env.DB.prepare(CLAIM_NEXT_JOB_SQL)
       .bind(
         workerToken,
-        now + RESERVATION_LEASE_MS,
+        now + WORKER_LEASE_MS,
         now,
         now,
         ARTWORK_ID,
@@ -319,6 +323,28 @@ FROM edit_jobs
 WHERE artwork_id = ? AND worker_token = ?
   AND state IN ('moderating', 'generating', 'committing')
 LIMIT 1`;
+
+export const RENEW_WORKER_LEASE_SQL = `UPDATE edit_jobs
+SET updated_at = ?,
+    lease_expires_at = ?
+WHERE id = ?
+  AND artwork_id = ?
+  AND state IN ('moderating', 'generating', 'committing')
+  AND worker_token = ?
+  AND lease_fence = ?
+  AND lease_expires_at > ?`;
+
+export const FAIL_CLAIMED_JOB_SQL = `UPDATE edit_jobs
+SET state = ?,
+    error_code = ?,
+    public_error_message = ?,
+    worker_token = NULL,
+    lease_expires_at = NULL,
+    updated_at = ?,
+    completed_at = ?
+WHERE id = ?
+  AND worker_token = ?
+  AND lease_fence = ?`;
 
 export const EXPIRE_PREPARING_RESERVATION_SQL = `UPDATE edit_jobs
 SET state = 'failed',
@@ -392,28 +418,17 @@ WHERE artwork_id = ?
       AND active.region_y + active.region_height > edit_jobs.region_y
   )`;
 
-export const REQUEUE_EXPIRED_ACTIVE_RESERVATION_SQL = `UPDATE edit_jobs
-SET state = 'queued',
-    attempt_count = attempt_count + 1,
-    available_at = ?,
+export const EXPIRE_ACTIVE_WORKER_SQL = `UPDATE edit_jobs
+SET state = 'failed',
+    error_code = 'QUEUE_LEASE_EXPIRED',
+    public_error_message = 'The generation worker stopped before finishing. Nothing was added to history.',
     worker_token = NULL,
-    lease_expires_at = ?,
-    updated_at = ?
+    lease_expires_at = NULL,
+    updated_at = ?,
+    completed_at = ?
 WHERE artwork_id = ?
   AND state IN ('moderating', 'generating', 'committing')
-  AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
-  AND attempt_count < ?
-  AND NOT EXISTS (
-    SELECT 1 FROM edit_jobs active
-    WHERE active.artwork_id = edit_jobs.artwork_id
-      AND active.id <> edit_jobs.id
-      AND active.state IN ('queued', 'moderating', 'generating', 'committing')
-      AND active.lease_expires_at > ?
-      AND active.region_x < edit_jobs.region_x + edit_jobs.region_width
-      AND active.region_x + active.region_width > edit_jobs.region_x
-      AND active.region_y < edit_jobs.region_y + edit_jobs.region_height
-      AND active.region_y + active.region_height > edit_jobs.region_y
-  )`;
+  AND (lease_expires_at IS NULL OR lease_expires_at <= ?)`;
 
 async function recoverExpiredJobs(env: AppEnv, now: number) {
   await env.DB.batch([
@@ -444,33 +459,89 @@ async function recoverExpiredJobs(env: AppEnv, now: number) {
       now,
       now,
     ),
-    env.DB.prepare(
-      `UPDATE edit_jobs
-       SET state = 'failed',
-           error_code = 'QUEUE_LEASE_EXPIRED',
-           public_error_message = 'The worker lease expired repeatedly. Nothing was added to history.',
-           worker_token = NULL,
-           lease_expires_at = NULL,
-           updated_at = ?,
-           completed_at = ?
-       WHERE artwork_id = ?
-         AND state IN ('moderating', 'generating', 'committing')
-         AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
-         AND attempt_count >= ?`,
-    ).bind(now, now, ARTWORK_ID, now, MAX_WORKER_RECOVERY_ATTEMPTS),
-    env.DB.prepare(REQUEUE_EXPIRED_ACTIVE_RESERVATION_SQL).bind(
+    env.DB.prepare(EXPIRE_ACTIVE_WORKER_SQL).bind(
       now,
-      now + RESERVATION_LEASE_MS,
       now,
       ARTWORK_ID,
-      now,
-      MAX_WORKER_RECOVERY_ATTEMPTS,
       now,
     ),
   ]);
 }
 
+type WorkerHeartbeat = {
+  checkpoint: () => Promise<void>;
+  stop: () => Promise<void>;
+};
+
+function startWorkerHeartbeat(env: AppEnv, job: QueueJob): WorkerHeartbeat {
+  let stopped = false;
+  let lostLease: DomainError | null = null;
+  let inFlight: Promise<void> | null = null;
+
+  const heartbeat = () => {
+    if (stopped || inFlight) return;
+    const now = Date.now();
+    inFlight = retryIdempotentD1(() =>
+      env.DB.prepare(RENEW_WORKER_LEASE_SQL)
+        .bind(
+          now,
+          now + WORKER_LEASE_MS,
+          job.id,
+          ARTWORK_ID,
+          job.workerToken,
+          job.leaseFence,
+          now,
+        )
+        .run(),
+    )
+      .then((result) => {
+        if (Number(result.meta.changes ?? 0) === 0) {
+          lostLease = new DomainError(
+            "QUEUE_LEASE_EXPIRED",
+            "The generation worker lost its reservation before finishing.",
+          );
+        }
+      })
+      .catch(() => {
+        lostLease = new DomainError(
+          "SERVICE_UNAVAILABLE",
+          "The generation worker could not renew its reservation.",
+        );
+      })
+      .finally(() => {
+        inFlight = null;
+      });
+  };
+
+  const timer = setInterval(heartbeat, WORKER_HEARTBEAT_MS);
+  return {
+    checkpoint: async () => {
+      const pending = inFlight;
+      if (pending) await pending;
+      if (lostLease) throw lostLease;
+    },
+    stop: async () => {
+      stopped = true;
+      clearInterval(timer);
+      const pending = inFlight;
+      if (pending) await pending;
+    },
+  };
+}
+
+function providerStageTimeout(deadlineAt: number, stageLimitMs: number) {
+  const timeoutMs = boundedStageTimeout(deadlineAt, stageLimitMs);
+  if (timeoutMs < 1_000) {
+    throw new DomainError(
+      "PROVIDER_TEMPORARY",
+      "The live generation time budget was exhausted. Nothing was added to history.",
+    );
+  }
+  return timeoutMs;
+}
+
 async function processClaimedJob(env: AppEnv, job: QueueJob) {
+  let heartbeat: WorkerHeartbeat | null = null;
   try {
     if (job.kind === "revert") {
       await commitRevert(env, job);
@@ -494,22 +565,24 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
     const editableRegion = job.referenceBlobId
       ? referencePlacementRegion(generationRegion)
       : generationRegion;
+    const deadlineAt = Date.now() + WORKER_TOTAL_BUDGET_MS;
+    heartbeat = startWorkerHeartbeat(env, job);
     await updateStage(env, job, "moderating", "generating");
-    let patch = await generateOpenAiPatch(
+    const patch = await generateOpenAiPatch(
       env,
       job,
       apiKey,
       job.prompt,
-      "medium",
-      false,
+      deadlineAt,
     );
+    await heartbeat.checkpoint();
     if (job.referenceBlobId) {
-      let referenceBytes = patch.referenceBytes;
+      const referenceBytes = patch.referenceBytes;
       if (!referenceBytes) {
         throw new DomainError("INTERNAL_ERROR", "The reference image could not be reviewed.");
       }
       await updateStage(env, job, "generating", "generating");
-      let review = await reviewReferenceEdit(
+      const review = await reviewReferenceEdit(
         apiKey,
         job.prompt,
         patch.bytes,
@@ -517,9 +590,10 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
         referenceBytes,
         patch.providerMaskBytes,
         editableRegion,
+        deadlineAt,
       );
+      await heartbeat.checkpoint();
       console.info(`[palimpsest:${job.id}] reference edit review`, {
-        attempt: "initial",
         subjectContained: review?.contained ?? null,
         referenceFaithful: review?.faithful ?? null,
         placementMatched: review?.placementMatched ?? null,
@@ -527,50 +601,12 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
         sourcePreserved: review?.sourcePreserved ?? null,
         reviewerReason: review?.reason.slice(0, 240) ?? null,
       });
-      let outcome = referenceReviewOutcome(review);
-      if (outcome === "retry-containment") {
-        console.info(`[palimpsest:${job.id}] reference containment retry`, {
-          reviewerReason: review.reason.slice(0, 240),
-        });
-        await updateStage(env, job, "generating", "generating");
-        patch = await generateOpenAiPatch(
-          env,
-          job,
-          apiKey,
-          job.prompt,
-          "medium",
-          true,
-        );
-        referenceBytes = patch.referenceBytes;
-        if (!referenceBytes) {
-          throw new DomainError("INTERNAL_ERROR", "The reference image could not be reviewed.");
-        }
-        await updateStage(env, job, "generating", "generating");
-        review = await reviewReferenceEdit(
-          apiKey,
-          job.prompt,
-          patch.bytes,
-          patch.sourceBytes,
-          referenceBytes,
-          patch.providerMaskBytes,
-          editableRegion,
-        );
-        console.info(`[palimpsest:${job.id}] reference edit review`, {
-          attempt: "containment-retry",
-          subjectContained: review.contained,
-          referenceFaithful: review.faithful,
-          placementMatched: review.placementMatched,
-          surroundingsBlended: review.blended,
-          sourcePreserved: review.sourcePreserved,
-          reviewerReason: review.reason.slice(0, 240),
-        });
-        outcome = referenceReviewOutcome(review, true);
-      }
+      const outcome = referenceReviewOutcome(review);
       if (outcome === "reject-containment") {
         throw new DomainError(
           "SUBJECT_OUT_OF_FRAME",
           reviewFailureMessage(
-            "The generated reference still did not match the selected placement after one automatic retry. Nothing was added to history; move or enlarge the patch and submit again.",
+            "The generated reference did not match the selected placement. Nothing was added to history; move or enlarge the patch and submit again.",
             review.reason,
           ),
         );
@@ -592,7 +628,9 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
         patch.bytes,
         patch.providerMaskBytes,
         editableRegion,
+        deadlineAt,
       );
+      await heartbeat.checkpoint();
       console.info(`[palimpsest:${job.id}] edit output review`, {
         subjectContained: review.contained,
         surroundingsBlended: review.blended,
@@ -610,8 +648,11 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
     }
 
     await updateStage(env, job, "generating", "committing");
+    await heartbeat.stop();
+    heartbeat = null;
     await commitPatch(env, job, patch);
   } catch (error) {
+    if (heartbeat) await heartbeat.stop();
     await handleFailure(env, job, error);
   }
 }
@@ -636,7 +677,7 @@ async function updateStage(
     .bind(
       nextState,
       now,
-      now + RESERVATION_LEASE_MS,
+      now + WORKER_LEASE_MS,
       job.id,
       ARTWORK_ID,
       expectedState,
@@ -659,8 +700,7 @@ async function generateOpenAiPatch(
   job: QueueJob,
   apiKey: string,
   requestedPrompt: string,
-  quality: "medium" | "high",
-  containmentRetry: boolean,
+  deadlineAt: number,
 ): Promise<{
   bytes: Uint8Array;
   contentType: string;
@@ -730,16 +770,18 @@ async function generateOpenAiPatch(
     buildOpenAiEditPrompt(
       requestedPrompt,
       Boolean(reference),
-      Boolean(reference) && containmentRetry,
     ),
   );
   form.append("size", "1024x1024");
-  form.append("quality", quality);
+  form.append("quality", "medium");
   form.append("output_format", "png");
   form.append("moderation", "auto");
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), IMAGE_EDIT_TIMEOUT_MS);
+  const timeout = setTimeout(
+    () => controller.abort(),
+    providerStageTimeout(deadlineAt, IMAGE_EDIT_TIMEOUT_MS),
+  );
   let response: Response;
   let body:
     | { data?: Array<{ b64_json?: string }>; error?: { code?: string } }
@@ -839,9 +881,13 @@ async function reviewEditOutput(
   generatedBytes: Uint8Array,
   providerMaskBytes: Uint8Array,
   editableRegion: { x: number; y: number; width: number; height: number },
+  deadlineAt: number,
 ) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), EDIT_REVIEW_TIMEOUT_MS);
+  const timeout = setTimeout(
+    () => controller.abort(),
+    providerStageTimeout(deadlineAt, EDIT_REVIEW_TIMEOUT_MS),
+  );
   let response: Response;
   let body: { output?: Array<unknown> } | null;
   try {
@@ -892,9 +938,13 @@ async function reviewReferenceEdit(
   referenceBytes: Uint8Array,
   providerMaskBytes: Uint8Array,
   editableRegion: GlobalRegion,
+  deadlineAt: number,
 ) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), EDIT_REVIEW_TIMEOUT_MS);
+  const timeout = setTimeout(
+    () => controller.abort(),
+    providerStageTimeout(deadlineAt, EDIT_REVIEW_TIMEOUT_MS),
+  );
   let response: Response;
   let body: { output?: Array<unknown> } | null;
   try {
@@ -1392,20 +1442,7 @@ async function handleFailure(env: AppEnv, job: QueueJob, error: unknown) {
   const code = domain?.code ?? "INTERNAL_ERROR";
   const message =
     domain?.message ?? "The edit could not be completed. Nothing was added to history.";
-  await env.DB.prepare(
-    `UPDATE edit_jobs
-     SET state = ?,
-         error_code = ?,
-         public_error_message = ?,
-         worker_token = NULL,
-         lease_expires_at = NULL,
-         updated_at = ?,
-         completed_at = ?
-     WHERE id = ?
-       AND worker_token = ?
-       AND lease_fence = ?
-       AND lease_expires_at > ?`,
-  )
+  await env.DB.prepare(FAIL_CLAIMED_JOB_SQL)
     .bind(
       state,
       code,
@@ -1415,7 +1452,6 @@ async function handleFailure(env: AppEnv, job: QueueJob, error: unknown) {
       job.id,
       job.workerToken,
       job.leaseFence,
-      now,
     )
     .run();
 }
