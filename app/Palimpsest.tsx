@@ -17,6 +17,7 @@ import {
   collaborationPollDelay,
   publicActivityJobs,
   queueRecoveryDelay,
+  visibleActivityJobs as activityJobsVisibleToVisitor,
   viewForActivityRegion,
 } from "@/app/activity-ui.mjs";
 import {
@@ -1270,8 +1271,13 @@ export default function Palimpsest() {
     : 1;
   const jobActive = Boolean(job && !terminalJobStates.has(job.state));
   const liveActivityJobs = publicActivityJobs(activity.jobs) as ActivityJob[];
-  const queueTotal = liveActivityJobs.length;
-  const queueBusy = queueTotal > 0 || jobActive;
+  const visibleActivityJobs = activityJobsVisibleToVisitor(
+    activity.jobs,
+    new Set(Object.keys(retryCapabilitiesByJobId)),
+  ) as ActivityJob[];
+  const retryableActivityJobs = visibleActivityJobs.filter(activityJobNeedsAttention);
+  const queueTotal = visibleActivityJobs.length;
+  const queueBusy = liveActivityJobs.length > 0 || jobActive;
   const hasRecoverableWork =
     activity.queue.queued > 0 ||
     activity.activeRegions.some((active) => !active.reservationActive);
@@ -1314,7 +1320,7 @@ export default function Palimpsest() {
     currentState,
     welcomeOpen,
     activeRegions: activity.activeRegions,
-    activityHasWork: queueTotal > 0 || hasRecoverableWork,
+    activityHasWork: liveActivityJobs.length > 0 || hasRecoverableWork,
   });
   useEffect(() => {
     latest.current = {
@@ -1335,7 +1341,7 @@ export default function Palimpsest() {
       currentState,
       welcomeOpen,
       activeRegions: activity.activeRegions,
-      activityHasWork: queueTotal > 0 || hasRecoverableWork,
+      activityHasWork: liveActivityJobs.length > 0 || hasRecoverableWork,
     };
   });
 
@@ -3082,7 +3088,7 @@ export default function Palimpsest() {
         <button
           type="button"
           className="mono-queue-toggle"
-          aria-label={`Queue, ${queueTotal} in process`}
+          aria-label={`Queue, ${liveActivityJobs.length} in process, ${retryableActivityJobs.length} need attention`}
           aria-controls="contribution-activity"
           aria-expanded={queueOpen}
           onClick={toggleQueue}
@@ -3134,7 +3140,7 @@ export default function Palimpsest() {
           <button
             type="button"
             className={mobileSection === "queue" ? "is-active" : ""}
-            aria-label={`Open contribution queue, ${queueTotal} pending`}
+            aria-label={`Open contribution activity, ${queueTotal} shown`}
             aria-controls="contribution-activity"
             aria-expanded={queueOpen}
             aria-pressed={mobileSection === "queue"}
@@ -3359,8 +3365,11 @@ export default function Palimpsest() {
         >
           <div className="mono-strip-head">
             <span className="mono-strip-summary">
-              live work — {queueTotal} in process
-              {queueTotal > 0 ? " · use show to find work on the canvas" : ""}
+              live work — {liveActivityJobs.length} in process
+              {retryableActivityJobs.length > 0
+                ? ` · ${retryableActivityJobs.length} needs attention`
+                : ""}
+              {liveActivityJobs.length > 0 ? " · use show to find work on the canvas" : ""}
             </span>
             <button
               type="button"
@@ -3375,13 +3384,15 @@ export default function Palimpsest() {
             <section className="mono-activity-group" aria-labelledby="activity-jobs-title">
               <div className="mono-activity-group-head">
                 <h2 id="activity-jobs-title">contributions</h2>
-                <span>{liveActivityJobs.length} shown</span>
+                <span>{visibleActivityJobs.length} shown</span>
               </div>
-              {liveActivityJobs.length === 0 ? (
-                <p className="mono-queue-empty">No contributions are currently in process.</p>
+              {visibleActivityJobs.length === 0 ? (
+                <p className="mono-queue-empty">
+                  No contributions are currently in process or need attention.
+                </p>
               ) : (
                 <div className="mono-queue-list" role="list" aria-live="polite">
-                  {liveActivityJobs.map((activityJob, index) => {
+                  {visibleActivityJobs.map((activityJob, index) => {
                     const state = activityJobState(activityJob);
                     const failed = activityJobNeedsAttention(activityJob);
                     const canRetry = Boolean(

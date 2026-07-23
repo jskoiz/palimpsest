@@ -40,6 +40,7 @@ import {
   collaborationPollDelay,
   publicActivityJobs,
   queueRecoveryDelay,
+  visibleActivityJobs,
   viewForActivityRegion,
 } from "../app/activity-ui.mjs";
 import {
@@ -57,13 +58,13 @@ function expectCode(callback, code) {
 
 test("activity jobs use stable visitor-facing states and separate failures from in-process work", () => {
   const jobs = [
-    { state: "queued", reservationActive: true },
-    { state: "moderating", reservationActive: true },
-    { state: "generating", reservationActive: true },
-    { state: "committing", reservationActive: true },
-    { state: "generating", reservationActive: false },
-    { state: "failed", reservationActive: false },
-    { state: "succeeded", reservationActive: false },
+    { id: "queued", state: "queued", reservationActive: true, retryable: false },
+    { id: "moderating", state: "moderating", reservationActive: true, retryable: false },
+    { id: "generating", state: "generating", reservationActive: true, retryable: false },
+    { id: "committing", state: "committing", reservationActive: true, retryable: false },
+    { id: "recovering", state: "generating", reservationActive: false, retryable: false },
+    { id: "owned-failure", state: "failed", reservationActive: false, retryable: true },
+    { id: "done", state: "succeeded", reservationActive: false, retryable: false },
   ];
 
   assert.deepEqual(jobs.map(activityJobState), [
@@ -77,6 +78,14 @@ test("activity jobs use stable visitor-facing states and separate failures from 
   ]);
   assert.deepEqual(activityJobCounts(jobs), { inProcess: 5, failed: 1, done: 1 });
   assert.deepEqual(publicActivityJobs(jobs), jobs.slice(0, 5));
+  assert.deepEqual(
+    visibleActivityJobs(jobs, new Set(["owned-failure"])),
+    jobs.slice(0, 6),
+  );
+  assert.deepEqual(
+    visibleActivityJobs(jobs, new Set()),
+    jobs.slice(0, 5),
+  );
 });
 
 test("queue recovery and collaboration polling back off with bounded jitter", () => {
@@ -764,9 +773,7 @@ test("one-click image upload skips mask painting and opens the blending prompt",
     "the positioned reference preview must be established before the prompt step opens",
   );
 
-  const editorStart = source.indexOf(
-    '<section className="mono-strip" aria-label="Contribute an edit">',
-  );
+  const editorStart = source.indexOf('aria-label="Contribute an edit"');
   const stepOneStart = source.indexOf("{step === 1 ? (", editorStart);
   const stepTwoStart = source.indexOf("{step === 2 ? (", stepOneStart);
   assert.ok(editorStart >= 0 && stepOneStart > editorStart && stepTwoStart > stepOneStart);

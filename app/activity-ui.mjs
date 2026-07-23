@@ -65,6 +65,24 @@ export function publicActivityJobs(jobs) {
 }
 
 /**
+ * Keep durable failures private unless the current browser owns the retry
+ * capability. This lets a contributor recover their own attempt without
+ * exposing terminal jobs in the public live-work feed.
+ *
+ * @param {Array<{ id: string, state: string, reservationActive: boolean, retryable: boolean }>} jobs
+ * @param {Set<string>} retryCapabilityIds
+ */
+export function visibleActivityJobs(jobs, retryCapabilityIds) {
+  return jobs.filter(
+    (job) =>
+      activityJobIsInProcess(job) ||
+      (activityJobNeedsAttention(job) &&
+        job.retryable &&
+        retryCapabilityIds.has(job.id)),
+  );
+}
+
+/**
  * Exponential recovery delay with bounded jitter. Supplying randomValue keeps
  * the helper deterministic in tests while production passes Math.random().
  *

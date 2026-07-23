@@ -70,6 +70,18 @@ test("visitor activity endpoint relies on the dispatcher-authenticated admin gat
   assert.doesNotMatch(source, /x-palimpsest-admin/i);
 });
 
+test("public visitor events are bounded before storage", async () => {
+  const [route, store] = await Promise.all([
+    readFile(new URL("../app/api/visitors/events/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/palimpsest/store.ts", import.meta.url), "utf8"),
+  ]);
+  assert.match(route, /application\/json/u);
+  assert.match(route, /PAYLOAD_TOO_LARGE/u);
+  assert.match(store, /VISITOR_EVENT_LIMIT_WINDOW_MS/u);
+  assert.match(store, /VISITOR_EVENT_RETENTION_MS/u);
+  assert.match(store, /WHERE NOT EXISTS/u);
+});
+
 test("both contribution routes consume the centralized server policy", async () => {
   const [editRoute, revertRoute] = await Promise.all([
     readFile(new URL("../app/api/edits/route.ts", import.meta.url), "utf8"),
