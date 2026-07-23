@@ -8,6 +8,7 @@ export interface AppEnv {
   OPENAI_API_KEY?: string;
   ADMIN_EMAIL_ALLOWLIST?: string;
   RATE_LIMIT_SALT?: string;
+  VISITOR_LOG_SALT?: string;
 }
 
 export function getRuntimeEnv(): AppEnv {

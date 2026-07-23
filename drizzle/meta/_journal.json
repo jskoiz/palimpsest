@@ -57,6 +57,13 @@
       "when": 1784693817000,
       "tag": "0007_current_live_canvas_reset",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1784839324633,
+      "tag": "0008_yummy_red_ghost",
+      "breakpoints": true
     }
   ]
 }

@@ -158,6 +158,7 @@ const PATCH_SIZE_STEP = 32;
 const QUEUE_RECOVERY_POLL_MS = 12_000;
 const DEFAULT_REGION = { x: 800, y: 832, width: 448, height: 384 };
 const WELCOME_STORAGE_KEY = "palimpsest:welcome:v1";
+const VISITOR_SESSION_STORAGE_KEY = "palimpsest:visitor-session:v1";
 const REFERENCE_IMAGE_SIZE = 1024;
 const REFERENCE_MASK_INSET = 64;
 const MAX_REFERENCE_UPLOAD_BYTES = 10 * 1024 * 1024;
@@ -168,6 +169,42 @@ const EMPTY_ACTIVITY: ActivityPayload = {
   recent: [],
   activeRegions: [],
 };
+
+type VisitorInteraction =
+  | "guide_opened"
+  | "queue_opened"
+  | "history_opened"
+  | "contribution_opened"
+  | "patch_confirmed"
+  | "mask_confirmed"
+  | "reference_added";
+
+function visitorSessionId(): string | null {
+  try {
+    const existing = window.sessionStorage.getItem(VISITOR_SESSION_STORAGE_KEY);
+    if (existing) return existing;
+    const created = crypto.randomUUID();
+    window.sessionStorage.setItem(VISITOR_SESSION_STORAGE_KEY, created);
+    return created;
+  } catch {
+    return null;
+  }
+}
+
+function trackVisitorInteraction(event: VisitorInteraction) {
+  const sessionId = visitorSessionId();
+  void fetch("/api/visitors/events", {
+    method: "POST",
+    keepalive: true,
+    headers: {
+      "Content-Type": "application/json",
+      ...(sessionId ? { "X-Palimpsest-Session": sessionId } : {}),
+    },
+    body: JSON.stringify({ event }),
+  }).catch(() => {
+    // Visitor telemetry is intentionally best-effort and never blocks creation.
+  });
+}
 
 function pad3(value: number) {
   return String(value).padStart(3, "0");
@@ -947,6 +984,7 @@ export default function Palimpsest() {
     setDeepIdle(false);
     setChromeVisible(true);
     setWelcomeOpen(true);
+    trackVisitorInteraction("guide_opened");
   }, []);
 
   const showToast = useCallback((text: string) => {
@@ -1324,6 +1362,7 @@ export default function Palimpsest() {
   }, [wake]);
 
   const toggleQueue = useCallback(() => {
+    if (!queueOpen) trackVisitorInteraction("queue_opened");
     setQueueOpen((open) => !open);
     setEditOpen(false);
     setHistoryOpen(false);
@@ -1333,7 +1372,7 @@ export default function Palimpsest() {
     setConfirmRestore(false);
     clearReferenceImage();
     wake();
-  }, [clearReferenceImage, wake]);
+  }, [clearReferenceImage, queueOpen, wake]);
 
   const openEditor = useCallback(async () => {
     const initial = latest.current;
@@ -1372,6 +1411,7 @@ export default function Palimpsest() {
     setSubmitError(null);
     setConfirmRestore(false);
     setView({ zoom: 1, x: 0, y: 0 });
+    trackVisitorInteraction("contribution_opened");
     if (closeTimer.current) window.clearTimeout(closeTimer.current);
     wake();
   }, [clearReferenceImage, refreshActivity, showToast, wake]);
@@ -1838,6 +1878,7 @@ export default function Palimpsest() {
       const previewUrl = URL.createObjectURL(file);
       referencePreviewUrlRef.current = previewUrl;
       setReferenceImage({ blob, fileName: file.name, previewUrl });
+      trackVisitorInteraction("reference_added");
     } catch (error) {
       event.currentTarget.value = "";
       setSubmitError(
@@ -1895,9 +1936,13 @@ export default function Palimpsest() {
       if (referenceImage) {
         form.append("reference", referenceImage.blob, "reference.png");
       }
+      const sessionId = visitorSessionId();
       const payload = await fetchJson<{ job: Job }>("/api/edits", {
         method: "POST",
-        headers: { "Idempotency-Key": crypto.randomUUID() },
+        headers: {
+          "Idempotency-Key": crypto.randomUUID(),
+          ...(sessionId ? { "X-Palimpsest-Session": sessionId } : {}),
+        },
         body: form,
       });
       setJob(payload.job);
@@ -1932,11 +1977,13 @@ export default function Palimpsest() {
     if (!history || !selectedRevision || selectedRevision.id === history.headRevisionId) return;
     setConfirmRestore(false);
     try {
+      const sessionId = visitorSessionId();
       const payload = await fetchJson<{ job: Job }>("/api/reverts", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "Idempotency-Key": crypto.randomUUID(),
+          ...(sessionId ? { "X-Palimpsest-Session": sessionId } : {}),
         },
         body: JSON.stringify({
           artworkId: "palimpsest",
@@ -2340,6 +2387,7 @@ export default function Palimpsest() {
             onClick={() => {
               setHistoryOpen(true);
               wake();
+              trackVisitorInteraction("history_opened");
             }}
           />
         </>
@@ -2547,6 +2595,7 @@ export default function Palimpsest() {
                 onClick={() => {
                   setStep(2);
                   wake();
+                  trackVisitorInteraction("patch_confirmed");
                 }}
               >
                 use this patch →
@@ -2598,6 +2647,7 @@ export default function Palimpsest() {
                 onClick={() => {
                   setStep(3);
                   wake();
+                  trackVisitorInteraction("mask_confirmed");
                 }}
               >
                 continue →

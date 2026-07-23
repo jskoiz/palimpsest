@@ -449,6 +449,155 @@ export async function requesterHash(env: AppEnv, request: Request): Promise<stri
   return sha256Hex(`${env.RATE_LIMIT_SALT ?? "palimpsest-v1"}:${address}`);
 }
 
+export const VISITOR_INTERACTION_TYPES = [
+  "guide_opened",
+  "queue_opened",
+  "history_opened",
+  "contribution_opened",
+  "patch_confirmed",
+  "mask_confirmed",
+  "reference_added",
+] as const;
+
+export type VisitorInteractionType = (typeof VISITOR_INTERACTION_TYPES)[number];
+export type VisitorEventType = VisitorInteractionType | "page_view" | "generation_requested" | "restore_requested";
+
+const VISITOR_EVENT_TYPES = new Set<VisitorEventType>([
+  "page_view",
+  "generation_requested",
+  "restore_requested",
+  ...VISITOR_INTERACTION_TYPES,
+]);
+
+type VisitorEventRow = {
+  visitorHash: string;
+  sessionId: string | null;
+  eventType: VisitorEventType;
+  path: string;
+  country: string | null;
+  userAgent: string | null;
+  jobId: string | null;
+  createdAt: number;
+};
+
+function normalizedSessionId(value: string | null | undefined): string | null {
+  if (!value || !/^[A-Za-z0-9_-]{20,128}$/u.test(value)) return null;
+  return value;
+}
+
+function normalizedCountry(value: string | null): string | null {
+  return value && /^[A-Z]{2}$/u.test(value) ? value : null;
+}
+
+function compactUserAgent(value: string | null): string | null {
+  if (!value) return null;
+  return value.replace(/\s+/gu, " ").trim().slice(0, 320) || null;
+}
+
+async function visitorHash(env: AppEnv, request: Request): Promise<string> {
+  const address = request.headers.get("CF-Connecting-IP") ?? "local-preview";
+  const salt = env.VISITOR_LOG_SALT ?? env.RATE_LIMIT_SALT;
+  if (!salt) {
+    throw new DomainError(
+      "SERVICE_UNAVAILABLE",
+      "Visitor logging requires a configured VISITOR_LOG_SALT.",
+    );
+  }
+  return sha256Hex(`${salt}:visitor:${address}`);
+}
+
+export function isVisitorInteractionType(value: unknown): value is VisitorInteractionType {
+  return typeof value === "string" && VISITOR_INTERACTION_TYPES.includes(value as VisitorInteractionType);
+}
+
+export async function recordVisitorEvent(
+  env: AppEnv,
+  request: Request,
+  eventType: VisitorEventType,
+  options: { sessionId?: string | null; jobId?: string | null } = {},
+) {
+  if (!VISITOR_EVENT_TYPES.has(eventType)) {
+    throw new DomainError("INVALID_REQUEST", "That visitor event is not supported.");
+  }
+  const url = new URL(request.url);
+  const now = Date.now();
+  await env.DB.prepare(
+    `INSERT INTO visitor_events
+      (id, visitor_hash, session_id, event_type, path, country, user_agent, job_id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      crypto.randomUUID(),
+      await visitorHash(env, request),
+      normalizedSessionId(options.sessionId),
+      eventType,
+      url.pathname,
+      normalizedCountry(request.headers.get("CF-IPCountry")),
+      compactUserAgent(request.headers.get("User-Agent")),
+      options.jobId ?? null,
+      now,
+    )
+    .run();
+}
+
+export async function getVisitorActivity(env: AppEnv, limit = 160) {
+  const boundedLimit = Math.max(1, Math.min(250, Math.floor(limit)));
+  const since = Date.now() - 24 * 60 * 60 * 1000;
+  const [summary, events] = await Promise.all([
+    env.DB.prepare(
+      `SELECT
+        COUNT(DISTINCT visitor_hash) AS visitors,
+        SUM(CASE WHEN event_type = 'page_view' THEN 1 ELSE 0 END) AS pageViews,
+        SUM(CASE WHEN event_type = 'generation_requested' THEN 1 ELSE 0 END) AS generations,
+        SUM(CASE WHEN event_type <> 'page_view' THEN 1 ELSE 0 END) AS interactions
+       FROM visitor_events
+       WHERE created_at >= ?`,
+    )
+      .bind(since)
+      .first<{
+        visitors: number | null;
+        pageViews: number | null;
+        generations: number | null;
+        interactions: number | null;
+      }>(),
+    env.DB.prepare(
+      `SELECT
+        visitor_hash AS visitorHash,
+        session_id AS sessionId,
+        event_type AS eventType,
+        path AS path,
+        country AS country,
+        user_agent AS userAgent,
+        job_id AS jobId,
+        created_at AS createdAt
+       FROM visitor_events
+       ORDER BY created_at DESC
+       LIMIT ?`,
+    )
+      .bind(boundedLimit)
+      .all<VisitorEventRow>(),
+  ]);
+
+  return {
+    summary: {
+      visitors: Number(summary?.visitors ?? 0),
+      pageViews: Number(summary?.pageViews ?? 0),
+      generations: Number(summary?.generations ?? 0),
+      interactions: Number(summary?.interactions ?? 0),
+    },
+    events: events.results.map((event) => ({
+      visitor: event.visitorHash.slice(0, 12),
+      session: event.sessionId?.slice(0, 12) ?? null,
+      type: event.eventType,
+      path: event.path,
+      country: event.country,
+      userAgent: event.userAgent,
+      jobId: event.jobId,
+      createdAt: new Date(Number(event.createdAt)).toISOString(),
+    })),
+  };
+}
+
 export async function enforceRateLimit(
   env: AppEnv,
   hash: string,

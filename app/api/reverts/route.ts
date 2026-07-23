@@ -8,6 +8,7 @@ import {
   enforceRateLimit,
   ensurePalimpsest,
   insertRevertJob,
+  recordVisitorEvent,
   requesterHash,
 } from "@/lib/palimpsest/store";
 
@@ -45,6 +46,14 @@ export async function POST(request: Request) {
       requesterHash: hash,
       idempotencyKey,
     });
+    try {
+      await recordVisitorEvent(env, request, "restore_requested", {
+        sessionId: request.headers.get("X-Palimpsest-Session"),
+        jobId: job.id,
+      });
+    } catch (logError) {
+      console.warn(`[palimpsest:${requestId}] visitor activity logging failed`, logError);
+    }
     console.info(`[palimpsest:${requestId}] contribution accepted`, {
       kind: "revert",
       ratePolicy: ratePolicy.name,
