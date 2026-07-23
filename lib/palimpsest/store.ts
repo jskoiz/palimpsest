@@ -10,7 +10,7 @@ import {
 } from "./domain.mjs";
 import {
   generationFrameForRegion,
-  regionRelativeToFrame,
+  maskInGenerationFrame,
 } from "./geometry.mjs";
 import { isRetryableD1Reset, retryIdempotentD1 } from "./d1.mjs";
 import { serializeRecentJobPayload } from "./activity.mjs";
@@ -862,11 +862,16 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
   const rate = prepareRateLimits(input.rateLimits, EDIT_RATE_RULES, now);
   const [shortRate, dailyRate] = rate.values;
   const retryTokenHash = await sha256Hex(input.retryToken);
+  const generationMask = maskInGenerationFrame(
+    input.region,
+    input.strokes,
+    frame,
+  );
   const displayMask = new TextEncoder().encode(
     createDisplayMaskSvg({
-      region: regionRelativeToFrame(input.region, frame),
+      region: generationMask.region,
       fill: input.fill,
-      strokes: input.strokes,
+      strokes: generationMask.strokes,
     }),
   );
   const displayMaskHash = await sha256Hex(displayMask);

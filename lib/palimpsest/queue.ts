@@ -21,6 +21,11 @@ import {
   type GenerationFrame,
   type GlobalRegion,
 } from "./store";
+import {
+  GENERATION_FRAME_MIN_EDGE,
+  GENERATION_FRAME_SIZE,
+  regionInGenerationFrame,
+} from "./geometry.mjs";
 
 type QueueJob = {
   id: string;
@@ -63,8 +68,52 @@ const IMAGE_EDIT_TIMEOUT_MS = 150_000;
 const EDIT_REVIEW_TIMEOUT_MS = 75_000;
 const MAX_GENERAL_EDIT_ATTEMPTS = 3;
 const MAX_REFERENCE_ATTEMPTS = 2;
-const GENERAL_EDIT_RETRY = "The previous result failed the framing review. Regenerate from the original current-canvas input. Center every discrete requested subject inside the editable area and scale it to no more than 55% of the editable width or height, leaving obvious unchanged background space on all four sides. For handwriting or other text, render every requested word, letter, punctuation mark, decorative stroke, and underline completely; no visible mark may touch or end at an editable boundary. Do not crop, truncate, or enlarge the subject to fill the mask.";
-const REFERENCE_EDIT_RETRY = "The previous result failed reference review. Regenerate from the original current-canvas input. It already contains the reference subject at the intended position, scale, and maximum footprint. Preserve those visible subject pixels and their exact identity, geometry, proportions, perspective, materials, control layout, symbols, labels, and fine details; do not enlarge, crop, reposition, redraw, redesign, or substitute any component. Edit away its source background and blend it naturally into the current surroundings without a rectangular patch, matte, halo, wash, or tonal seam.";
+
+function cleanReviewReason(reason: string) {
+  return reason.replace(/\s+/g, " ").trim().slice(0, 320);
+}
+
+function generalRetryPrompt(
+  plannedPrompt: string,
+  review: { contained: boolean; blended: boolean; reason: string },
+) {
+  const corrections = [
+    "Regenerate from Image 1, the original current-canvas working crop.",
+    review.contained
+      ? "Keep the complete requested subject at its current safe scale and position."
+      : "Center every discrete requested subject inside the editable area and scale it to no more than 55% of the editable width or height, leaving obvious unchanged background space on all four sides. For handwriting or other text, render every requested word, letter, punctuation mark, decorative stroke, and underline completely; no visible mark may touch or end at an editable boundary.",
+    review.blended
+      ? "Preserve the existing natural transition into the surrounding canvas."
+      : "Match the surrounding canvas texture, color, lighting, and edge softness without a rectangular patch, matte, halo, wash, or tonal seam.",
+    `Review finding to correct: ${cleanReviewReason(review.reason)}`,
+  ];
+  return `${plannedPrompt} ${corrections.join(" ")}`;
+}
+
+function referenceRetryPrompt(
+  plannedPrompt: string,
+  review: { contained: boolean; faithful: boolean; blended: boolean; reason: string },
+) {
+  const corrections = [
+    "Regenerate from Image 1, the original current-canvas working crop.",
+    review.contained
+      ? "Keep the complete subject at its current safe scale and position."
+      : "Keep the complete reference subject centered within the prepared guide and leave clear canvas space on all four sides; do not enlarge or crop it.",
+    review.faithful
+      ? "Preserve the subject identity and component layout already achieved."
+      : "Use Image 2 as the high-resolution identity source. Preserve its exact silhouette, geometry, proportions, perspective, materials, control layout, symbols, labels, and fine details; do not redraw, redesign, simplify, or substitute any component.",
+    review.blended
+      ? "Preserve the existing natural transition into the surrounding canvas."
+      : "Remove the reference background and blend the subject into the current surroundings without a rectangular patch, matte, halo, wash, or tonal seam.",
+    `Review finding to correct: ${cleanReviewReason(review.reason)}`,
+  ];
+  return `${plannedPrompt} ${corrections.join(" ")}`;
+}
+
+function reviewFailureMessage(message: string, reason: string) {
+  const detail = cleanReviewReason(reason);
+  return detail ? `${message} Last review: ${detail}` : message;
+}
 
 export type QueueProcessResult = {
   claimed: number;
@@ -93,8 +142,13 @@ function jobFrame(job: QueueJob): GenerationFrame {
   if (
     job.frameX == null ||
     job.frameY == null ||
-    job.frameWidth !== 1024 ||
-    job.frameHeight !== 1024
+    job.frameWidth == null ||
+    job.frameHeight == null ||
+    !Number.isSafeInteger(job.frameWidth) ||
+    !Number.isSafeInteger(job.frameHeight) ||
+    job.frameWidth !== job.frameHeight ||
+    job.frameWidth < GENERATION_FRAME_MIN_EDGE ||
+    job.frameWidth > GENERATION_FRAME_SIZE
   ) {
     throw new DomainError("INTERNAL_ERROR", "The queued edit has no valid generation frame.");
   }
@@ -510,7 +564,10 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
         if (attempt === MAX_REFERENCE_ATTEMPTS - 1) {
           throw new DomainError(
             "REFERENCE_REVIEW_FAILED",
-            "The generated edit could not preserve the reference faithfully and blend it into the canvas. Nothing was added to history; use a clear reference and a large enough region, then try again.",
+            reviewFailureMessage(
+              "The generated edit could not preserve the reference faithfully and blend it into the canvas. Nothing was added to history.",
+              review.reason,
+            ),
           );
         }
         await updateStage(env, job, "generating", "generating");
@@ -518,18 +575,13 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
           env,
           job,
           apiKey,
-          `${plannedPrompt} ${REFERENCE_EDIT_RETRY}`,
+          referenceRetryPrompt(plannedPrompt, review),
         );
       }
     } else {
       const region = jobRegion(job);
       const frame = jobFrame(job);
-      const editableRegion = {
-        x: region.x - frame.x,
-        y: region.y - frame.y,
-        width: region.width,
-        height: region.height,
-      };
+      const editableRegion = regionInGenerationFrame(region, frame);
       for (let attempt = 0; attempt < MAX_GENERAL_EDIT_ATTEMPTS; attempt += 1) {
         await updateStage(env, job, "generating", "generating");
         const review = await reviewEditOutput(
@@ -549,7 +601,10 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
         if (attempt === MAX_GENERAL_EDIT_ATTEMPTS - 1) {
           throw new DomainError(
             "SUBJECT_OUT_OF_FRAME",
-            "The generated edit could not keep the complete requested subject inside the selected region. Nothing was added to history; choose a larger region or try again.",
+            reviewFailureMessage(
+              "The generated edit could not keep the complete requested subject inside the selected region. Nothing was added to history.",
+              review.reason,
+            ),
           );
         }
         await updateStage(env, job, "generating", "generating");
@@ -557,7 +612,7 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
           env,
           job,
           apiKey,
-          `${plannedPrompt} ${GENERAL_EDIT_RETRY}`,
+          generalRetryPrompt(plannedPrompt, review),
         );
       }
     }
@@ -780,6 +835,14 @@ async function generateOpenAiPatch(
       type: "image/png",
     }),
   );
+  if (referenceBytes) {
+    form.append(
+      "image[]",
+      new File([referenceBytes], "palimpsest-reference.png", {
+        type: "image/png",
+      }),
+    );
+  }
   form.append(
     "mask",
     new File([providerMaskBytes], "palimpsest-mask.png", {
@@ -788,7 +851,7 @@ async function generateOpenAiPatch(
   );
   form.append("prompt", buildOpenAiEditPrompt(plannedPrompt, Boolean(reference)));
   form.append("size", "1024x1024");
-  form.append("quality", "medium");
+  form.append("quality", referenceBytes ? "high" : "medium");
   form.append("output_format", "png");
   form.append("moderation", "auto");
 

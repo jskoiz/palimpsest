@@ -28,9 +28,11 @@ import {
   constrainCanvasView,
   EDIT_REGION_MAX_EDGE,
   EDIT_REGION_MIN_EDGE,
+  GENERATION_FRAME_SIZE,
   generationFrameForRegion,
+  maskInGenerationFrame,
   positionEditRegion,
-  regionRelativeToFrame,
+  regionInGenerationFrame,
   resizeEditRegion,
   regionsOverlap,
   timelineIndexAtPosition,
@@ -784,8 +786,8 @@ async function flattenArtworkFrame(state: ArtworkState, frame: Region): Promise<
   }
 
   const source = document.createElement("canvas");
-  source.width = frame.width;
-  source.height = frame.height;
+  source.width = GENERATION_FRAME_SIZE;
+  source.height = GENERATION_FRAME_SIZE;
   const sourceContext = source.getContext("2d");
   if (!sourceContext) throw new Error("This browser cannot prepare image edits.");
   sourceContext.drawImage(
@@ -796,8 +798,8 @@ async function flattenArtworkFrame(state: ArtworkState, frame: Region): Promise<
     frame.height,
     0,
     0,
-    frame.width,
-    frame.height,
+    GENERATION_FRAME_SIZE,
+    GENERATION_FRAME_SIZE,
   );
   return canvasBlob(source, "The artwork frame could not be encoded.");
 }
@@ -821,25 +823,31 @@ async function placeReferenceGuide(
 
   try {
     const canvas = document.createElement("canvas");
-    canvas.width = frame.width;
-    canvas.height = frame.height;
+    canvas.width = GENERATION_FRAME_SIZE;
+    canvas.height = GENERATION_FRAME_SIZE;
     const context = canvas.getContext("2d");
     if (!context) throw new Error("This browser cannot prepare reference placement.");
-    context.drawImage(sourceImage, 0, 0, frame.width, frame.height);
+    context.drawImage(
+      sourceImage,
+      0,
+      0,
+      GENERATION_FRAME_SIZE,
+      GENERATION_FRAME_SIZE,
+    );
     context.imageSmoothingEnabled = true;
     context.imageSmoothingQuality = "high";
 
-    const localRegion = regionRelativeToFrame(region, frame);
+    const localRegion = regionInGenerationFrame(region, frame);
     const scale = Math.min(
-      (region.width * REFERENCE_TARGET_FILL) / referenceImage.width,
-      (region.height * REFERENCE_TARGET_FILL) / referenceImage.height,
+      (localRegion.width * REFERENCE_TARGET_FILL) / referenceImage.width,
+      (localRegion.height * REFERENCE_TARGET_FILL) / referenceImage.height,
     );
     const width = Math.max(1, Math.round(referenceImage.width * scale));
     const height = Math.max(1, Math.round(referenceImage.height * scale));
     context.drawImage(
       referenceImage,
-      Math.round(localRegion.x + (region.width - width) / 2),
-      Math.round(localRegion.y + (region.height - height) / 2),
+      Math.round(localRegion.x + (localRegion.width - width) / 2),
+      Math.round(localRegion.y + (localRegion.height - height) / 2),
       width,
       height,
     );
@@ -857,25 +865,26 @@ async function providerMask(
   fill: boolean,
 ): Promise<Blob> {
   const canvas = document.createElement("canvas");
-  canvas.width = frame.width;
-  canvas.height = frame.height;
+  canvas.width = GENERATION_FRAME_SIZE;
+  canvas.height = GENERATION_FRAME_SIZE;
   const context = canvas.getContext("2d");
   if (!context) throw new Error("This browser cannot prepare a mask.");
   context.fillStyle = "#111111";
-  context.fillRect(0, 0, frame.width, frame.height);
+  context.fillRect(0, 0, GENERATION_FRAME_SIZE, GENERATION_FRAME_SIZE);
   context.globalCompositeOperation = "destination-out";
-  const frameRegion = regionRelativeToFrame(region, frame);
+  const generationMask = maskInGenerationFrame(region, strokes, frame);
+  const frameRegion = generationMask.region;
   if (fill) {
     context.clearRect(
       frameRegion.x,
       frameRegion.y,
-      region.width,
-      region.height,
+      frameRegion.width,
+      frameRegion.height,
     );
   } else {
     context.lineCap = "round";
     context.lineJoin = "round";
-    for (const stroke of strokes) {
+    for (const stroke of generationMask.strokes) {
       const first = stroke.points[0];
       if (!first) continue;
       context.lineWidth = stroke.width;

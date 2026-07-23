@@ -19,9 +19,10 @@ import {
   canvasViewCanPan,
   constrainCanvasView,
   generationFrameForRegion,
+  maskInGenerationFrame,
   nudgeEditRegion,
   positionEditRegion,
-  regionRelativeToFrame,
+  regionInGenerationFrame,
   resizeEditRegion,
   regionsOverlap,
   timelineIndexAtPosition,
@@ -342,10 +343,10 @@ test("live image prompts keep random objects whole without forcing an art style"
 
 test("reference-image prompts preserve the positioned subject while blending its frame", () => {
   const prompt = buildOpenAiEditPrompt("Add the flower from my reference.", true);
-  assert.match(prompt, /supplied current canvas image/i);
-  assert.match(prompt, /reference at the intended position and size/i);
-  assert.match(prompt, /within that exact footprint/i);
-  assert.match(prompt, /identity, detail, and composition source/i);
+  assert.match(prompt, /Image 1 is a high-resolution working crop/i);
+  assert.match(prompt, /Image 2 is the contributor's full-resolution visual reference/i);
+  assert.match(prompt, /primary subject within the guide footprint/i);
+  assert.match(prompt, /identity and detail source/i);
   assert.match(prompt, /do not enlarge, crop, reposition, redesign/i);
   assert.match(prompt, /control count and arrangement, symbols, labels/i);
   assert.match(prompt, /matching local perspective, scale, lighting/i);
@@ -503,7 +504,10 @@ test("reference images stay optional, visible in the patch, and reach live gener
   assert.match(clientSource, /REFERENCE_IMAGE_SIZE \/ image\.width/);
   assert.match(clientSource, /flattenArtworkFrame\(editBase\.state, frame\)/);
   assert.match(clientSource, /placeReferenceGuide/);
-  assert.match(clientSource, /region\.width \* REFERENCE_TARGET_FILL/);
+  assert.match(clientSource, /localRegion\.width \* REFERENCE_TARGET_FILL/);
+  assert.match(clientSource, /regionInGenerationFrame/);
+  assert.match(clientSource, /maskInGenerationFrame/);
+  assert.match(clientSource, /GENERATION_FRAME_SIZE/);
   assert.match(clientSource, /referenceImage\.sourceBlob/);
   assert.doesNotMatch(clientSource, /transparentGenerationFrame/);
   assert.doesNotMatch(clientSource, /normalizeReferenceImage\(file, editRegion\)/);
@@ -513,12 +517,12 @@ test("reference images stay optional, visible in the patch, and reach live gener
   assert.match(storeSource, /reference_blob_id/);
   assert.doesNotMatch(storeSource, /kind[^\n]*'reference'|VALUES \([^\n]*'reference'/);
   assert.match(storeSource, /referenceBlobId,[\s\S]*VALUES \(\?, \?, 'input'/);
-  assert.doesNotMatch(queueSource, /palimpsest-reference\.png/);
+  assert.match(queueSource, /palimpsest-reference\.png/);
+  assert.match(queueSource, /referenceBytes \? "high" : "medium"/);
   assert.match(queueSource, /form\.append\("model", "gpt-image-2"\)/);
   assert.doesNotMatch(queueSource, /gpt-image-1\.5/);
   assert.doesNotMatch(queueSource, /form\.append\("background", "transparent"\)/);
   assert.doesNotMatch(queueSource, /form\.append\("input_fidelity"/);
-  assert.match(queueSource, /form\.append\("quality", "medium"\)/);
   assert.match(queueSource, /buildOpenAiEditPrompt\(plannedPrompt, Boolean\(reference\)\)/);
   assert.match(queueSource, /reviewReferenceEdit/);
   assert.match(queueSource, /review\.contained && review\.faithful && review\.blended/);
@@ -526,9 +530,11 @@ test("reference images stay optional, visible in the patch, and reach live gener
   assert.match(queueSource, /review\.contained && review\.blended/);
   assert.match(queueSource, /MAX_GENERAL_EDIT_ATTEMPTS = 3/);
   assert.match(queueSource, /every requested word, letter, punctuation mark/);
+  assert.match(queueSource, /Review finding to correct/);
+  assert.match(queueSource, /Last review:/);
   assert.match(queueSource, /SUBJECT_OUT_OF_FRAME/);
   assert.match(queueSource, /MAX_REFERENCE_ATTEMPTS = 2/);
-  assert.match(queueSource, /already contains the reference subject at the intended position, scale, and maximum footprint/);
+  assert.match(queueSource, /Use Image 2 as the high-resolution identity source/);
   assert.match(queueSource, /https:\/\/api\.openai\.com\/v1\/responses/);
 });
 
@@ -671,36 +677,54 @@ test("collaboration UI never silently relocates a selected patch", async () => {
   assert.match(source, /!conflictingRegion/);
 });
 
-test("generation frames center seam-crossing regions and clamp at every artwork edge", () => {
+test("adaptive generation frames give small edits a high-resolution working crop", () => {
   assert.deepEqual(
     generationFrameForRegion({ x: 896, y: 832, width: 256, height: 384 }),
-    { x: 512, y: 512, width: 1024, height: 1024 },
+    { x: 717, y: 717, width: 615, height: 615 },
   );
 
   const corners = [
-    [{ x: 0, y: 0, width: 64, height: 64 }, { x: 0, y: 0, width: 1024, height: 1024 }],
-    [{ x: 1984, y: 0, width: 64, height: 64 }, { x: 1024, y: 0, width: 1024, height: 1024 }],
-    [{ x: 0, y: 1984, width: 64, height: 64 }, { x: 0, y: 1024, width: 1024, height: 1024 }],
-    [{ x: 1984, y: 1984, width: 64, height: 64 }, { x: 1024, y: 1024, width: 1024, height: 1024 }],
+    [{ x: 0, y: 0, width: 64, height: 64 }, { x: 0, y: 0, width: 256, height: 256 }],
+    [{ x: 1984, y: 0, width: 64, height: 64 }, { x: 1792, y: 0, width: 256, height: 256 }],
+    [{ x: 0, y: 1984, width: 64, height: 64 }, { x: 0, y: 1792, width: 256, height: 256 }],
+    [{ x: 1984, y: 1984, width: 64, height: 64 }, { x: 1792, y: 1792, width: 256, height: 256 }],
   ];
   for (const [region, expectedFrame] of corners) {
     assert.deepEqual(generationFrameForRegion(region), expectedFrame);
   }
+
+  assert.deepEqual(
+    generationFrameForRegion({ x: 167, y: 1035, width: 161, height: 305 }),
+    { x: 4, y: 944, width: 488, height: 488 },
+  );
 });
 
-test("global regions convert to frame-local mask coordinates", () => {
+test("global masks scale into provider pixels without losing stroke geometry", () => {
   const region = { x: 896, y: 832, width: 256, height: 384 };
   const frame = generationFrameForRegion(region);
-  const frameLocalRegion = regionRelativeToFrame(region, frame);
-  assert.deepEqual(frameLocalRegion, { x: 384, y: 320, width: 256, height: 384 });
-  assert.deepEqual(regionRelativeToFrame(region), frameLocalRegion);
+  const providerRegion = regionInGenerationFrame(region, frame);
+  assert.deepEqual(providerRegion, { x: 298, y: 191, width: 426, height: 640 });
+  assert.deepEqual(regionInGenerationFrame(region), providerRegion);
+
+  const providerMask = maskInGenerationFrame(
+    region,
+    [{ width: 16, points: [{ x: 0, y: 0 }, { x: 256, y: 384 }] }],
+    frame,
+  );
+  assert.deepEqual(providerMask, {
+    region: providerRegion,
+    strokes: [{
+      width: 27,
+      points: [{ x: 0, y: 0 }, { x: 426, y: 640 }],
+    }],
+  });
 
   const svg = createDisplayMaskSvg({
-    region: frameLocalRegion,
+    region: providerMask.region,
     fill: true,
     strokes: [],
   });
-  assert.match(svg, /<rect x="384" y="320" width="256" height="384"\/>/);
+  assert.match(svg, /<rect x="298" y="191" width="426" height="640"\/>/);
 });
 
 test("region overlap requires positive shared area", () => {
