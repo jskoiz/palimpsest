@@ -4,13 +4,11 @@ import {
   buildOpenAiEditPrompt,
 } from "./domain.mjs";
 import {
-  buildEditPlanRequest,
-  extractEditPlan,
   buildEditOutputReviewRequest,
   extractEditOutputReview,
   buildReferenceEditReviewRequest,
   extractReferenceEditReview,
-} from "./ai-planner.mjs";
+} from "./ai-review.mjs";
 import { isRetryableD1Reset, retryIdempotentD1 } from "./d1.mjs";
 import type { AppEnv } from "./runtime";
 import { readPngDimensions, sha256Hex } from "./runtime";
@@ -47,7 +45,6 @@ type QueueJob = {
   maskBlobId: string | null;
   displayMaskBlobId: string | null;
   referenceBlobId: string | null;
-  attemptCount: number;
   leaseFence: number;
   workerToken: string;
   createdAt: number;
@@ -58,56 +55,15 @@ type CommitLock = {
   fence: number;
 };
 
-const MAX_ATTEMPTS = 2;
+const MAX_WORKER_RECOVERY_ATTEMPTS = 1;
 const COMMIT_LOCK_LEASE_MS = 15_000;
 const COMMIT_LOCK_ATTEMPTS = 40;
 const COMMIT_LOCK_RETRY_MS = 25;
-const MODERATION_TIMEOUT_MS = 30_000;
-const EDIT_PLANNING_TIMEOUT_MS = 30_000;
 const IMAGE_EDIT_TIMEOUT_MS = 150_000;
 const EDIT_REVIEW_TIMEOUT_MS = 75_000;
-const MAX_GENERAL_EDIT_ATTEMPTS = 3;
-const MAX_REFERENCE_ATTEMPTS = 2;
 
 function cleanReviewReason(reason: string) {
   return reason.replace(/\s+/g, " ").trim().slice(0, 320);
-}
-
-function generalRetryPrompt(
-  plannedPrompt: string,
-  review: { contained: boolean; blended: boolean; reason: string },
-) {
-  const corrections = [
-    "Regenerate from Image 1, the original current-canvas working crop.",
-    review.contained
-      ? "Keep the complete requested subject at its current safe scale and position."
-      : "Center every discrete requested subject inside the editable area and scale it to no more than 55% of the editable width or height, leaving obvious unchanged background space on all four sides. For handwriting or other text, render every requested word, letter, punctuation mark, decorative stroke, and underline completely; no visible mark may touch or end at an editable boundary.",
-    review.blended
-      ? "Preserve the existing natural transition into the surrounding canvas."
-      : "Match the surrounding canvas texture, color, lighting, and edge softness without a rectangular patch, matte, halo, wash, or tonal seam.",
-    `Review finding to correct: ${cleanReviewReason(review.reason)}`,
-  ];
-  return `${plannedPrompt} ${corrections.join(" ")}`;
-}
-
-function referenceRetryPrompt(
-  plannedPrompt: string,
-  review: { contained: boolean; faithful: boolean; blended: boolean; reason: string },
-) {
-  const corrections = [
-    "Regenerate from Image 1, the original current-canvas working crop.",
-    review.contained
-      ? "Keep the complete subject at its current safe scale and position."
-      : "Keep the complete reference subject centered within the prepared guide and leave clear canvas space on all four sides; do not enlarge or crop it.",
-    review.faithful
-      ? "Preserve the subject identity and component layout already achieved."
-      : "Use Image 2 as the high-resolution identity source. Preserve its exact silhouette, geometry, proportions, perspective, materials, control layout, symbols, labels, and fine details; do not redraw, redesign, simplify, or substitute any component.",
-    review.blended
-      ? "Preserve the existing natural transition into the surrounding canvas."
-      : "Remove the reference background and blend the subject into the current surroundings without a rectangular patch, matte, halo, wash, or tonal seam.",
-    `Review finding to correct: ${cleanReviewReason(review.reason)}`,
-  ];
-  return `${plannedPrompt} ${corrections.join(" ")}`;
 }
 
 function reviewFailureMessage(message: string, reason: string) {
@@ -300,7 +256,6 @@ RETURNING
   mask_blob_id AS maskBlobId,
   display_mask_blob_id AS displayMaskBlobId,
   reference_blob_id AS referenceBlobId,
-  attempt_count AS attemptCount,
   lease_fence AS leaseFence,
   worker_token AS workerToken,
   created_at AS createdAt`;
@@ -356,7 +311,7 @@ export const CLAIMED_JOB_BY_TOKEN_SQL = `SELECT
   frame_width AS frameWidth, frame_height AS frameHeight,
   source_blob_id AS sourceBlobId, mask_blob_id AS maskBlobId,
   display_mask_blob_id AS displayMaskBlobId, reference_blob_id AS referenceBlobId,
-  attempt_count AS attemptCount, lease_fence AS leaseFence,
+  lease_fence AS leaseFence,
   worker_token AS workerToken, created_at AS createdAt
 FROM edit_jobs
 WHERE artwork_id = ? AND worker_token = ?
@@ -500,14 +455,14 @@ async function recoverExpiredJobs(env: AppEnv, now: number) {
          AND state IN ('moderating', 'generating', 'committing')
          AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
          AND attempt_count >= ?`,
-    ).bind(now, now, ARTWORK_ID, now, MAX_ATTEMPTS),
+    ).bind(now, now, ARTWORK_ID, now, MAX_WORKER_RECOVERY_ATTEMPTS),
     env.DB.prepare(REQUEUE_EXPIRED_ACTIVE_RESERVATION_SQL).bind(
       now,
       now + RESERVATION_LEASE_MS,
       now,
       ARTWORK_ID,
       now,
-      MAX_ATTEMPTS,
+      MAX_WORKER_RECOVERY_ATTEMPTS,
       now,
     ),
   ]);
@@ -531,97 +486,67 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
         "Live AI editing is not configured. Nothing was added to history.",
       );
     }
-    await moderatePrompt(apiKey, job.prompt);
-    const plannedPrompt = await planEditPrompt(
-      apiKey,
-      job.prompt,
-      Boolean(job.referenceBlobId),
-    );
     const region = jobRegion(job);
     const frame = jobFrame(job);
     const editableRegion = regionInGenerationFrame(region, frame);
     await updateStage(env, job, "moderating", "generating");
-    let patch = await generateOpenAiPatch(
+    const patch = await generateOpenAiPatch(
       env,
       job,
       apiKey,
-      plannedPrompt,
-      job.referenceBlobId ? "high" : "medium",
+      job.prompt,
+      "medium",
     );
     if (job.referenceBlobId) {
       const referenceBytes = patch.referenceBytes;
       if (!referenceBytes) {
         throw new DomainError("INTERNAL_ERROR", "The reference image could not be reviewed.");
       }
-      for (let attempt = 0; attempt < MAX_REFERENCE_ATTEMPTS; attempt += 1) {
-        await updateStage(env, job, "generating", "generating");
-        const review = await reviewReferenceEdit(
-          apiKey,
-          job.prompt,
-          patch.bytes,
-          referenceBytes,
-          patch.providerMaskBytes,
-          editableRegion,
-        );
-        console.info(`[palimpsest:${job.id}] reference edit review`, {
-          attempt: attempt + 1,
-          subjectContained: review?.contained ?? null,
-          referenceFaithful: review?.faithful ?? null,
-          surroundingsBlended: review?.blended ?? null,
-          reviewerReason: review?.reason.slice(0, 240) ?? null,
-        });
-        if (review.contained && review.faithful && review.blended) break;
-        if (attempt === MAX_REFERENCE_ATTEMPTS - 1) {
-          throw new DomainError(
-            "REFERENCE_REVIEW_FAILED",
-            reviewFailureMessage(
-              "The generated edit could not preserve the reference faithfully and blend it into the canvas. Nothing was added to history.",
-              review.reason,
-            ),
-          );
-        }
-        await updateStage(env, job, "generating", "generating");
-        patch = await generateOpenAiPatch(
-          env,
-          job,
-          apiKey,
-          referenceRetryPrompt(plannedPrompt, review),
-          "medium",
+      await updateStage(env, job, "generating", "generating");
+      const review = await reviewReferenceEdit(
+        apiKey,
+        job.prompt,
+        patch.bytes,
+        referenceBytes,
+        patch.providerMaskBytes,
+        editableRegion,
+      );
+      console.info(`[palimpsest:${job.id}] reference edit review`, {
+        subjectContained: review?.contained ?? null,
+        referenceFaithful: review?.faithful ?? null,
+        surroundingsBlended: review?.blended ?? null,
+        reviewerReason: review?.reason.slice(0, 240) ?? null,
+      });
+      if (!review.contained || !review.faithful || !review.blended) {
+        throw new DomainError(
+          "REFERENCE_REVIEW_FAILED",
+          reviewFailureMessage(
+            "The generated edit did not pass the reference and blending check. Nothing was added to history; use retry for one fresh attempt.",
+            review.reason,
+          ),
         );
       }
     } else {
-      for (let attempt = 0; attempt < MAX_GENERAL_EDIT_ATTEMPTS; attempt += 1) {
-        await updateStage(env, job, "generating", "generating");
-        const review = await reviewEditOutput(
-          apiKey,
-          job.prompt,
-          patch.bytes,
-          patch.providerMaskBytes,
-          editableRegion,
-        );
-        console.info(`[palimpsest:${job.id}] edit output review`, {
-          attempt: attempt + 1,
-          subjectContained: review.contained,
-          surroundingsBlended: review.blended,
-          reviewerReason: review.reason.slice(0, 240),
-        });
-        if (review.contained && review.blended) break;
-        if (attempt === MAX_GENERAL_EDIT_ATTEMPTS - 1) {
-          throw new DomainError(
-            "SUBJECT_OUT_OF_FRAME",
-            reviewFailureMessage(
-              "The generated edit could not keep the complete requested subject inside the selected region. Nothing was added to history.",
-              review.reason,
-            ),
-          );
-        }
-        await updateStage(env, job, "generating", "generating");
-        patch = await generateOpenAiPatch(
-          env,
-          job,
-          apiKey,
-          generalRetryPrompt(plannedPrompt, review),
-          "medium",
+      await updateStage(env, job, "generating", "generating");
+      const review = await reviewEditOutput(
+        apiKey,
+        job.prompt,
+        patch.bytes,
+        patch.providerMaskBytes,
+        editableRegion,
+      );
+      console.info(`[palimpsest:${job.id}] edit output review`, {
+        subjectContained: review.contained,
+        surroundingsBlended: review.blended,
+        reviewerReason: review.reason.slice(0, 240),
+      });
+      if (!review.contained || !review.blended) {
+        throw new DomainError(
+          "SUBJECT_OUT_OF_FRAME",
+          reviewFailureMessage(
+            "The generated edit did not pass the framing and blending check. Nothing was added to history; use retry for one fresh attempt.",
+            review.reason,
+          ),
         );
       }
     }
@@ -671,130 +596,11 @@ async function updateStage(
   job.state = nextState;
 }
 
-async function moderatePrompt(apiKey: string, prompt: string) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), MODERATION_TIMEOUT_MS);
-  let response: Response;
-  let body: { results?: Array<{ flagged?: boolean }> } | null;
-  try {
-    response = await fetch("https://api.openai.com/v1/moderations", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ model: "omni-moderation-latest", input: prompt }),
-      signal: controller.signal,
-    });
-    body = (await response.json().catch(() => null)) as {
-      results?: Array<{ flagged?: boolean }>;
-    } | null;
-  } catch {
-    throw new DomainError(
-      "PROVIDER_TEMPORARY",
-      "Live image editing did not respond in time. Nothing was added to history.",
-    );
-  } finally {
-    clearTimeout(timeout);
-  }
-  if (!response.ok) {
-    if (response.status === 401 || response.status === 403) {
-      throw new DomainError(
-        "AI_CONFIGURATION_ERROR",
-        "Live image editing could not authenticate. Nothing was added to history.",
-      );
-    }
-    if (response.status === 429 || response.status >= 500) {
-      throw new DomainError(
-        "PROVIDER_TEMPORARY",
-        "Live image editing is temporarily unavailable. Nothing was added to history.",
-      );
-    }
-    throw new DomainError("CONTENT_POLICY", "This prompt cannot be submitted as written.");
-  }
-  const result = body?.results?.[0];
-  if (!result) {
-    throw new DomainError(
-      "PROVIDER_TEMPORARY",
-      "Live image editing returned an invalid moderation response. Nothing was added to history.",
-    );
-  }
-  if (result.flagged) {
-    throw new DomainError(
-      "CONTENT_POLICY",
-      "This prompt cannot be submitted. Describe a safe visual change without personal information.",
-    );
-  }
-}
-
-async function planEditPrompt(
-  apiKey: string,
-  prompt: string,
-  hasReference: boolean,
-): Promise<string> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), EDIT_PLANNING_TIMEOUT_MS);
-  let response: Response;
-  let body:
-    | {
-        output?: Array<unknown>;
-        error?: { code?: string };
-      }
-    | null;
-  try {
-    response = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(buildEditPlanRequest(prompt, hasReference)),
-      signal: controller.signal,
-    });
-    body = (await response.json().catch(() => null)) as typeof body;
-  } catch {
-    throw new DomainError(
-      "PROVIDER_TEMPORARY",
-      "GPT-5.6 did not finish planning this edit in time. Nothing was added to history.",
-    );
-  } finally {
-    clearTimeout(timeout);
-  }
-
-  if (!response.ok) {
-    if (response.status === 401 || response.status === 403) {
-      throw new DomainError(
-        "AI_CONFIGURATION_ERROR",
-        "GPT-5.6 could not authenticate. Nothing was added to history.",
-      );
-    }
-    if (response.status === 429 || response.status >= 500) {
-      throw new DomainError(
-        "PROVIDER_TEMPORARY",
-        "GPT-5.6 is temporarily unavailable. Nothing was added to history.",
-      );
-    }
-    throw new DomainError(
-      "AI_CONFIGURATION_ERROR",
-      "GPT-5.6 could not plan this edit. Nothing was added to history.",
-    );
-  }
-
-  const plan = extractEditPlan(body);
-  if (!plan) {
-    throw new DomainError(
-      "PROVIDER_TEMPORARY",
-      "GPT-5.6 returned no usable edit plan. Nothing was added to history.",
-    );
-  }
-  return plan;
-}
-
 async function generateOpenAiPatch(
   env: AppEnv,
   job: QueueJob,
   apiKey: string,
-  plannedPrompt: string,
+  requestedPrompt: string,
   quality: "medium" | "high",
 ): Promise<{
   bytes: Uint8Array;
@@ -859,7 +665,7 @@ async function generateOpenAiPatch(
       type: "image/png",
     }),
   );
-  form.append("prompt", buildOpenAiEditPrompt(plannedPrompt, Boolean(reference)));
+  form.append("prompt", buildOpenAiEditPrompt(requestedPrompt, Boolean(reference)));
   form.append("size", "1024x1024");
   form.append("quality", quality);
   form.append("output_format", "png");
@@ -1507,35 +1313,6 @@ async function commitRevert(env: AppEnv, job: QueueJob) {
 async function handleFailure(env: AppEnv, job: QueueJob, error: unknown) {
   const domain = error instanceof DomainError ? error : null;
   const now = Date.now();
-  if (domain?.code === "PROVIDER_TEMPORARY" && job.attemptCount < MAX_ATTEMPTS) {
-    const attempt = Number(job.attemptCount) + 1;
-    await env.DB.prepare(
-      `UPDATE edit_jobs
-       SET state = 'queued',
-           attempt_count = ?,
-           available_at = ?,
-           worker_token = NULL,
-           lease_expires_at = ?,
-           updated_at = ?
-       WHERE id = ?
-         AND worker_token = ?
-         AND lease_fence = ?
-         AND lease_expires_at > ?`,
-    )
-      .bind(
-        attempt,
-        now + attempt * 5000,
-        now + RESERVATION_LEASE_MS,
-        now,
-        job.id,
-        job.workerToken,
-        job.leaseFence,
-        now,
-      )
-      .run();
-    return;
-  }
-
   const state =
     domain?.code === "STALE_BASE_REVISION"
       ? "stale"

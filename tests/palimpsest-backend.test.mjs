@@ -1328,18 +1328,35 @@ test("safe manual retry creates one immutable successor and keeps the failure vi
       'retry-source', 'retry-mask', 'retry-display', 'parent-key', 'fingerprint',
       'token-hash', 'request-parent', 1, NULL, 'PROVIDER_TEMPORARY', 'Try again.',
       1000, 2000, 2000
+    ), (
+      'failed-review', 'palimpsest', 'edit', 'failed', 'openai', 'author-a', 'owner',
+      'r0', 'Private prompt', 140, 20, 100, 120, 0, 0, 1024, 1024,
+      'retry-source', 'retry-mask', 'retry-display', 'review-parent-key', 'review-fingerprint',
+      'token-hash', 'request-review-parent', 1, NULL, 'SUBJECT_OUT_OF_FRAME',
+      'Use retry for one fresh attempt.', 1100, 2100, 2100
     );
   `);
   const retrySql = await readSqlConstant(
     "lib/palimpsest/store.ts",
     "INSERT_RETRY_JOB_SQL",
   );
+  const recentSql = await readSqlConstant("lib/palimpsest/store.ts", "RECENT_JOBS_SQL");
+  const beforeRetry = db.prepare(recentSql).all(2500, "palimpsest", "palimpsest");
+  assert.equal(beforeRetry.find((row) => row.jobId === "failed-parent").retryable, 1);
+  assert.equal(beforeRetry.find((row) => row.jobId === "failed-review").retryable, 1);
+  assert.match(retrySql, /REFERENCE_REVIEW_FAILED/u);
+
   const values = [
     "retry-child", "failed-parent", "palimpsest", "owner", "token-hash",
     "child-key", "request-child", 3000, 63000, 0, 0, 3, 0, 12,
   ];
   assert.equal(db.prepare(retrySql).run(...values).changes, 1);
   assert.equal(db.prepare(retrySql).run("other-child", ...values.slice(1)).changes, 0);
+  const reviewValues = [
+    "retry-review-child", "failed-review", "palimpsest", "owner", "token-hash",
+    "review-child-key", "request-review-child", 3100, 63100, 0, 0, 3, 0, 12,
+  ];
+  assert.equal(db.prepare(retrySql).run(...reviewValues).changes, 1);
   assert.deepEqual(
     {
       ...db.prepare(
@@ -1365,11 +1382,13 @@ test("safe manual retry creates one immutable successor and keeps the failure vi
       request_id: "request-child",
     },
   );
-  const recentSql = await readSqlConstant("lib/palimpsest/store.ts", "RECENT_JOBS_SQL");
   const recent = db.prepare(recentSql).all(4000, "palimpsest", "palimpsest");
   const parent = recent.find((row) => row.jobId === "failed-parent");
+  const reviewParent = recent.find((row) => row.jobId === "failed-review");
   assert.equal(parent.errorCode, "PROVIDER_TEMPORARY");
   assert.equal(parent.requestId, "request-parent");
   assert.equal(parent.retryable, 0, "a parent with an existing successor is no longer retryable");
+  assert.equal(reviewParent.errorCode, "SUBJECT_OUT_OF_FRAME");
+  assert.equal(reviewParent.retryable, 0);
   db.close();
 });

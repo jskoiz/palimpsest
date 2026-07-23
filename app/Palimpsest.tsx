@@ -636,9 +636,10 @@ function WelcomeDrawer({
                 <span>03</span>
                 <h2>Contribute</h2>
                 <p>
-                  Place and resize the patch, then paint what may change. GPT-5.6
-                  plans the request; GPT Image renders that masked area. References
-                  are optional. Live outlines lock only active work.
+                  Place and resize the patch, then paint what may change. GPT Image
+                  makes one masked image pass; GPT-5.6 checks it before acceptance.
+                  If it does not pass, you decide whether to retry. References are
+                  optional. Live outlines lock only active work.
                 </p>
               </section>
             </div>
@@ -1801,7 +1802,7 @@ export default function Palimpsest() {
           prompt: activityJob.displaySummary,
           region: activityJob.region,
         });
-        showToast("Retry reserved — generation is starting again.");
+        showToast("Retry reserved — one fresh image pass is starting.");
         void requestQueueDrain();
         await refreshActivity();
       } catch (error) {

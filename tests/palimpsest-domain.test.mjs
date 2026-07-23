@@ -28,14 +28,12 @@ import {
   timelineIndexAtPosition,
 } from "../lib/palimpsest/geometry.mjs";
 import {
-  EDIT_PLANNER_MODEL,
-  buildEditPlanRequest,
-  extractEditPlan,
+  EDIT_REVIEW_MODEL,
   buildEditOutputReviewRequest,
   extractEditOutputReview,
   buildReferenceEditReviewRequest,
   extractReferenceEditReview,
-} from "../lib/palimpsest/ai-planner.mjs";
+} from "../lib/palimpsest/ai-review.mjs";
 import {
   activityJobCounts,
   activityJobState,
@@ -61,7 +59,7 @@ test("activity jobs use stable visitor-facing states and separate failures from 
 
   assert.deepEqual(jobs.map(activityJobState), [
     "reserved",
-    "planning",
+    "starting",
     "generating",
     "finishing",
     "recovering",
@@ -366,46 +364,6 @@ test("reference-image prompts preserve the positioned subject while blending its
   assert.match(prompt, /Add the flower from my reference\./);
 });
 
-test("GPT-5.6 plans the requested edit without changing contributor intent", () => {
-  const request = buildEditPlanRequest("Add one cobalt paper boat.", true);
-
-  assert.equal(request.model, EDIT_PLANNER_MODEL);
-  assert.equal(request.model, "gpt-5.6");
-  assert.deepEqual(request.reasoning, { effort: "low" });
-  assert.equal(request.store, false);
-  assert.match(request.instructions, /Preserve the contributor's intent/i);
-  assert.match(request.instructions, /Do not invent new subjects/i);
-  assert.match(request.input, /Add one cobalt paper boat\./);
-  assert.match(request.input, /second image/i);
-});
-
-test("GPT-5.6 edit plans are read from message output rather than reasoning items", () => {
-  const plan = extractEditPlan({
-    output: [
-      { type: "reasoning", summary: [] },
-      {
-        type: "message",
-        content: [
-          { type: "refusal", refusal: "not used" },
-          { type: "output_text", text: "Add one cobalt paper boat." },
-        ],
-      },
-      {
-        type: "message",
-        content: [
-          { type: "output_text", text: "Keep it fully inside the masked area." },
-        ],
-      },
-    ],
-  });
-
-  assert.equal(
-    plan,
-    "Add one cobalt paper boat.\nKeep it fully inside the masked area.",
-  );
-  assert.equal(extractEditPlan({ output: [{ type: "reasoning" }] }), null);
-});
-
 test("every generated subject receives a structured framing review", () => {
   const request = buildEditOutputReviewRequest({
     requestedChange: "handwritten note that says 'Codex is awesome'",
@@ -414,6 +372,7 @@ test("every generated subject receives a structured framing review", () => {
     editableRegion: { x: 0, y: 382, width: 326, height: 260 },
   });
 
+  assert.equal(request.model, EDIT_REVIEW_MODEL);
   assert.equal(request.model, "gpt-5.6");
   assert.equal(request.store, false);
   assert.equal(request.max_output_tokens, 500);
@@ -457,6 +416,7 @@ test("reference generations receive structured fidelity and blending review", ()
     providerMaskUrl: "data:image/png;base64,mask",
     editableRegion: { x: 120, y: 220, width: 320, height: 400 },
   });
+  assert.equal(request.model, EDIT_REVIEW_MODEL);
   assert.equal(request.model, "gpt-5.6");
   assert.equal(request.store, false);
   assert.equal(request.max_output_tokens, 500);
@@ -500,7 +460,7 @@ test("reference generations receive structured fidelity and blending review", ()
   assert.equal(extractReferenceEditReview({ output: [] }), null);
 });
 
-test("reference images stay optional, visible in the patch, and reach live generation", async () => {
+test("live generation uses one medium image pass followed by one quality review", async () => {
   const [routeSource, clientSource, queueSource, storeSource] = await Promise.all([
     readFile(new URL("../app/api/edits/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8"),
@@ -511,6 +471,8 @@ test("reference images stay optional, visible in the patch, and reach live gener
   assert.match(clientSource, /form\.append\("reference", referenceImage\.blob/);
   assert.match(clientSource, /mono-reference-on-canvas/);
   assert.match(clientSource, /image\/png,image\/jpeg,image\/webp/);
+  assert.match(clientSource, /makes one masked image pass/);
+  assert.doesNotMatch(clientSource, /plans the request/);
   assert.doesNotMatch(clientSource, /REFERENCE_MASK_INSET/);
   assert.match(clientSource, /const blob = await normalizeReferenceImage\(file\)/);
   assert.match(clientSource, /sourceBlob: file/);
@@ -528,29 +490,31 @@ test("reference images stay optional, visible in the patch, and reach live gener
   assert.match(routeSource, /referenceValue instanceof File/);
   assert.match(routeSource, /referenceBytes/);
   assert.match(storeSource, /reference_blob_id/);
+  assert.match(storeSource, /SUBJECT_OUT_OF_FRAME[\s\S]*REFERENCE_REVIEW_FAILED/);
   assert.doesNotMatch(storeSource, /kind[^\n]*'reference'|VALUES \([^\n]*'reference'/);
   assert.match(storeSource, /referenceBlobId,[\s\S]*VALUES \(\?, \?, 'input'/);
   assert.match(queueSource, /palimpsest-reference\.png/);
-  assert.match(queueSource, /job\.referenceBlobId \? "high" : "medium"/);
-  assert.match(queueSource, /referenceRetryPrompt\(plannedPrompt, review\),\s*"medium"/);
+  assert.equal(queueSource.match(/await generateOpenAiPatch\(/gu)?.length, 1);
+  assert.match(queueSource, /job\.prompt,\s*"medium"/);
+  assert.doesNotMatch(queueSource, /planEditPrompt|generalRetryPrompt|referenceRetryPrompt/);
+  assert.doesNotMatch(queueSource, /MAX_GENERAL_EDIT_ATTEMPTS|MAX_REFERENCE_ATTEMPTS/);
+  assert.doesNotMatch(queueSource, /\/v1\/moderations|omni-moderation/);
   assert.match(queueSource, /form\.append\("quality", quality\)/);
   assert.match(queueSource, /form\.append\("model", "gpt-image-2"\)/);
+  assert.match(queueSource, /form\.append\("moderation", "auto"\)/);
   assert.doesNotMatch(queueSource, /gpt-image-1\.5/);
   assert.doesNotMatch(queueSource, /form\.append\("background", "transparent"\)/);
   assert.doesNotMatch(queueSource, /form\.append\("input_fidelity"/);
-  assert.match(queueSource, /buildOpenAiEditPrompt\(plannedPrompt, Boolean\(reference\)\)/);
+  assert.match(queueSource, /buildOpenAiEditPrompt\(requestedPrompt, Boolean\(reference\)\)/);
   assert.match(queueSource, /reviewReferenceEdit/);
-  assert.match(queueSource, /review\.contained && review\.faithful && review\.blended/);
+  assert.match(queueSource, /!review\.contained \|\| !review\.faithful \|\| !review\.blended/);
   assert.match(queueSource, /reviewEditOutput/);
-  assert.match(queueSource, /review\.contained && review\.blended/);
-  assert.match(queueSource, /MAX_GENERAL_EDIT_ATTEMPTS = 3/);
-  assert.match(queueSource, /every requested word, letter, punctuation mark/);
-  assert.match(queueSource, /Review finding to correct/);
+  assert.match(queueSource, /!review\.contained \|\| !review\.blended/);
+  assert.match(queueSource, /use retry for one fresh attempt/);
   assert.match(queueSource, /Last review:/);
   assert.match(queueSource, /SUBJECT_OUT_OF_FRAME/);
-  assert.match(queueSource, /MAX_REFERENCE_ATTEMPTS = 2/);
-  assert.match(queueSource, /Use Image 2 as the high-resolution identity source/);
   assert.match(queueSource, /https:\/\/api\.openai\.com\/v1\/responses/);
+  assert.doesNotMatch(queueSource, /domain\?\.code === "PROVIDER_TEMPORARY" &&/);
 });
 
 test("stale base revisions are rejected without an implicit rebase", () => {

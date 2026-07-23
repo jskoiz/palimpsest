@@ -432,7 +432,11 @@ export const RECENT_JOBS_SQL = `SELECT
     j.kind = 'edit'
     AND j.state = 'failed'
     AND (
-      j.error_code = 'PROVIDER_TEMPORARY'
+      j.error_code IN (
+        'PROVIDER_TEMPORARY',
+        'SUBJECT_OUT_OF_FRAME',
+        'REFERENCE_REVIEW_FAILED'
+      )
       OR (j.error_code = 'QUEUE_LEASE_EXPIRED' AND j.started_at IS NULL)
     )
     AND j.source_blob_id IS NOT NULL
@@ -1458,7 +1462,11 @@ WHERE parent.artwork_id = c.artwork_id
   AND parent.requester_hash = c.requester_hash
   AND parent.retry_token_hash = c.retry_token_hash
   AND (
-    parent.error_code = 'PROVIDER_TEMPORARY'
+    parent.error_code IN (
+      'PROVIDER_TEMPORARY',
+      'SUBJECT_OUT_OF_FRAME',
+      'REFERENCE_REVIEW_FAILED'
+    )
     OR (parent.error_code = 'QUEUE_LEASE_EXPIRED' AND parent.started_at IS NULL)
   )
   AND parent.source_blob_id IS NOT NULL
@@ -1551,7 +1559,11 @@ export async function retryFailedEditJob(
   }
   const technicallyRetryable =
     candidate.state === "failed" &&
-    (candidate.errorCode === "PROVIDER_TEMPORARY" ||
+    ([
+      "PROVIDER_TEMPORARY",
+      "SUBJECT_OUT_OF_FRAME",
+      "REFERENCE_REVIEW_FAILED",
+    ].includes(candidate.errorCode ?? "") ||
       (candidate.errorCode === "QUEUE_LEASE_EXPIRED" && candidate.startedAt == null));
   const requiredKeys = [
     candidate.sourceKey,
@@ -1700,7 +1712,11 @@ export async function getPublicJob(env: AppEnv, jobId: string) {
        CASE WHEN
          j.kind = 'edit' AND j.state = 'failed'
          AND (
-           j.error_code = 'PROVIDER_TEMPORARY'
+           j.error_code IN (
+             'PROVIDER_TEMPORARY',
+             'SUBJECT_OUT_OF_FRAME',
+             'REFERENCE_REVIEW_FAILED'
+           )
            OR (j.error_code = 'QUEUE_LEASE_EXPIRED' AND j.started_at IS NULL)
          )
          AND j.source_blob_id IS NOT NULL

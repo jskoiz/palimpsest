@@ -19,7 +19,7 @@ export function activityJobState(job) {
   if (FAILED_JOB_STATES.has(job.state)) return "failed";
   if (!job.reservationActive && ACTIVE_JOB_STATES.has(job.state)) return "recovering";
   if (job.state === "queued") return "reserved";
-  if (job.state === "moderating") return "planning";
+  if (job.state === "moderating") return "starting";
   if (job.state === "generating") return "generating";
   if (job.state === "committing") return "finishing";
   return "recovering";
