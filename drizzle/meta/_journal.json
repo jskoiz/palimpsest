@@ -71,6 +71,13 @@
       "when": 1784750400000,
       "tag": "0009_durable_job_attempts",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1784774061000,
+      "tag": "0010_reset_framing_test_archive",
+      "breakpoints": true
     }
   ]
 }

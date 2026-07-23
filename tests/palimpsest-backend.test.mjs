@@ -594,6 +594,103 @@ test("live-canvas reset targets the current archive with validated SQL", async (
   );
 });
 
+test("framing-test reset clears the current archive and durable job state", async () => {
+  const db = await migratedDatabase();
+  db.exec(`
+    INSERT INTO artworks (
+      id, slug, title, width, height, tile_width, tile_height,
+      columns, rows, head_revision_id, head_sequence, created_at
+    ) VALUES ('palimpsest-purple', 'palimpsest', 'Palimpsest', 2048, 2048,
+      1024, 1024, 2, 2, 'cropped-revision', 1, 1);
+    INSERT INTO authors (id, display_name, source, created_at) VALUES
+      ('archive-purple', 'Palimpsest Archive', 'seed', 1),
+      ('visitor-purple', 'Visitor', 'visitor', 2);
+    INSERT INTO blobs (
+      id, artwork_id, kind, r2_key, content_type, byte_length,
+      sha256, width, height, created_at
+    ) VALUES ('cropped-patch', 'palimpsest-purple', 'patch', 'cropped.png',
+      'image/png', 1, 'cropped-hash', 1024, 1024, 2);
+    INSERT INTO revisions (
+      id, artwork_id, sequence, parent_revision_id, origin, status,
+      author_id, prompt, region_x, region_y, region_width, region_height, created_at
+    ) VALUES
+      ('purple-seed', 'palimpsest-purple', 0, NULL, 'seed', 'accepted',
+        'archive-purple', 'Purple abstract canvas.', NULL, NULL, NULL, NULL, 1),
+      ('cropped-revision', 'palimpsest-purple', 1, 'purple-seed', 'openai',
+        'accepted', 'visitor-purple', 'Cropped note', 0, 1154, 326, 260, 2);
+    INSERT INTO revision_patches (
+      revision_id, patch_blob_id, display_mask_blob_id,
+      frame_x, frame_y, frame_width, frame_height
+    ) VALUES ('cropped-revision', 'cropped-patch', NULL, 0, 772, 1024, 1024);
+    INSERT INTO edit_jobs (
+      id, artwork_id, kind, state, execution_mode, author_id, requester_hash,
+      base_revision_id, prompt, region_x, region_y, region_width, region_height,
+      idempotency_key, request_fingerprint, available_at, lease_expires_at,
+      created_at, updated_at, retry_token_hash, request_id
+    ) VALUES ('cropped-job', 'palimpsest-purple', 'edit', 'succeeded', 'openai',
+      'visitor-purple', 'requester', 'purple-seed', 'Cropped note', 0, 1154, 326,
+      260, 'cropped-idem', 'cropped-fingerprint', 1, NULL, 1, 2,
+      'retry-token-hash', 'request-cropped');
+    INSERT INTO artwork_commit_locks (artwork_id, fence)
+      VALUES ('palimpsest-purple', 2);
+    INSERT INTO rate_limit_claims (
+      requester_hash, scope, window_start, idempotency_key, job_id, created_at
+    ) VALUES ('requester', 'edit:short', 0, 'cropped-idem', 'cropped-job', 1);
+  `);
+
+  const reset = await readFile(
+    new URL("drizzle/0010_reset_framing_test_archive.sql", root),
+    "utf8",
+  );
+  applyMigration(db, reset);
+
+  assert.match(reset, /'palimpsest-purple'/u);
+  assert.doesNotMatch(reset, /'palimpsest'/u);
+  for (const table of [
+    "artworks",
+    "authors",
+    "blobs",
+    "edit_jobs",
+    "keyframe_tiles",
+    "keyframes",
+    "rate_limit_claims",
+    "revision_patches",
+    "revisions",
+    "artwork_commit_locks",
+  ]) {
+    assert.equal(
+      db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count,
+      0,
+      `${table} must be empty after the framing-test reset`,
+    );
+  }
+
+  db.exec(`
+    INSERT INTO artworks (
+      id, slug, title, width, height, tile_width, tile_height,
+      columns, rows, head_revision_id, head_sequence, created_at
+    ) VALUES ('palimpsest-purple', 'palimpsest', 'Palimpsest', 2048, 2048,
+      1024, 1024, 2, 2, 'purple-seed', 0, 3);
+    INSERT INTO authors (id, display_name, source, created_at)
+      VALUES ('archive-purple', 'Palimpsest Archive', 'seed', 3);
+    INSERT INTO revisions (
+      id, artwork_id, sequence, parent_revision_id, origin, status,
+      author_id, prompt, created_at
+    ) VALUES ('purple-seed', 'palimpsest-purple', 0, NULL, 'seed', 'accepted',
+      'archive-purple', 'Purple abstract canvas.', 3);
+  `);
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        "SELECT head_revision_id, head_sequence FROM artworks WHERE id = 'palimpsest-purple'",
+      ).get(),
+    },
+    { head_revision_id: "purple-seed", head_sequence: 0 },
+  );
+  assert.throws(() => db.exec("DELETE FROM revisions WHERE id = 'purple-seed'"));
+  db.close();
+});
+
 test("atomic spatial reservations reject overlap, allow touching, and expire cleanly", async () => {
   const db = await migratedDatabase();
   seedArtwork(db);
