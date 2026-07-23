@@ -23,6 +23,7 @@ import {
   ARTWORK_SIZE,
   REFERENCE_EDIT_MIN_EDGE,
   REFERENCE_TARGET_FILL,
+  referencePlacementRegion,
 } from "@/lib/palimpsest/domain.mjs";
 import {
   canvasViewCanPan,
@@ -34,7 +35,6 @@ import {
   maskInGenerationFrame,
   positionEditRegion,
   referenceSafeEditRegion,
-  regionInGenerationFrame,
   resizeEditRegion,
   regionsOverlap,
   timelineIndexAtPosition,
@@ -642,8 +642,9 @@ function WelcomeDrawer({
                 <p>
                   Place and resize the patch, then paint what may change. GPT Image
                   makes one masked image pass; GPT-5.6 checks it before acceptance.
-                  A reference-only framing miss gets one smaller automatic retry.
-                  References use a protected safe area. Live outlines lock only active work.
+                  A reference-only placement miss gets one automatic retry.
+                  References use the preview as an exact protected placement area, so
+                  prior artwork outside it cannot be replaced. Live outlines lock only active work.
                 </p>
               </section>
             </div>
@@ -940,65 +941,12 @@ async function flattenArtworkFrame(state: ArtworkState, frame: Region): Promise<
   return canvasBlob(source, "The artwork frame could not be encoded.");
 }
 
-async function placeReferenceGuide(
-  source: Blob,
-  reference: Blob,
-  region: Region,
-  frame: Region,
-): Promise<Blob> {
-  let sourceImage: ImageBitmap;
-  let referenceImage: ImageBitmap;
-  try {
-    [sourceImage, referenceImage] = await Promise.all([
-      createImageBitmap(source),
-      createImageBitmap(reference),
-    ]);
-  } catch {
-    throw new Error("The reference placement guide could not be prepared.");
-  }
-
-  try {
-    const canvas = document.createElement("canvas");
-    canvas.width = GENERATION_FRAME_SIZE;
-    canvas.height = GENERATION_FRAME_SIZE;
-    const context = canvas.getContext("2d");
-    if (!context) throw new Error("This browser cannot prepare reference placement.");
-    context.drawImage(
-      sourceImage,
-      0,
-      0,
-      GENERATION_FRAME_SIZE,
-      GENERATION_FRAME_SIZE,
-    );
-    context.imageSmoothingEnabled = true;
-    context.imageSmoothingQuality = "high";
-
-    const localRegion = regionInGenerationFrame(region, frame);
-    const scale = Math.min(
-      (localRegion.width * REFERENCE_TARGET_FILL) / referenceImage.width,
-      (localRegion.height * REFERENCE_TARGET_FILL) / referenceImage.height,
-    );
-    const width = Math.max(1, Math.round(referenceImage.width * scale));
-    const height = Math.max(1, Math.round(referenceImage.height * scale));
-    context.drawImage(
-      referenceImage,
-      Math.round(localRegion.x + (localRegion.width - width) / 2),
-      Math.round(localRegion.y + (localRegion.height - height) / 2),
-      width,
-      height,
-    );
-    return canvasBlob(canvas, "The reference placement guide could not be encoded.");
-  } finally {
-    sourceImage.close();
-    referenceImage.close();
-  }
-}
-
 async function providerMask(
   region: Region,
   frame: Region,
   strokes: Stroke[],
   fill: boolean,
+  referencePlacement: boolean,
 ): Promise<Blob> {
   const canvas = document.createElement("canvas");
   canvas.width = GENERATION_FRAME_SIZE;
@@ -1009,7 +957,9 @@ async function providerMask(
   context.fillRect(0, 0, GENERATION_FRAME_SIZE, GENERATION_FRAME_SIZE);
   context.globalCompositeOperation = "destination-out";
   const generationMask = maskInGenerationFrame(region, strokes, frame);
-  const frameRegion = generationMask.region;
+  const frameRegion = referencePlacement
+    ? referencePlacementRegion(generationMask.region)
+    : generationMask.region;
   if (fill) {
     context.clearRect(
       frameRegion.x,
@@ -1649,7 +1599,15 @@ export default function Palimpsest() {
     context.lineCap = "round";
     context.lineJoin = "round";
     if (fillMask) {
-      context.fillRect(0, 0, width, height);
+      const fillRegion = referenceImage
+        ? referencePlacementRegion({ x: 0, y: 0, width, height })
+        : { x: 0, y: 0, width, height };
+      context.fillRect(
+        fillRegion.x,
+        fillRegion.y,
+        fillRegion.width,
+        fillRegion.height,
+      );
     }
     for (const stroke of strokes) {
       const first = stroke.points[0];
@@ -1664,7 +1622,7 @@ export default function Palimpsest() {
       }
       context.stroke();
     }
-  }, [editOpen, editRegion, fillMask, step, strokes, submitted]);
+  }, [editOpen, editRegion, fillMask, referenceImage, step, strokes, submitted]);
 
   const zoomAt = useCallback((cx: number, cy: number, factor: number) => {
     setView((current) => {
@@ -2368,8 +2326,8 @@ export default function Palimpsest() {
       });
       showToast(
         expanded
-          ? `Reference safe area expanded to ${safeRegion.width} × ${safeRegion.height}.`
-          : "Reference safe area ready — 33% margin on every side.",
+          ? `Reference context expanded to ${safeRegion.width} × ${safeRegion.height}; the centered preview is the exact placement area.`
+          : "Reference placement ready — the centered preview is the exact visible area.",
       );
     } catch (error) {
       event.currentTarget.value = "";
@@ -2429,21 +2387,13 @@ export default function Palimpsest() {
         : crypto.randomUUID();
     try {
       const [source, mask] = await Promise.all([
-        flattenArtworkFrame(editBase.state, frame).then((artworkFrame) =>
-          referenceImage
-            ? placeReferenceGuide(
-                artworkFrame,
-                referenceImage.sourceBlob,
-                editRegion,
-                frame,
-              )
-            : artworkFrame,
-        ),
+        flattenArtworkFrame(editBase.state, frame),
         providerMask(
           editRegion,
           frame,
           strokes,
           fillMask,
+          Boolean(referenceImage),
         ),
       ]);
       const form = new FormData();
@@ -2761,7 +2711,7 @@ export default function Palimpsest() {
                     >
                       <img src={referenceImage.previewUrl} alt="" />
                     </div>
-                    <span>safe subject area · 33% margin</span>
+                    <span>exact placement · prior art protected</span>
                   </div>
                 ) : null}
                 {step >= 2 && !submitted ? (

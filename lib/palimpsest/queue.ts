@@ -2,6 +2,7 @@ import {
   ARTWORK_ID,
   DomainError,
   buildOpenAiEditPrompt,
+  referencePlacementRegion,
 } from "./domain.mjs";
 import {
   buildEditOutputReviewRequest,
@@ -489,7 +490,10 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
     }
     const region = jobRegion(job);
     const frame = jobFrame(job);
-    const editableRegion = regionInGenerationFrame(region, frame);
+    const generationRegion = regionInGenerationFrame(region, frame);
+    const editableRegion = job.referenceBlobId
+      ? referencePlacementRegion(generationRegion)
+      : generationRegion;
     await updateStage(env, job, "moderating", "generating");
     let patch = await generateOpenAiPatch(
       env,
@@ -509,6 +513,7 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
         apiKey,
         job.prompt,
         patch.bytes,
+        patch.sourceBytes,
         referenceBytes,
         patch.providerMaskBytes,
         editableRegion,
@@ -517,7 +522,9 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
         attempt: "initial",
         subjectContained: review?.contained ?? null,
         referenceFaithful: review?.faithful ?? null,
+        placementMatched: review?.placementMatched ?? null,
         surroundingsBlended: review?.blended ?? null,
+        sourcePreserved: review?.sourcePreserved ?? null,
         reviewerReason: review?.reason.slice(0, 240) ?? null,
       });
       let outcome = referenceReviewOutcome(review);
@@ -543,6 +550,7 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
           apiKey,
           job.prompt,
           patch.bytes,
+          patch.sourceBytes,
           referenceBytes,
           patch.providerMaskBytes,
           editableRegion,
@@ -551,7 +559,9 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
           attempt: "containment-retry",
           subjectContained: review.contained,
           referenceFaithful: review.faithful,
+          placementMatched: review.placementMatched,
           surroundingsBlended: review.blended,
+          sourcePreserved: review.sourcePreserved,
           reviewerReason: review.reason.slice(0, 240),
         });
         outcome = referenceReviewOutcome(review, true);
@@ -560,7 +570,7 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
         throw new DomainError(
           "SUBJECT_OUT_OF_FRAME",
           reviewFailureMessage(
-            "The generated reference subject still crossed the safe area after one automatic smaller-scale retry. Nothing was added to history; choose a larger patch or submit again.",
+            "The generated reference still did not match the selected placement after one automatic retry. Nothing was added to history; move or enlarge the patch and submit again.",
             review.reason,
           ),
         );
@@ -656,6 +666,7 @@ async function generateOpenAiPatch(
   contentType: string;
   providerRequestId?: string;
   providerMaskBytes: Uint8Array;
+  sourceBytes: Uint8Array;
   referenceBytes: Uint8Array | null;
 }> {
   if (!job.sourceBlobId || !job.maskBlobId) {
@@ -808,6 +819,7 @@ async function generateOpenAiPatch(
     contentType: "image/png",
     providerRequestId,
     providerMaskBytes,
+    sourceBytes,
     referenceBytes,
   };
 }
@@ -876,6 +888,7 @@ async function reviewReferenceEdit(
   apiKey: string,
   requestedChange: string,
   generatedBytes: Uint8Array,
+  sourceBytes: Uint8Array,
   referenceBytes: Uint8Array,
   providerMaskBytes: Uint8Array,
   editableRegion: GlobalRegion,
@@ -894,6 +907,7 @@ async function reviewReferenceEdit(
       body: JSON.stringify(buildReferenceEditReviewRequest({
         requestedChange,
         generatedImageUrl: imageDataUrl(generatedBytes),
+        sourceImageUrl: imageDataUrl(sourceBytes),
         referenceImageUrl: imageDataUrl(referenceBytes),
         providerMaskUrl: imageDataUrl(providerMaskBytes),
         editableRegion,

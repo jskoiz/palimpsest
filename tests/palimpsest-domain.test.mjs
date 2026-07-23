@@ -13,6 +13,7 @@ import {
   buildOpenAiEditPrompt,
   createDisplayMaskSvg,
   displayMaskForLayer,
+  referencePlacementRegion,
   resolveLayerStack,
   serializeHistory,
   validateRegion,
@@ -358,28 +359,29 @@ test("reference-image prompts preserve the positioned subject while blending its
   const prompt = buildOpenAiEditPrompt("Add the flower from my reference.", true);
   assert.match(prompt, /Image 1 is a high-resolution working crop/i);
   assert.match(prompt, /Image 2 is the contributor's full-resolution visual reference/i);
-  assert.match(prompt, /primary subject within the guide footprint/i);
+  assert.match(prompt, /transparent mask area is the exact placement footprint/i);
   assert.match(prompt, /identity and detail source/i);
   assert.match(prompt, /do not enlarge, crop, reposition, redesign/i);
   assert.match(prompt, /control count and arrangement, symbols, labels/i);
   assert.match(prompt, /matching local perspective, scale, lighting/i);
   assert.match(prompt, /Do not copy the reference image's rectangular background/i);
+  assert.match(prompt, /Preserve every existing Image 1 pixel/i);
+  assert.match(prompt, /including existing text and marks/i);
   assert.match(prompt, /do not invent hidden structure or replacement controls/i);
   assert.match(prompt, /Reference backgrounds, display stands, or secondary props may be omitted/i);
-  assert.match(prompt, /composition guide centered inside the transparent editable area/i);
-  assert.match(prompt, /preserve the complete visible primary subject/i);
+  assert.match(prompt, /surrounding opaque mask is protected prior artwork/i);
   assert.match(prompt, /Add the flower from my reference\./);
 });
 
-test("reference containment retry asks for one materially smaller subject", () => {
+test("reference placement retry preserves the selected scale without cropping", () => {
   const prompt = buildOpenAiEditPrompt(
     "Add the flower from my reference.",
     true,
     true,
   );
-  assert.match(prompt, /single containment retry/i);
-  assert.match(prompt, /no more than 70% of the prepared guide/i);
-  assert.match(prompt, /do not enlarge the subject/i);
+  assert.match(prompt, /single placement retry/i);
+  assert.match(prompt, /Match the reference preview's scale and center exactly/i);
+  assert.match(prompt, /without shrinking it below half/i);
 });
 
 test("every generated subject receives a structured framing review", () => {
@@ -430,6 +432,7 @@ test("reference generations receive structured fidelity and blending review", ()
   const request = buildReferenceEditReviewRequest({
     requestedChange: "Place the mini keyboard.",
     generatedImageUrl: "data:image/png;base64,generated",
+    sourceImageUrl: "data:image/png;base64,source",
     referenceImageUrl: "data:image/png;base64,reference",
     providerMaskUrl: "data:image/png;base64,mask",
     editableRegion: { x: 120, y: 220, width: 320, height: 400 },
@@ -439,13 +442,17 @@ test("reference generations receive structured fidelity and blending review", ()
   assert.equal(request.store, false);
   assert.equal(request.max_output_tokens, 500);
   assert.equal(request.input[0].content[1].type, "input_image");
-  assert.equal(request.input[0].content[2].image_url, "data:image/png;base64,reference");
-  assert.equal(request.input[0].content[3].image_url, "data:image/png;base64,mask");
+  assert.equal(request.input[0].content[1].image_url, "data:image/png;base64,generated");
+  assert.equal(request.input[0].content[2].image_url, "data:image/png;base64,source");
+  assert.equal(request.input[0].content[3].image_url, "data:image/png;base64,reference");
+  assert.equal(request.input[0].content[4].image_url, "data:image/png;base64,mask");
   assert.equal(request.text.format.type, "json_schema");
   assert.equal(request.text.format.strict, true);
   assert.match(request.instructions, /control count and arrangement, symbols, labels/i);
   assert.match(request.instructions, /no visible rectangular patch/i);
+  assert.match(request.instructions, /smudging of uncovered prior artwork fails source preservation/i);
   assert.match(request.input[0].content[0].text, /visually faithful/i);
+  assert.match(request.input[0].content[0].text, /matched to the preview's placement and relative scale/i);
   assert.match(request.input[0].content[0].text, /naturally blended/i);
   assert.match(
     request.input[0].content[0].text,
@@ -454,7 +461,9 @@ test("reference generations receive structured fidelity and blending review", ()
   assert.deepEqual(request.text.format.schema.required, [
     "contained",
     "faithful",
+    "placementMatched",
     "blended",
+    "sourcePreserved",
     "reason",
   ]);
 
@@ -464,14 +473,16 @@ test("reference generations receive structured fidelity and blending review", ()
         type: "message",
         content: [{
           type: "output_text",
-          text: '{"contained":true,"faithful":false,"blended":true,"reason":"The controls were redesigned."}',
+          text: '{"contained":true,"faithful":false,"placementMatched":true,"blended":true,"sourcePreserved":true,"reason":"The controls were redesigned."}',
         }],
       }],
     }),
     {
       contained: true,
       faithful: false,
+      placementMatched: true,
       blended: true,
+      sourcePreserved: true,
       reason: "The controls were redesigned.",
     },
   );
@@ -480,26 +491,66 @@ test("reference generations receive structured fidelity and blending review", ()
 
 test("reference review retries only a clean containment miss and only once", () => {
   assert.equal(
-    referenceReviewOutcome({ contained: true, faithful: true, blended: true }),
+    referenceReviewOutcome({
+      contained: true,
+      faithful: true,
+      placementMatched: true,
+      blended: true,
+      sourcePreserved: true,
+    }),
     "accept",
   );
   assert.equal(
-    referenceReviewOutcome({ contained: false, faithful: true, blended: true }),
+    referenceReviewOutcome({
+      contained: false,
+      faithful: true,
+      placementMatched: false,
+      blended: true,
+      sourcePreserved: true,
+    }),
     "retry-containment",
   );
   assert.equal(
     referenceReviewOutcome(
-      { contained: false, faithful: true, blended: true },
+      {
+        contained: false,
+        faithful: true,
+        placementMatched: false,
+        blended: true,
+        sourcePreserved: true,
+      },
       true,
     ),
     "reject-containment",
   );
   assert.equal(
-    referenceReviewOutcome({ contained: true, faithful: false, blended: true }),
+    referenceReviewOutcome({
+      contained: true,
+      faithful: false,
+      placementMatched: true,
+      blended: true,
+      sourcePreserved: true,
+    }),
     "reject-reference",
   );
   assert.equal(
-    referenceReviewOutcome({ contained: true, faithful: true, blended: false }),
+    referenceReviewOutcome({
+      contained: true,
+      faithful: true,
+      placementMatched: true,
+      blended: false,
+      sourcePreserved: true,
+    }),
+    "reject-reference",
+  );
+  assert.equal(
+    referenceReviewOutcome({
+      contained: true,
+      faithful: true,
+      placementMatched: true,
+      blended: true,
+      sourcePreserved: false,
+    }),
     "reject-reference",
   );
 });
@@ -521,16 +572,15 @@ test("live generation uses one image pass with one bounded reference containment
   assert.match(clientSource, /const normalized = await normalizeReferenceImage\(file\)/);
   assert.match(clientSource, /referenceSafeEditRegion/);
   assert.match(clientSource, /REFERENCE_EDIT_MIN_EDGE/);
-  assert.match(clientSource, /33% margin on every side/);
+  assert.match(clientSource, /centered preview is the exact placement area/);
   assert.match(clientSource, /sourceBlob: file/);
   assert.match(clientSource, /REFERENCE_IMAGE_SIZE \/ image\.width/);
   assert.match(clientSource, /flattenArtworkFrame\(editBase\.state, frame\)/);
-  assert.match(clientSource, /placeReferenceGuide/);
-  assert.match(clientSource, /localRegion\.width \* REFERENCE_TARGET_FILL/);
-  assert.match(clientSource, /regionInGenerationFrame/);
+  assert.doesNotMatch(clientSource, /placeReferenceGuide/);
+  assert.match(clientSource, /referencePlacementRegion\(generationMask\.region\)/);
+  assert.match(clientSource, /Boolean\(referenceImage\)/);
   assert.match(clientSource, /maskInGenerationFrame/);
   assert.match(clientSource, /GENERATION_FRAME_SIZE/);
-  assert.match(clientSource, /referenceImage\.sourceBlob/);
   assert.doesNotMatch(clientSource, /transparentGenerationFrame/);
   assert.doesNotMatch(clientSource, /normalizeReferenceImage\(file, editRegion\)/);
   assert.doesNotMatch(clientSource, /referenceImage \? REFERENCE_MASK_INSET : 0/);
@@ -538,6 +588,8 @@ test("live generation uses one image pass with one bounded reference containment
   assert.match(routeSource, /assertReferenceEditRegion\(validated\.region\)/);
   assert.match(routeSource, /referenceBytes/);
   assert.match(storeSource, /reference_blob_id/);
+  assert.match(storeSource, /referencePlacementRegion\(generationMask\.region\)/);
+  assert.match(storeSource, /generation: input\.referenceBytes \? "reference-placement" : "live-ai"/);
   assert.match(storeSource, /SUBJECT_OUT_OF_FRAME[\s\S]*REFERENCE_REVIEW_FAILED/);
   assert.doesNotMatch(storeSource, /kind[^\n]*'reference'|VALUES \([^\n]*'reference'/);
   assert.match(storeSource, /referenceBlobId,[\s\S]*VALUES \(\?, \?, 'input'/);
@@ -556,6 +608,8 @@ test("live generation uses one image pass with one bounded reference containment
   assert.doesNotMatch(queueSource, /form\.append\("input_fidelity"/);
   assert.match(queueSource, /buildOpenAiEditPrompt\([\s\S]*Boolean\(reference\) && containmentRetry/);
   assert.match(queueSource, /reviewReferenceEdit/);
+  assert.match(queueSource, /sourceImageUrl: imageDataUrl\(sourceBytes\)/);
+  assert.match(queueSource, /referencePlacementRegion\(generationRegion\)/);
   assert.match(queueSource, /referenceReviewOutcome\(review\)/);
   assert.match(queueSource, /referenceReviewOutcome\(review, true\)/);
   assert.match(queueSource, /outcome === "retry-containment"/);
@@ -709,6 +763,21 @@ test("reference patches expand around the intended placement with aspect-aware r
       1,
     ),
     { x: 1728, y: 1720, width: 320, height: 320 },
+  );
+});
+
+test("reference preview footprint is the authoritative accepted-layer region", () => {
+  assert.deepEqual(
+    referencePlacementRegion({ x: 263, y: 687, width: 320, height: 320 }),
+    { x: 367, y: 791, width: 112, height: 112 },
+  );
+  assert.deepEqual(
+    referencePlacementRegion({ x: 183, y: 687, width: 480, height: 320 }),
+    { x: 339, y: 791, width: 168, height: 112 },
+  );
+  assert.deepEqual(
+    referencePlacementRegion({ x: 298, y: 191, width: 426, height: 640 }),
+    { x: 437, y: 399, width: 149, height: 224 },
   );
 });
 

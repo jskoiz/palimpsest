@@ -4,6 +4,7 @@ import {
   DomainError,
   createDisplayMaskSvg,
   displayMaskForLayer,
+  referencePlacementRegion,
   resolveLayerStack,
   serializeHistory,
   serializeRevision,
@@ -844,7 +845,7 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
     frame,
     fill: input.fill,
     strokes: input.strokes,
-    generation: "live-ai",
+    generation: input.referenceBytes ? "reference-placement" : "live-ai",
   });
   const [sourceHash, maskHash, referenceHash] = await Promise.all([
     sha256Hex(input.sourceBytes),
@@ -871,11 +872,14 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
     input.strokes,
     frame,
   );
+  const displayRegion = input.referenceBytes
+    ? referencePlacementRegion(generationMask.region)
+    : generationMask.region;
   const displayMask = new TextEncoder().encode(
     createDisplayMaskSvg({
-      region: generationMask.region,
-      fill: input.fill,
-      strokes: generationMask.strokes,
+      region: displayRegion,
+      fill: input.referenceBytes ? true : input.fill,
+      strokes: input.referenceBytes ? [] : generationMask.strokes,
     }),
   );
   const displayMaskHash = await sha256Hex(displayMask);
