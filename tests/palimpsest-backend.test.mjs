@@ -33,20 +33,32 @@ function applyMigration(db, sql) {
 async function migratedDatabase({ durable = true } = {}) {
   const db = new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
-  const [initial, parallel, liveOnly, whiteCanvasReset, referenceImages, durableJobs] = await Promise.all([
+  const [
+    initial,
+    parallel,
+    liveOnly,
+    whiteCanvasReset,
+    referenceImages,
+    durableJobs,
+    visitorEvents,
+  ] = await Promise.all([
     readFile(new URL("drizzle/0000_slow_gambit.sql", root), "utf8"),
     readFile(new URL("drizzle/0001_parallel_regions.sql", root), "utf8"),
     readFile(new URL("drizzle/0002_live_ai_only.sql", root), "utf8"),
     readFile(new URL("drizzle/0003_white_canvas_reset.sql", root), "utf8"),
     readFile(new URL("drizzle/0004_reference_images.sql", root), "utf8"),
     readFile(new URL("drizzle/0009_durable_job_attempts.sql", root), "utf8"),
+    readFile(new URL("drizzle/0012_visitor_activity.sql", root), "utf8"),
   ]);
   applyMigration(db, initial);
   applyMigration(db, parallel);
   applyMigration(db, liveOnly);
   applyMigration(db, whiteCanvasReset);
   applyMigration(db, referenceImages);
-  if (durable) applyMigration(db, durableJobs);
+  if (durable) {
+    applyMigration(db, durableJobs);
+    applyMigration(db, visitorEvents);
+  }
   return db;
 }
 
@@ -194,6 +206,39 @@ test("activity job serializer preserves the public durable-attempt contract", ()
     completedAt: new Date(2_000).toISOString(),
     retryable: true,
   });
+});
+
+test("visitor event migration stores pseudonymous activity without raw IP fields", async () => {
+  const db = await migratedDatabase();
+  const columns = db.prepare("PRAGMA table_info(visitor_events)").all();
+  assert.deepEqual(
+    columns.map((column) => column.name),
+    [
+      "id",
+      "visitor_hash",
+      "session_id",
+      "event_type",
+      "path",
+      "country",
+      "user_agent",
+      "job_id",
+      "created_at",
+    ],
+  );
+  const foreignKeys = db.prepare("PRAGMA foreign_key_list(visitor_events)").all();
+  assert.equal(
+    foreignKeys.some((foreignKey) => foreignKey.from === "job_id" && foreignKey.on_delete === "SET NULL"),
+    true,
+  );
+  db.prepare(
+    `INSERT INTO visitor_events
+     (id, visitor_hash, session_id, event_type, path, country, user_agent, created_at)
+     VALUES ('event-1', 'salted-network-hash', 'opaque-session', 'page_view', '/', 'US', 'Test Browser', 1)`,
+  ).run();
+  const event = db.prepare("SELECT visitor_hash AS visitorHash, event_type AS eventType FROM visitor_events").get();
+  assert.equal(event.visitorHash, "salted-network-hash");
+  assert.equal(event.eventType, "page_view");
+  db.close();
 });
 
 test("activity keeps expired nonterminal regions visible for recovery", async () => {

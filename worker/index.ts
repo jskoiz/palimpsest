@@ -2,6 +2,7 @@
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
 import { processQueue } from "../lib/palimpsest/queue";
+import { recordVisitorEvent } from "../lib/palimpsest/store";
 
 interface Env {
   ASSETS: Fetcher;
@@ -9,6 +10,7 @@ interface Env {
   BLOBS: R2Bucket;
   OPENAI_API_KEY?: string;
   RATE_LIMIT_SALT?: string;
+  VISITOR_LOG_SALT?: string;
   IMAGES: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
@@ -55,6 +57,14 @@ const worker = {
         }),
       );
     }
+    if (request.method === "GET" && url.pathname === "/" && response.ok) {
+      ctx.waitUntil(
+        recordVisitorEvent(env, request, "page_view").catch((error) => {
+          console.warn("[palimpsest] visitor page-view logging failed", error);
+        }),
+      );
+    }
+
     return response;
   },
 };

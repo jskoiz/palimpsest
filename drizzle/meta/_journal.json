@@ -85,6 +85,13 @@
       "when": 1784825202000,
       "tag": "0011_clear_canvas_and_history",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1784839324633,
+      "tag": "0012_visitor_activity",
+      "breakpoints": true
     }
   ]
 }

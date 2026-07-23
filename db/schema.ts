@@ -273,3 +273,38 @@ export const rateLimitClaims = sqliteTable(
     }),
   ],
 );
+
+export const visitorEvents = sqliteTable(
+  "visitor_events",
+  {
+    id: text("id").primaryKey(),
+    // A salted, non-reversible network identifier. Raw IP addresses are never
+    // persisted in the activity log.
+    visitorHash: text("visitor_hash").notNull(),
+    // A browser-generated opaque value used only to group one visit.
+    sessionId: text("session_id"),
+    eventType: text("event_type", {
+      enum: [
+        "page_view",
+        "guide_opened",
+        "queue_opened",
+        "history_opened",
+        "contribution_opened",
+        "patch_confirmed",
+        "mask_confirmed",
+        "reference_added",
+        "generation_requested",
+        "restore_requested",
+      ],
+    }).notNull(),
+    path: text("path").notNull(),
+    country: text("country"),
+    userAgent: text("user_agent"),
+    jobId: text("job_id").references(() => editJobs.id, { onDelete: "set null" }),
+    createdAt,
+  },
+  (table) => [
+    index("visitor_events_created_idx").on(table.createdAt),
+    index("visitor_events_visitor_created_idx").on(table.visitorHash, table.createdAt),
+  ],
+);

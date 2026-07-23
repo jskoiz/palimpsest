@@ -19,6 +19,7 @@ import { contributionRatePolicy } from "@/lib/palimpsest/rate-policy.mjs";
 import {
   ensurePalimpsest,
   insertEditJob,
+  recordVisitorEvent,
   requesterHash,
 } from "@/lib/palimpsest/store";
 
@@ -197,6 +198,14 @@ export async function POST(request: Request) {
       requestId,
       retryToken,
     });
+    try {
+      await recordVisitorEvent(env, request, "generation_requested", {
+        sessionId: request.headers.get("X-Palimpsest-Session"),
+        jobId: job.id,
+      });
+    } catch (logError) {
+      console.warn(`[palimpsest:${requestId}] visitor activity logging failed`, logError);
+    }
     console.info(`[palimpsest:${requestId}] contribution accepted`, {
       kind: "edit",
       mode: referenceBytes ? "openai-reference" : "openai",

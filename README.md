@@ -32,7 +32,7 @@ The queue fails closed if any required OpenAI step is unavailable. The original 
 ## Architecture
 
 - Next.js-compatible React UI on vinext and Cloudflare Workers
-- D1 for artworks, revisions, edit reservations, commit fencing, rate windows, and blob metadata
+- D1 for artworks, revisions, edit reservations, visitor activity, commit fencing, rate windows, and blob metadata
 - R2 for canonical tiles, masks, references, patches, and keyframes
 - Generated D1 migrations as the authoritative schema
 - Atomic global-coordinate reservations with lease recovery and overlap rejection
@@ -65,6 +65,12 @@ npm run dev
 Open `http://localhost:4317/` (or the port printed by the development server). No sample download is required: local D1 is initialized with one plain white 2048×2048 seed revision.
 
 Without `OPENAI_API_KEY`, the archive remains viewable but new contributions are disabled. Configure the same name as a production secret before deployment.
+
+## Visitor activity
+
+`/visitors` is a private activity dashboard for an authenticated administrator. It shows page views, key canvas interactions, and server-confirmed generation or restore requests. The dashboard calls a fail-closed API guarded by the existing `ADMIN_EMAIL_ALLOWLIST` dispatcher identity.
+
+Visitor records contain a salted, pseudonymous network ID, an opaque per-tab session ID when JavaScript is available, country code, and a truncated user agent. They deliberately exclude raw IP addresses, prompts, reference uploads, and image data. Configure `VISITOR_LOG_SALT` as a production secret (or retain the existing `RATE_LIMIT_SALT` as a temporary fallback) before deployment.
 
 ## Validation
 

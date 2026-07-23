@@ -60,6 +60,16 @@ test("verified admins bypass every edit and restore limit", () => {
   }
 });
 
+test("visitor activity endpoint relies on the dispatcher-authenticated admin gate", async () => {
+  const source = await readFile(
+    new URL("../app/api/visitors/route.ts", import.meta.url),
+    "utf8",
+  );
+  assert.match(source, /isVerifiedAdminRequest\(env, request\)/u);
+  assert.match(source, /status:\s*403/u);
+  assert.doesNotMatch(source, /x-palimpsest-admin/i);
+});
+
 test("both contribution routes consume the centralized server policy", async () => {
   const [editRoute, revertRoute] = await Promise.all([
     readFile(new URL("../app/api/edits/route.ts", import.meta.url), "utf8"),

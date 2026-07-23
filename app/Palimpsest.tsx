@@ -214,6 +214,7 @@ const PATCH_SIZE_STEP = 32;
 const DEFAULT_REGION = { x: 800, y: 832, width: 448, height: 384 };
 const WELCOME_STORAGE_KEY = "palimpsest:welcome:v1";
 const RETRY_CAPABILITIES_STORAGE_KEY = "palimpsest:retry-capabilities:v1";
+const VISITOR_SESSION_STORAGE_KEY = "palimpsest:visitor-session:v1";
 const REFERENCE_IMAGE_SIZE = 1024;
 const REFERENCE_PREVIEW_FILL = 0.72;
 const REFERENCE_DECODE_MAX_EDGE = 1536;
@@ -227,6 +228,42 @@ const EMPTY_ACTIVITY: ActivityPayload = {
   recent: [],
   activeRegions: [],
 };
+
+type VisitorInteraction =
+  | "guide_opened"
+  | "queue_opened"
+  | "history_opened"
+  | "contribution_opened"
+  | "patch_confirmed"
+  | "mask_confirmed"
+  | "reference_added";
+
+function visitorSessionId(): string | null {
+  try {
+    const existing = window.sessionStorage.getItem(VISITOR_SESSION_STORAGE_KEY);
+    if (existing) return existing;
+    const created = crypto.randomUUID();
+    window.sessionStorage.setItem(VISITOR_SESSION_STORAGE_KEY, created);
+    return created;
+  } catch {
+    return null;
+  }
+}
+
+function trackVisitorInteraction(event: VisitorInteraction) {
+  const sessionId = visitorSessionId();
+  void fetch("/api/visitors/events", {
+    method: "POST",
+    keepalive: true,
+    headers: {
+      "Content-Type": "application/json",
+      ...(sessionId ? { "X-Palimpsest-Session": sessionId } : {}),
+    },
+    body: JSON.stringify({ event }),
+  }).catch(() => {
+    // Visitor telemetry is intentionally best-effort and never blocks creation.
+  });
+}
 
 function pad3(value: number) {
   return String(value).padStart(3, "0");
@@ -1353,6 +1390,7 @@ export default function Palimpsest() {
     setDeepIdle(false);
     setChromeVisible(true);
     setWelcomeOpen(true);
+    trackVisitorInteraction("guide_opened");
   }, []);
 
   const showToast = useCallback((text: string) => {
@@ -1832,6 +1870,7 @@ export default function Palimpsest() {
   }, [wake]);
 
   const toggleQueue = useCallback(() => {
+    if (!queueOpen) trackVisitorInteraction("queue_opened");
     setQueueOpen((open) => !open);
     setEditOpen(false);
     setHistoryOpen(false);
@@ -1841,7 +1880,7 @@ export default function Palimpsest() {
     setConfirmRestore(false);
     if (!localSubmissionFailure) clearReferenceImage();
     wake();
-  }, [clearReferenceImage, localSubmissionFailure, wake]);
+  }, [clearReferenceImage, localSubmissionFailure, queueOpen, wake]);
 
   const focusActivityJob = useCallback(
     (activityJob: ActivityJob) => {
@@ -1951,6 +1990,7 @@ export default function Palimpsest() {
   );
 
   const toggleHistory = useCallback(() => {
+    if (!historyOpen) trackVisitorInteraction("history_opened");
     setHistoryOpen((open) => !open);
     setQueueOpen(false);
     setEditOpen(false);
@@ -1961,7 +2001,7 @@ export default function Palimpsest() {
     setConfirmRestore(false);
     clearReferenceImage();
     wake();
-  }, [clearReferenceImage, wake]);
+  }, [clearReferenceImage, historyOpen, wake]);
 
   const openEditor = useCallback(async () => {
     const initial = latest.current;
@@ -2001,6 +2041,7 @@ export default function Palimpsest() {
     setSubmitError(null);
     setConfirmRestore(false);
     setView({ zoom: 1, x: 0, y: 0 });
+    trackVisitorInteraction("contribution_opened");
     if (closeTimer.current) window.clearTimeout(closeTimer.current);
     wake();
   }, [clearReferenceImage, refreshActivity, showToast, wake]);
@@ -2555,6 +2596,7 @@ export default function Palimpsest() {
           ? "Background removed — position the reference preview for GPT Image to blend."
           : "Reference preview ready — position it for GPT Image to blend.",
       );
+      trackVisitorInteraction("reference_added");
     } catch (error) {
       event.currentTarget.value = "";
       setSubmitError(
@@ -2626,11 +2668,13 @@ export default function Palimpsest() {
       if (reference) {
         form.append("reference", reference, "reference.png");
       }
+      const sessionId = visitorSessionId();
       const payload = await fetchJson<{ job: Job }>("/api/edits", {
         method: "POST",
         headers: {
           "Idempotency-Key": idempotencyKey,
           "X-Palimpsest-Retry-Token": retryToken,
+          ...(sessionId ? { "X-Palimpsest-Session": sessionId } : {}),
         },
         body: form,
       });
@@ -2710,11 +2754,13 @@ export default function Palimpsest() {
     if (!history || !selectedRevision || selectedRevision.id === history.headRevisionId) return;
     setConfirmRestore(false);
     try {
+      const sessionId = visitorSessionId();
       const payload = await fetchJson<{ job: Job }>("/api/reverts", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "Idempotency-Key": crypto.randomUUID(),
+          ...(sessionId ? { "X-Palimpsest-Session": sessionId } : {}),
         },
         body: JSON.stringify({
           artworkId: "palimpsest",
@@ -3176,6 +3222,7 @@ export default function Palimpsest() {
             onClick={() => {
               setHistoryOpen(true);
               wake();
+              trackVisitorInteraction("history_opened");
             }}
           />
         </>
@@ -3522,6 +3569,7 @@ export default function Palimpsest() {
                 onClick={() => {
                   setStep(2);
                   wake();
+                  trackVisitorInteraction("patch_confirmed");
                 }}
               >
                 use this patch
@@ -3573,6 +3621,7 @@ export default function Palimpsest() {
                 onClick={() => {
                   setStep(3);
                   wake();
+                  trackVisitorInteraction("mask_confirmed");
                 }}
               >
                 continue →
