@@ -1,6 +1,7 @@
 /** Cloudflare Worker entry point for Palimpsest. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
+import { processQueue } from "../lib/palimpsest/queue";
 
 interface Env {
   ASSETS: Fetcher;
@@ -43,7 +44,18 @@ const worker = {
       }, allowedWidths);
     }
 
-    return handler.fetch(request, env, ctx);
+    const response = await handler.fetch(request, env, ctx);
+    if (request.method === "POST" && url.pathname === "/api/edits" && response.status === 202) {
+      ctx.waitUntil(
+        processQueue(env, 1).catch((error: unknown) => {
+          console.error("[palimpsest] background queue processing failed", {
+            name: error instanceof Error ? error.name : "UnknownError",
+            message: error instanceof Error ? error.message : "Unknown worker failure",
+          });
+        }),
+      );
+    }
+    return response;
   },
 };
 

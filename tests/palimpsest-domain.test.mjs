@@ -6,14 +6,11 @@ import test from "node:test";
 import {
   ARTWORK_SIZE,
   DomainError,
-  REFERENCE_EDIT_MIN_EDGE,
-  REFERENCE_TARGET_FILL,
   assertFreshBase,
-  assertReferenceEditRegion,
   buildOpenAiEditPrompt,
   createDisplayMaskSvg,
+  createPlacementDisplayMaskSvg,
   displayMaskForLayer,
-  referencePlacementRegion,
   resolveLayerStack,
   serializeHistory,
   validateRegion,
@@ -26,7 +23,6 @@ import {
   maskInGenerationFrame,
   nudgeEditRegion,
   positionEditRegion,
-  referenceSafeEditRegion,
   regionInGenerationFrame,
   resizeEditRegion,
   regionsOverlap,
@@ -36,9 +32,6 @@ import {
   EDIT_REVIEW_MODEL,
   buildEditOutputReviewRequest,
   extractEditOutputReview,
-  buildReferenceEditReviewRequest,
-  extractReferenceEditReview,
-  referenceReviewOutcome,
 } from "../lib/palimpsest/ai-review.mjs";
 import {
   activityJobCounts,
@@ -274,8 +267,20 @@ test("filled display masks feather their edges while painted masks stay exact", 
   assert.match(paintedSvg, /<polyline points="110,220 130,240"/);
 });
 
+test("uploaded placement masks are a hard exact clip with no repainting halo", () => {
+  const svg = createPlacementDisplayMaskSvg({
+    x: 120,
+    y: 220,
+    width: 149,
+    height: 224,
+  });
+  assert.match(svg, /<rect x="120" y="220" width="149" height="224" fill="white"\/>/);
+  assert.doesNotMatch(svg, /feGaussianBlur|filter=|clipPath|inset/u);
+});
+
 test("generated layers retain the reservation mask", () => {
   assert.equal(displayMaskForLayer("openai", "display-mask"), "display-mask");
+  assert.equal(displayMaskForLayer("placement", "display-mask"), "display-mask");
   assert.equal(displayMaskForLayer("demo", "display-mask"), "display-mask");
   assert.equal(displayMaskForLayer("openai", null), null);
   assert.equal(displayMaskForLayer("seed", "unexpected-mask"), null);
@@ -342,25 +347,49 @@ test("canonical seed assets are the verified purple abstract canvas", async () =
   }
 });
 
-test("new contributions expose only the live AI generation path", async () => {
-  const [routeSource, clientSource, queueSource, storeSource, readme] =
+test("contributions expose prompt generation and deterministic uploaded placement", async () => {
+  const [routeSource, clientSource, queueSource, storeSource, workerSource, schemaSource, readme] =
     await Promise.all([
       readFile(new URL("../app/api/edits/route.ts", import.meta.url), "utf8"),
       readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8"),
       readFile(new URL("../lib/palimpsest/queue.ts", import.meta.url), "utf8"),
       readFile(new URL("../lib/palimpsest/store.ts", import.meta.url), "utf8"),
+      readFile(new URL("../worker/index.ts", import.meta.url), "utf8"),
+      readFile(new URL("../db/schema.ts", import.meta.url), "utf8"),
       readFile(new URL("../README.md", import.meta.url), "utf8"),
     ]);
 
   assert.match(routeSource, /Generation mode is server-controlled/);
-  assert.match(routeSource, /OPENAI_API_KEY\?\.trim\(\)/);
+  assert.match(routeSource, /new Set\(\["meta", "source", "mask", "placement"\]\)/);
+  assert.match(routeSource, /form\.getAll\("placement"\)/);
+  assert.match(routeSource, /placementValues\.length > 1/);
+  assert.match(
+    routeSource,
+    /hasPlacement\s*\? sourceValue !== null \|\| maskValue !== null\s*: !hasPromptInputs/,
+  );
+  assert.match(
+    routeSource,
+    /Submit exactly one placement PNG, or one source PNG with one mask PNG\./,
+  );
+  assert.match(routeSource, /await validatePlacementPng\(placementBytes\)/);
+  assert.doesNotMatch(routeSource, /assertReferenceEditRegion/);
+  assert.doesNotMatch(routeSource, /form\.getAll\("reference"\)|referenceValue/);
   assert.doesNotMatch(routeSource, /Deterministic demo|executionMode ===/);
   assert.doesNotMatch(clientSource, /setExecutionMode|\[x\] live ai edit/);
-  assert.match(clientSource, /disabled=\{jobActive \|\| !liveEditingAvailable\}/);
-  assert.match(clientSource, /"generate live →"/);
+  assert.match(clientSource, /prepareReferencePixels/);
+  assert.match(clientSource, /referencePlacementLayer/);
+  assert.match(clientSource, /backgroundRemovalEnabled/);
+  assert.match(clientSource, /initialReferencePlacementRegion/);
+  assert.match(clientSource, /resizeReferencePlacementRegion/);
   assert.doesNotMatch(queueSource, /makeDemoPatchSvg|image\/svg\+xml/);
-  assert.match(storeSource, /"openai",\s*authorId/);
-  assert.match(storeSource, /available: Boolean\(env\.OPENAI_API_KEY\?\.trim\(\)\)/);
+  assert.match(queueSource, /job\.executionMode === "placement"/);
+  assert.match(queueSource, /loadPlacementPatch/);
+  assert.match(storeSource, /const hasPlacement = input\.placementBytes instanceof Uint8Array/);
+  assert.match(storeSource, /const executionMode = hasPlacement \? "placement" : "openai"/);
+  assert.match(storeSource, /createPlacementDisplayMaskSvg/);
+  assert.match(schemaSource, /enum: \["openai", "placement", "none"\]/);
+  assert.match(workerSource, /ctx\.waitUntil\(/);
+  assert.match(workerSource, /processQueue\(env, 1\)/);
   assert.doesNotMatch(readme, /demo renderer/i);
 });
 
@@ -373,31 +402,6 @@ test("live image prompts keep random objects whole without forcing an art style"
   assert.match(prompt, /without forcing it into a predefined artistic motif/i);
   assert.match(prompt, /Add a bright plastic toy truck\./);
   assert.doesNotMatch(prompt, /vermilion|graphite|mixed-media/i);
-});
-
-test("reference-image prompts preserve the positioned subject while blending its frame", () => {
-  const prompt = buildOpenAiEditPrompt("Add the flower from my reference.", true);
-  assert.match(prompt, /Image 1 is a high-resolution working crop/i);
-  assert.match(prompt, /Image 2 is the contributor's full-resolution visual reference/i);
-  assert.match(prompt, /transparent mask area is the exact placement footprint/i);
-  assert.match(prompt, /identity and detail source/i);
-  assert.match(prompt, /do not enlarge, crop, reposition, redesign/i);
-  assert.match(prompt, /control count and arrangement, symbols, labels/i);
-  assert.match(prompt, /matching local perspective, scale, lighting/i);
-  assert.match(prompt, /Do not copy the reference image's rectangular background/i);
-  assert.match(prompt, /Preserve every existing Image 1 pixel/i);
-  assert.match(prompt, /including existing text and marks/i);
-  assert.match(prompt, /do not invent hidden structure or replacement controls/i);
-  assert.match(prompt, /Reference backgrounds, display stands, or secondary props may be omitted/i);
-  assert.match(prompt, /surrounding opaque mask is protected prior artwork/i);
-  assert.match(prompt, /Add the flower from my reference\./);
-});
-
-test("reference placement prompt is strict enough for one bounded image pass", () => {
-  const prompt = buildOpenAiEditPrompt("Add the flower from my reference.", true);
-  assert.match(prompt, /Match the reference preview's scale and center exactly/i);
-  assert.match(prompt, /without shrinking it below half/i);
-  assert.doesNotMatch(prompt, /retry/i);
 });
 
 test("every generated subject receives a structured framing review", () => {
@@ -444,160 +448,17 @@ test("every generated subject receives a structured framing review", () => {
   assert.equal(extractEditOutputReview({ output: [] }), null);
 });
 
-test("reference generations receive structured fidelity and blending review", () => {
-  const request = buildReferenceEditReviewRequest({
-    requestedChange: "Place the mini keyboard.",
-    generatedImageUrl: "data:image/png;base64,generated",
-    sourceImageUrl: "data:image/png;base64,source",
-    referenceImageUrl: "data:image/png;base64,reference",
-    providerMaskUrl: "data:image/png;base64,mask",
-    editableRegion: { x: 120, y: 220, width: 320, height: 400 },
-  });
-  assert.equal(request.model, EDIT_REVIEW_MODEL);
-  assert.equal(request.model, "gpt-5.6");
-  assert.equal(request.store, false);
-  assert.equal(request.max_output_tokens, 500);
-  assert.equal(request.input[0].content[1].type, "input_image");
-  assert.equal(request.input[0].content[1].image_url, "data:image/png;base64,generated");
-  assert.equal(request.input[0].content[2].image_url, "data:image/png;base64,source");
-  assert.equal(request.input[0].content[3].image_url, "data:image/png;base64,reference");
-  assert.equal(request.input[0].content[4].image_url, "data:image/png;base64,mask");
-  assert.equal(request.text.format.type, "json_schema");
-  assert.equal(request.text.format.strict, true);
-  assert.match(request.instructions, /control count and arrangement, symbols, labels/i);
-  assert.match(request.instructions, /no visible rectangular patch/i);
-  assert.match(request.instructions, /smudging of uncovered prior artwork fails source preservation/i);
-  assert.match(request.input[0].content[0].text, /visually faithful/i);
-  assert.match(request.input[0].content[0].text, /matched to the preview's placement and relative scale/i);
-  assert.match(request.input[0].content[0].text, /naturally blended/i);
-  assert.match(
-    request.input[0].content[0].text,
-    /x=120, y=220, width=320, height=400; its right edge is x=440 and bottom edge is y=620/i,
-  );
-  assert.deepEqual(request.text.format.schema.required, [
-    "contained",
-    "faithful",
-    "placementMatched",
-    "blended",
-    "sourcePreserved",
-    "reason",
-  ]);
-
-  assert.deepEqual(
-    extractReferenceEditReview({
-      output: [{
-        type: "message",
-        content: [{
-          type: "output_text",
-          text: '{"contained":true,"faithful":false,"placementMatched":true,"blended":true,"sourcePreserved":true,"reason":"The controls were redesigned."}',
-        }],
-      }],
-    }),
-    {
-      contained: true,
-      faithful: false,
-      placementMatched: true,
-      blended: true,
-      sourcePreserved: true,
-      reason: "The controls were redesigned.",
-    },
-  );
-  assert.equal(extractReferenceEditReview({ output: [] }), null);
-});
-
-test("reference review returns one terminal outcome without another image pass", () => {
-  assert.equal(
-    referenceReviewOutcome({
-      contained: true,
-      faithful: true,
-      placementMatched: true,
-      blended: true,
-      sourcePreserved: true,
-    }),
-    "accept",
-  );
-  assert.equal(
-    referenceReviewOutcome({
-      contained: false,
-      faithful: true,
-      placementMatched: false,
-      blended: true,
-      sourcePreserved: true,
-    }),
-    "reject-containment",
-  );
-  assert.equal(
-    referenceReviewOutcome({
-      contained: true,
-      faithful: false,
-      placementMatched: true,
-      blended: true,
-      sourcePreserved: true,
-    }),
-    "reject-reference",
-  );
-  assert.equal(
-    referenceReviewOutcome({
-      contained: true,
-      faithful: true,
-      placementMatched: true,
-      blended: false,
-      sourcePreserved: true,
-    }),
-    "reject-reference",
-  );
-  assert.equal(
-    referenceReviewOutcome({
-      contained: true,
-      faithful: true,
-      placementMatched: true,
-      blended: true,
-      sourcePreserved: false,
-    }),
-    "reject-reference",
-  );
-});
-
-test("live generation uses one bounded image pass and one review pass", async () => {
-  const [routeSource, clientSource, queueSource, storeSource] = await Promise.all([
-    readFile(new URL("../app/api/edits/route.ts", import.meta.url), "utf8"),
+test("prompt generation uses one bounded image pass and one review pass", async () => {
+  const [clientSource, queueSource] = await Promise.all([
     readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8"),
     readFile(new URL("../lib/palimpsest/queue.ts", import.meta.url), "utf8"),
-    readFile(new URL("../lib/palimpsest/store.ts", import.meta.url), "utf8"),
   ]);
 
-  assert.match(clientSource, /form\.append\("reference", referenceImage\.blob/);
-  assert.match(clientSource, /mono-reference-on-canvas/);
-  assert.match(clientSource, /image\/png,image\/jpeg,image\/webp/);
+  assert.match(clientSource, /flattenArtworkFrame\(editBase\.state, frame\)/);
+  assert.match(clientSource, /providerMask\(editRegion, frame, strokes, fillMask\)/);
   assert.match(clientSource, /makes one masked image pass/);
   assert.doesNotMatch(clientSource, /automatic retry/);
   assert.doesNotMatch(clientSource, /plans the request/);
-  assert.doesNotMatch(clientSource, /REFERENCE_MASK_INSET/);
-  assert.match(clientSource, /const normalized = await normalizeReferenceImage\(file\)/);
-  assert.match(clientSource, /referenceSafeEditRegion/);
-  assert.match(clientSource, /REFERENCE_EDIT_MIN_EDGE/);
-  assert.match(clientSource, /drag the outer patch to position the exact preview/);
-  assert.match(clientSource, /sourceBlob: file/);
-  assert.match(clientSource, /REFERENCE_IMAGE_SIZE \/ image\.width/);
-  assert.match(clientSource, /flattenArtworkFrame\(editBase\.state, frame\)/);
-  assert.doesNotMatch(clientSource, /placeReferenceGuide/);
-  assert.match(clientSource, /referencePlacementRegion\(generationMask\.region\)/);
-  assert.match(clientSource, /Boolean\(referenceImage\)/);
-  assert.match(clientSource, /maskInGenerationFrame/);
-  assert.match(clientSource, /GENERATION_FRAME_SIZE/);
-  assert.doesNotMatch(clientSource, /transparentGenerationFrame/);
-  assert.doesNotMatch(clientSource, /normalizeReferenceImage\(file, editRegion\)/);
-  assert.doesNotMatch(clientSource, /referenceImage \? REFERENCE_MASK_INSET : 0/);
-  assert.match(routeSource, /referenceValue instanceof File/);
-  assert.match(routeSource, /assertReferenceEditRegion\(validated\.region\)/);
-  assert.match(routeSource, /referenceBytes/);
-  assert.match(storeSource, /reference_blob_id/);
-  assert.match(storeSource, /referencePlacementRegion\(generationMask\.region\)/);
-  assert.match(storeSource, /generation: input\.referenceBytes \? "reference-placement" : "live-ai"/);
-  assert.match(storeSource, /SUBJECT_OUT_OF_FRAME[\s\S]*REFERENCE_REVIEW_FAILED/);
-  assert.doesNotMatch(storeSource, /kind[^\n]*'reference'|VALUES \([^\n]*'reference'/);
-  assert.match(storeSource, /referenceBlobId,[\s\S]*VALUES \(\?, \?, 'input'/);
-  assert.match(queueSource, /palimpsest-reference\.png/);
   assert.equal(queueSource.match(/await generateOpenAiPatch\(/gu)?.length, 1);
   assert.match(queueSource, /job\.prompt,\s*deadlineAt/);
   assert.doesNotMatch(queueSource, /planEditPrompt|generalRetryPrompt|referenceRetryPrompt/);
@@ -609,13 +470,9 @@ test("live generation uses one bounded image pass and one review pass", async ()
   assert.doesNotMatch(queueSource, /gpt-image-1\.5/);
   assert.doesNotMatch(queueSource, /form\.append\("background", "transparent"\)/);
   assert.doesNotMatch(queueSource, /form\.append\("input_fidelity"/);
-  assert.match(queueSource, /buildOpenAiEditPrompt\([\s\S]*Boolean\(reference\)/);
+  assert.match(queueSource, /buildOpenAiEditPrompt\(requestedPrompt\)/);
   assert.doesNotMatch(queueSource, /containmentRetry|retry-containment|containment-retry/);
-  assert.match(queueSource, /reviewReferenceEdit/);
-  assert.match(queueSource, /sourceImageUrl: imageDataUrl\(sourceBytes\)/);
-  assert.match(queueSource, /referencePlacementRegion\(generationRegion\)/);
-  assert.match(queueSource, /referenceReviewOutcome\(review\)/);
-  assert.match(queueSource, /outcome === "reject-containment"/);
+  assert.doesNotMatch(queueSource, /reviewReferenceEdit|referenceReviewOutcome/);
   assert.match(queueSource, /reviewEditOutput/);
   assert.match(queueSource, /!review\.contained \|\| !review\.blended/);
   assert.match(queueSource, /startWorkerHeartbeat/);
@@ -627,6 +484,60 @@ test("live generation uses one bounded image pass and one review pass", async ()
   assert.match(queueSource, /SUBJECT_OUT_OF_FRAME/);
   assert.match(queueSource, /https:\/\/api\.openai\.com\/v1\/responses/);
   assert.doesNotMatch(queueSource, /domain\?\.code === "PROVIDER_TEMPORARY" &&/);
+});
+
+test("uploaded placements bypass generation and commit the exact moderated PNG", async () => {
+  const [clientSource, queueSource, storeSource] = await Promise.all([
+    readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../lib/palimpsest/queue.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/palimpsest/store.ts", import.meta.url), "utf8"),
+  ]);
+  const placementBranchStart = queueSource.indexOf(
+    'if (job.executionMode === "placement")',
+  );
+  const promptBranchStart = queueSource.indexOf(
+    "const apiKey = env.OPENAI_API_KEY",
+    placementBranchStart,
+  );
+  assert.ok(placementBranchStart >= 0 && promptBranchStart > placementBranchStart);
+  const placementBranch = queueSource.slice(
+    placementBranchStart,
+    promptBranchStart,
+  );
+  assert.match(placementBranch, /loadPlacementPatch/);
+  assert.match(placementBranch, /moderatePlacement/);
+  assert.match(placementBranch, /commitPatch/);
+  assert.ok(
+    placementBranch.indexOf("loadPlacementPatch") <
+      placementBranch.indexOf("moderatePlacement") &&
+      placementBranch.indexOf("moderatePlacement") <
+        placementBranch.indexOf('"moderating", "committing"') &&
+      placementBranch.indexOf('"moderating", "committing"') <
+        placementBranch.indexOf("commitPatch"),
+    "the exact stored bytes must pass moderation before the job can enter commit",
+  );
+  assert.doesNotMatch(
+    placementBranch,
+    /generateOpenAiPatch|reviewEditOutput|api\.openai\.com/u,
+  );
+
+  assert.match(clientSource, /const normalized = await normalizeReferenceImage\(file\)/);
+  assert.match(clientSource, /referencePlacementLayer\(activeReferenceBlob, editRegion, frame\)/);
+  assert.match(clientSource, /form\.append\("placement", placement, "placement\.png"\)/);
+  assert.match(
+    clientSource,
+    /if \(placement\) \{[\s\S]*form\.append\("placement"[\s\S]*\} else if \(generationInputs\) \{[\s\S]*form\.append\("source"[\s\S]*form\.append\("mask"/,
+  );
+  assert.match(clientSource, /setSubmitted\(true\);\s*void requestQueueDrain\(\)/);
+  assert.match(clientSource, /Background removed — drag or resize the exact image/);
+  assert.doesNotMatch(clientSource, /referenceSafeEditRegion|REFERENCE_TARGET_FILL/);
+  assert.match(storeSource, /const hasPlacement = input\.placementBytes instanceof Uint8Array/);
+  assert.match(storeSource, /const placementBlobId = hasPlacement \? crypto\.randomUUID\(\) : null/);
+  assert.match(storeSource, /env\.BLOBS\.put\(placementKey, input\.placementBytes/);
+  assert.match(storeSource, /createPlacementDisplayMaskSvg\(generationMask\.region\)/);
+  assert.match(queueSource, /const blobId = placementBlobId \?\? crypto\.randomUUID\(\)/);
+  assert.match(queueSource, /UPDATE blobs\s+SET kind = 'patch'/);
+  assert.doesNotMatch(queueSource, /palimpsest-reference\.png/);
 });
 
 test("stale base revisions are rejected without an implicit rebase", () => {
@@ -746,59 +657,6 @@ test("patch resizing stays useful, bounded, and inside the artwork", () => {
   );
 });
 
-test("reference patches expand around the intended placement with aspect-aware room", () => {
-  assert.equal(REFERENCE_EDIT_MIN_EDGE, 320);
-  assert.equal(REFERENCE_TARGET_FILL, 0.35);
-  assert.deepEqual(
-    referenceSafeEditRegion(
-      { x: 326, y: 733, width: 193, height: 228 },
-      1,
-    ),
-    { x: 263, y: 687, width: 320, height: 320 },
-  );
-  assert.deepEqual(
-    referenceSafeEditRegion(
-      { x: 326, y: 733, width: 193, height: 228 },
-      1.5,
-    ),
-    { x: 183, y: 687, width: 480, height: 320 },
-  );
-  assert.deepEqual(
-    referenceSafeEditRegion(
-      { x: 1900, y: 1800, width: 160, height: 160 },
-      1,
-    ),
-    { x: 1728, y: 1720, width: 320, height: 320 },
-  );
-});
-
-test("reference preview footprint is the authoritative accepted-layer region", () => {
-  assert.deepEqual(
-    referencePlacementRegion({ x: 263, y: 687, width: 320, height: 320 }),
-    { x: 367, y: 791, width: 112, height: 112 },
-  );
-  assert.deepEqual(
-    referencePlacementRegion({ x: 183, y: 687, width: 480, height: 320 }),
-    { x: 339, y: 791, width: 168, height: 112 },
-  );
-  assert.deepEqual(
-    referencePlacementRegion({ x: 298, y: 191, width: 426, height: 640 }),
-    { x: 437, y: 399, width: 149, height: 224 },
-  );
-});
-
-test("server-side reference sizing rejects undersized patches", () => {
-  assert.equal(assertReferenceEditRegion({ width: 320, height: 320 }), true);
-  expectCode(
-    () => assertReferenceEditRegion({ width: 319, height: 512 }),
-    "REFERENCE_REGION_TOO_SMALL",
-  );
-  expectCode(
-    () => assertReferenceEditRegion({ width: 512, height: 319 }),
-    "REFERENCE_REGION_TOO_SMALL",
-  );
-});
-
 test("patch selection preserves user coordinates when it overlaps a live reservation", () => {
   const patch = { x: 100, y: 100, width: 200, height: 200 };
   const reserved = { x: 300, y: 180, width: 180, height: 180 };
@@ -826,17 +684,99 @@ test("reference preview remains movable during the prompt step", async () => {
 
   assert.match(
     source,
-    /const patchCanMove =\s*!submitted && \(step === 1 \|\| \(step === 3 && Boolean\(referenceImage\)\)\)/,
+    /const patchCanMove =\s*!submitted &&\s*!isPreparing &&\s*\(step === 1 \|\| \(step === 3 && Boolean\(referenceImage\)\)\)/,
   );
-  assert.match(source, /referenceActive: Boolean\(referenceImage\)/);
   assert.match(
     source,
-    /current\.step === 1 \|\| \(current\.step === 3 && current\.referenceActive\)/,
+    /const patchCanResize =\s*!submitted &&\s*!isPreparing &&\s*\(step === 1 \|\| \(step === 3 && Boolean\(referenceImage\)\)\)/,
   );
+  assert.match(source, /referenceActive: Boolean\(referenceImage\)/);
+  assert.match(source, /preparing: isPreparing/);
+  assert.match(source, /editRegion,/);
+  assert.match(
+    source,
+    /const canMovePatch =\s*current\.step === 1 \|\| \(current\.step === 3 && current\.referenceActive\)/,
+  );
+  assert.match(source, /canMovePatch && !current\.submitted && !current\.preparing/);
   assert.match(source, /if \(!patchCanMove\) return/);
   assert.match(source, /tabIndex=\{patchCanMove \? 0 : -1\}/);
-  assert.match(source, /Drag to reposition the exact preview/);
-  assert.match(source, /drag to position · exact preview/);
+  assert.match(
+    source,
+    /exact image placement at \$\{editRegion\.x\}[\s\S]*Drag to move,[\s\S]*resize/,
+  );
+  assert.match(source, /exact pixels · drag or resize/);
+});
+
+test("one-click image upload skips mask painting and opens exact prompt placement", async () => {
+  const source = await readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8");
+  const selectStart = source.indexOf("const selectReferenceImage = async");
+  const canSubmitStart = source.indexOf("const canSubmit =", selectStart);
+  assert.ok(selectStart >= 0 && canSubmitStart > selectStart);
+  const selection = source.slice(selectStart, canSubmitStart);
+  assert.match(selection, /latest\.current\.editRegion/);
+  assert.match(selection, /initialReferencePlacementRegion/);
+  assert.match(selection, /setEditRegion\(placementRegion\)/);
+  assert.match(selection, /setStrokes\(\[\]\)/);
+  assert.match(selection, /setFillMask\(true\)/);
+  assert.match(selection, /setStep\(3\)/);
+  assert.ok(
+    selection.indexOf("setEditRegion(placementRegion)") <
+      selection.indexOf("setStep(3)"),
+    "the exact placement must be established before the prompt step opens",
+  );
+
+  const editorStart = source.indexOf(
+    '<section className="mono-strip" aria-label="Contribute an edit">',
+  );
+  const stepOneStart = source.indexOf("{step === 1 ? (", editorStart);
+  const stepTwoStart = source.indexOf("{step === 2 ? (", stepOneStart);
+  assert.ok(editorStart >= 0 && stepOneStart > editorStart && stepTwoStart > stepOneStart);
+  assert.ok(
+    source.indexOf('type="file"', editorStart) < stepOneStart,
+    "the upload input must be available before the prompt-only step",
+  );
+  const stepOne = source.slice(stepOneStart, stepTwoStart);
+  assert.match(stepOne, /place an image →/);
+  assert.match(stepOne, /referenceInputRef\.current\.click\(\)/);
+});
+
+test("extreme reference aspects are rejected after visible bounds are prepared", async () => {
+  const source = await readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8");
+  const normalizeStart = source.indexOf("async function normalizeReferenceImage");
+  const placementStart = source.indexOf("async function referencePlacementLayer", normalizeStart);
+  assert.ok(normalizeStart >= 0 && placementStart > normalizeStart);
+  const normalization = source.slice(normalizeStart, placementStart);
+
+  assert.match(source, /const REFERENCE_MAX_ASPECT_RATIO = 8/);
+  assert.match(normalization, /const \{ bounds \} = prepared/);
+  assert.match(normalization, /const aspectRatio = bounds\.width \/ bounds\.height/);
+  assert.match(
+    normalization,
+    /aspectRatio > REFERENCE_MAX_ASPECT_RATIO \|\|\s*aspectRatio < 1 \/ REFERENCE_MAX_ASPECT_RATIO/,
+  );
+  assert.match(
+    normalization,
+    /Crop this image so its width and height are within an 8:1 ratio\./,
+  );
+});
+
+test("placement completion has redundant queue wakeup and fast bounded polling", async () => {
+  const [clientSource, workerSource] = await Promise.all([
+    readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../worker/index.ts", import.meta.url), "utf8"),
+  ]);
+  const submitStart = clientSource.indexOf("const submitEdit = async");
+  const revertStart = clientSource.indexOf("const submitRevert = async", submitStart);
+  assert.ok(submitStart >= 0 && revertStart > submitStart);
+  const submit = clientSource.slice(submitStart, revertStart);
+
+  assert.match(submit, /setSubmitted\(true\);\s*void requestQueueDrain\(\)/);
+  assert.doesNotMatch(submit, /if \(!placement\) void requestQueueDrain/);
+  assert.match(clientSource, /referenceImage \? 350 : 3000/);
+  assert.match(clientSource, /fetchJson<\{ job: Job \}>\(`\/api\/jobs\//);
+  assert.match(workerSource, /response\.status === 202/);
+  assert.match(workerSource, /ctx\.waitUntil\(/);
+  assert.match(workerSource, /processQueue\(env, 1\)/);
 });
 
 test("adaptive generation frames give small edits a high-resolution working crop", () => {

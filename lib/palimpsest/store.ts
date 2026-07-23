@@ -3,8 +3,8 @@ import {
   ARTWORK_SIZE,
   DomainError,
   createDisplayMaskSvg,
+  createPlacementDisplayMaskSvg,
   displayMaskForLayer,
-  referencePlacementRegion,
   resolveLayerStack,
   serializeHistory,
   serializeRevision,
@@ -223,7 +223,8 @@ export async function listHistory(env: AppEnv, requestUrl: string) {
     revisions,
     headRevisionId: head?.id ?? null,
     editing: {
-      available: Boolean(env.OPENAI_API_KEY?.trim()),
+      generationAvailable: Boolean(env.OPENAI_API_KEY?.trim()),
+      placementAvailable: Boolean(env.OPENAI_API_KEY?.trim()),
     },
   };
 }
@@ -440,15 +441,25 @@ export const RECENT_JOBS_SQL = `SELECT
       )
       OR (j.error_code = 'QUEUE_LEASE_EXPIRED' AND j.started_at IS NULL)
     )
-    AND j.source_blob_id IS NOT NULL
-    AND j.mask_blob_id IS NOT NULL
     AND j.display_mask_blob_id IS NOT NULL
-    AND EXISTS (SELECT 1 FROM blobs source WHERE source.id = j.source_blob_id)
-    AND EXISTS (SELECT 1 FROM blobs mask WHERE mask.id = j.mask_blob_id)
     AND EXISTS (SELECT 1 FROM blobs display WHERE display.id = j.display_mask_blob_id)
     AND (
-      j.reference_blob_id IS NULL
-      OR EXISTS (SELECT 1 FROM blobs reference WHERE reference.id = j.reference_blob_id)
+      (
+        j.execution_mode = 'openai'
+        AND j.reference_blob_id IS NULL
+        AND j.source_blob_id IS NOT NULL
+        AND j.mask_blob_id IS NOT NULL
+        AND EXISTS (SELECT 1 FROM blobs source WHERE source.id = j.source_blob_id)
+        AND EXISTS (SELECT 1 FROM blobs mask WHERE mask.id = j.mask_blob_id)
+      )
+      OR
+      (
+        j.execution_mode = 'placement'
+        AND j.reference_blob_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM blobs placement WHERE placement.id = j.reference_blob_id
+        )
+      )
     )
     AND NOT EXISTS (SELECT 1 FROM edit_jobs retry WHERE retry.retry_of_job_id = j.id)
     THEN 1 ELSE 0
@@ -596,9 +607,9 @@ type InsertEditInput = {
   strokes: Array<{ width: number; points: Array<{ x: number; y: number }> }>;
   idempotencyKey: string;
   requesterHash: string;
-  sourceBytes: Uint8Array;
-  maskBytes: Uint8Array;
-  referenceBytes?: Uint8Array;
+  sourceBytes?: Uint8Array;
+  maskBytes?: Uint8Array;
+  placementBytes?: Uint8Array;
   rateLimits: readonly ContributionRateLimit[];
   requestId: string;
   retryToken: string;
@@ -612,7 +623,7 @@ type ExistingIdempotencyRow = {
   sourceBlobId: string | null;
   maskBlobId: string | null;
   displayMaskBlobId: string | null;
-  referenceBlobId: string | null;
+  placementBlobId: string | null;
   retryTokenHash: string | null;
 };
 
@@ -827,7 +838,7 @@ async function getIdempotentJob(
               source_blob_id AS sourceBlobId,
               mask_blob_id AS maskBlobId,
               display_mask_blob_id AS displayMaskBlobId,
-              reference_blob_id AS referenceBlobId,
+              reference_blob_id AS placementBlobId,
               retry_token_hash AS retryTokenHash
        FROM edit_jobs WHERE artwork_id = ? AND idempotency_key = ? LIMIT 1`,
     )
@@ -837,7 +848,22 @@ async function getIdempotentJob(
 }
 
 export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
+  const hasSource = input.sourceBytes instanceof Uint8Array;
+  const hasMask = input.maskBytes instanceof Uint8Array;
+  const hasPromptInputs = hasSource && hasMask;
+  const hasPlacement = input.placementBytes instanceof Uint8Array;
+  if (
+    hasSource !== hasMask ||
+    hasPromptInputs === hasPlacement
+  ) {
+    throw new DomainError(
+      "INTERNAL_ERROR",
+      "The edit reservation received an invalid immutable input set.",
+    );
+  }
+
   const frame = generationFrameForRegion(input.region);
+  const executionMode = hasPlacement ? "placement" : "openai";
   const normalizedMeta = JSON.stringify({
     baseRevisionId: input.baseRevisionId,
     prompt: input.prompt,
@@ -845,23 +871,23 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
     frame,
     fill: input.fill,
     strokes: input.strokes,
-    generation: input.referenceBytes ? "reference-placement" : "live-ai",
+    executionMode,
   });
-  const [sourceHash, maskHash, referenceHash] = await Promise.all([
-    sha256Hex(input.sourceBytes),
-    sha256Hex(input.maskBytes),
-    input.referenceBytes ? sha256Hex(input.referenceBytes) : Promise.resolve(null),
+  const [sourceHash, maskHash, placementHash] = await Promise.all([
+    hasPromptInputs ? sha256Hex(input.sourceBytes!) : Promise.resolve(null),
+    hasPromptInputs ? sha256Hex(input.maskBytes!) : Promise.resolve(null),
+    hasPlacement ? sha256Hex(input.placementBytes!) : Promise.resolve(null),
   ]);
   const fingerprint = await sha256Hex(
-    `${normalizedMeta}:${sourceHash}:${maskHash}:${referenceHash ?? "none"}`,
+    `${normalizedMeta}:${sourceHash ?? "none"}:${maskHash ?? "none"}:${placementHash ?? "none"}`,
   );
 
   const jobId = crypto.randomUUID();
   const authorId = crypto.randomUUID();
-  const sourceBlobId = crypto.randomUUID();
-  const maskBlobId = crypto.randomUUID();
+  const sourceBlobId = hasPromptInputs ? crypto.randomUUID() : null;
+  const maskBlobId = hasPromptInputs ? crypto.randomUUID() : null;
   const displayMaskBlobId = crypto.randomUUID();
-  const referenceBlobId = input.referenceBytes ? crypto.randomUUID() : null;
+  const placementBlobId = hasPlacement ? crypto.randomUUID() : null;
   const now = Date.now();
   const leaseExpiresAt = now + RESERVATION_LEASE_MS;
   const rate = prepareRateLimits(input.rateLimits, EDIT_RATE_RULES, now);
@@ -872,15 +898,14 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
     input.strokes,
     frame,
   );
-  const displayRegion = input.referenceBytes
-    ? referencePlacementRegion(generationMask.region)
-    : generationMask.region;
   const displayMask = new TextEncoder().encode(
-    createDisplayMaskSvg({
-      region: displayRegion,
-      fill: input.referenceBytes ? true : input.fill,
-      strokes: input.referenceBytes ? [] : generationMask.strokes,
-    }),
+    executionMode === "placement"
+      ? createPlacementDisplayMaskSvg(generationMask.region)
+      : createDisplayMaskSvg({
+          region: generationMask.region,
+          fill: input.fill,
+          strokes: generationMask.strokes,
+        }),
   );
   const displayMaskHash = await sha256Hex(displayMask);
 
@@ -891,7 +916,7 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
               source_blob_id AS sourceBlobId,
               mask_blob_id AS maskBlobId,
               display_mask_blob_id AS displayMaskBlobId,
-              reference_blob_id AS referenceBlobId,
+              reference_blob_id AS placementBlobId,
               retry_token_hash AS retryTokenHash
        FROM edit_jobs WHERE artwork_id = ? AND idempotency_key = ? LIMIT 1`,
     ).bind(ARTWORK_ID, input.idempotencyKey),
@@ -962,7 +987,7 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
     env.DB.prepare(INSERT_EDIT_RESERVATION_SQL).bind(
       jobId,
       ARTWORK_ID,
-      "openai",
+      executionMode,
       authorId,
       input.requesterHash,
       input.baseRevisionId,
@@ -978,7 +1003,7 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
       sourceBlobId,
       maskBlobId,
       displayMaskBlobId,
-      referenceBlobId,
+      placementBlobId,
       input.idempotencyKey,
       fingerprint,
       PREPARING_AVAILABLE_AT,
@@ -1074,7 +1099,7 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
     sourceBlobId,
     maskBlobId,
     displayMaskBlobId,
-    referenceBlobId,
+    placementBlobId,
     retryTokenHash,
   };
   const selectedRetryToken =
@@ -1085,7 +1110,17 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
     const publicJob = await getPublicJob(env, selected.id);
     return selectedRetryToken ? { ...publicJob, retryToken: selectedRetryToken } : publicJob;
   }
-  if (!selected.sourceBlobId || !selected.maskBlobId || !selected.displayMaskBlobId) {
+  if (
+    !selected.displayMaskBlobId ||
+    (
+      executionMode === "openai" &&
+      (!selected.sourceBlobId || !selected.maskBlobId)
+    ) ||
+    (
+      executionMode === "placement" &&
+      !selected.placementBlobId
+    )
+  ) {
     throw new DomainError(
       "INTERNAL_ERROR",
       "The reserved edit is missing its immutable input identifiers.",
@@ -1095,29 +1130,43 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
   const selectedSourceBlobId = selected.sourceBlobId;
   const selectedMaskBlobId = selected.maskBlobId;
   const selectedDisplayMaskBlobId = selected.displayMaskBlobId;
-  const selectedReferenceBlobId = selected.referenceBlobId;
-  const sourceKey = `artworks/palimpsest/inputs/${selectedJobId}/source-${sourceHash}.png`;
-  const maskKey = `artworks/palimpsest/masks/${selectedJobId}/provider-${maskHash}.png`;
+  const selectedPlacementBlobId = selected.placementBlobId;
+  const sourceKey = sourceHash
+    ? `artworks/palimpsest/inputs/${selectedJobId}/source-${sourceHash}.png`
+    : null;
+  const maskKey = maskHash
+    ? `artworks/palimpsest/masks/${selectedJobId}/provider-${maskHash}.png`
+    : null;
   const displayMaskKey = `artworks/palimpsest/masks/${selectedJobId}/display-${displayMaskHash}.svg`;
-  const referenceKey = referenceHash
-    ? `artworks/palimpsest/inputs/${selectedJobId}/reference-${referenceHash}.png`
+  const placementKey = placementHash
+    ? `artworks/palimpsest/inputs/${selectedJobId}/placement-${placementHash}.png`
     : null;
 
-  const blobWrites = [
-    env.BLOBS.put(sourceKey, input.sourceBytes, {
-      httpMetadata: { contentType: "image/png" },
-      customMetadata: { sha256: sourceHash, private: "true" },
-    }),
-    env.BLOBS.put(maskKey, input.maskBytes, {
-      httpMetadata: { contentType: "image/png" },
-      customMetadata: { sha256: maskHash, private: "true" },
-    }),
-  ];
-  if (input.referenceBytes && referenceHash && referenceKey) {
+  const blobWrites: Array<Promise<R2Object | null>> = [];
+  if (
+    input.sourceBytes &&
+    input.maskBytes &&
+    sourceHash &&
+    maskHash &&
+    sourceKey &&
+    maskKey
+  ) {
     blobWrites.push(
-      env.BLOBS.put(referenceKey, input.referenceBytes, {
+      env.BLOBS.put(sourceKey, input.sourceBytes, {
         httpMetadata: { contentType: "image/png" },
-        customMetadata: { sha256: referenceHash, private: "true" },
+        customMetadata: { sha256: sourceHash, private: "true" },
+      }),
+      env.BLOBS.put(maskKey, input.maskBytes, {
+        httpMetadata: { contentType: "image/png" },
+        customMetadata: { sha256: maskHash, private: "true" },
+      }),
+    );
+  }
+  if (input.placementBytes && placementHash && placementKey) {
+    blobWrites.push(
+      env.BLOBS.put(placementKey, input.placementBytes, {
+        httpMetadata: { contentType: "image/png" },
+        customMetadata: { sha256: placementHash, private: "true" },
       }),
     );
   }
@@ -1138,19 +1187,50 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
   }
 
   const readyAt = Date.now();
-  const statements = [
-    env.DB.prepare(
-      `INSERT OR IGNORE INTO blobs
-       (id, artwork_id, kind, r2_key, content_type, byte_length, sha256, width, height, created_at)
-       VALUES (?, ?, 'input', ?, 'image/png', ?, ?, 1024, 1024, ?)`,
-    ).bind(selectedSourceBlobId, ARTWORK_ID, sourceKey, input.sourceBytes.byteLength, sourceHash, now),
-    env.DB.prepare(
-      `INSERT OR IGNORE INTO blobs
-       (id, artwork_id, kind, r2_key, content_type, byte_length, sha256, width, height, created_at)
-       VALUES (?, ?, 'mask', ?, 'image/png', ?, ?, 1024, 1024, ?)`,
-    ).bind(selectedMaskBlobId, ARTWORK_ID, maskKey, input.maskBytes.byteLength, maskHash, now),
-  ];
-  if (input.referenceBytes && selectedReferenceBlobId && referenceHash && referenceKey) {
+  const statements: D1PreparedStatement[] = [];
+  if (
+    input.sourceBytes &&
+    input.maskBytes &&
+    selectedSourceBlobId &&
+    selectedMaskBlobId &&
+    sourceHash &&
+    maskHash &&
+    sourceKey &&
+    maskKey
+  ) {
+    statements.push(
+      env.DB.prepare(
+        `INSERT OR IGNORE INTO blobs
+         (id, artwork_id, kind, r2_key, content_type, byte_length, sha256, width, height, created_at)
+         VALUES (?, ?, 'input', ?, 'image/png', ?, ?, 1024, 1024, ?)`,
+      ).bind(
+        selectedSourceBlobId,
+        ARTWORK_ID,
+        sourceKey,
+        input.sourceBytes.byteLength,
+        sourceHash,
+        now,
+      ),
+      env.DB.prepare(
+        `INSERT OR IGNORE INTO blobs
+         (id, artwork_id, kind, r2_key, content_type, byte_length, sha256, width, height, created_at)
+         VALUES (?, ?, 'mask', ?, 'image/png', ?, ?, 1024, 1024, ?)`,
+      ).bind(
+        selectedMaskBlobId,
+        ARTWORK_ID,
+        maskKey,
+        input.maskBytes.byteLength,
+        maskHash,
+        now,
+      ),
+    );
+  }
+  if (
+    input.placementBytes &&
+    selectedPlacementBlobId &&
+    placementHash &&
+    placementKey
+  ) {
     statements.push(
       env.DB
         .prepare(
@@ -1159,11 +1239,11 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
            VALUES (?, ?, 'input', ?, 'image/png', ?, ?, 1024, 1024, ?)`,
         )
         .bind(
-          selectedReferenceBlobId,
+          selectedPlacementBlobId,
           ARTWORK_ID,
-          referenceKey,
-          input.referenceBytes.byteLength,
-          referenceHash,
+          placementKey,
+          input.placementBytes.byteLength,
+          placementHash,
           now,
         ),
     );
@@ -1424,12 +1504,14 @@ export async function insertRevertJob(
 type RetryCandidateRow = {
   id: string;
   state: string;
+  executionMode: "openai" | "placement" | "none";
+  placementBlobId: string | null;
   errorCode: string | null;
   startedAt: number | null;
   sourceKey: string | null;
   maskKey: string | null;
   displayMaskKey: string | null;
-  referenceKey: string | null;
+  placementKey: string | null;
   successorId: string | null;
 };
 
@@ -1473,15 +1555,26 @@ WHERE parent.artwork_id = c.artwork_id
     )
     OR (parent.error_code = 'QUEUE_LEASE_EXPIRED' AND parent.started_at IS NULL)
   )
-  AND parent.source_blob_id IS NOT NULL
-  AND parent.mask_blob_id IS NOT NULL
   AND parent.display_mask_blob_id IS NOT NULL
-  AND EXISTS (SELECT 1 FROM blobs source WHERE source.id = parent.source_blob_id)
-  AND EXISTS (SELECT 1 FROM blobs mask WHERE mask.id = parent.mask_blob_id)
   AND EXISTS (SELECT 1 FROM blobs display WHERE display.id = parent.display_mask_blob_id)
-  AND (parent.reference_blob_id IS NULL OR EXISTS (
-    SELECT 1 FROM blobs reference WHERE reference.id = parent.reference_blob_id
-  ))
+  AND (
+    (
+      parent.execution_mode = 'openai'
+      AND parent.reference_blob_id IS NULL
+      AND parent.source_blob_id IS NOT NULL
+      AND parent.mask_blob_id IS NOT NULL
+      AND EXISTS (SELECT 1 FROM blobs source WHERE source.id = parent.source_blob_id)
+      AND EXISTS (SELECT 1 FROM blobs mask WHERE mask.id = parent.mask_blob_id)
+    )
+    OR
+    (
+      parent.execution_mode = 'placement'
+      AND parent.reference_blob_id IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM blobs placement WHERE placement.id = parent.reference_blob_id
+      )
+    )
+  )
   AND EXISTS (
     SELECT 1 FROM revisions base
     WHERE base.artwork_id = parent.artwork_id AND base.id = parent.base_revision_id
@@ -1539,16 +1632,18 @@ export async function retryFailedEditJob(
   const retryTokenHash = await sha256Hex(input.retryToken);
   const candidate = await runIdempotentD1(() =>
     env.DB.prepare(
-      `SELECT j.id, j.state, j.error_code AS errorCode, j.started_at AS startedAt,
+      `SELECT j.id, j.state, j.execution_mode AS executionMode,
+              j.reference_blob_id AS placementBlobId,
+              j.error_code AS errorCode, j.started_at AS startedAt,
               source.r2_key AS sourceKey, mask.r2_key AS maskKey,
-              display.r2_key AS displayMaskKey, reference.r2_key AS referenceKey,
+              display.r2_key AS displayMaskKey, placement.r2_key AS placementKey,
               (SELECT child.id FROM edit_jobs child
                WHERE child.retry_of_job_id = j.id LIMIT 1) AS successorId
        FROM edit_jobs j
        LEFT JOIN blobs source ON source.id = j.source_blob_id
        LEFT JOIN blobs mask ON mask.id = j.mask_blob_id
        LEFT JOIN blobs display ON display.id = j.display_mask_blob_id
-       LEFT JOIN blobs reference ON reference.id = j.reference_blob_id
+       LEFT JOIN blobs placement ON placement.id = j.reference_blob_id
        WHERE j.id = ? AND j.artwork_id = ? AND j.kind = 'edit'
          AND j.requester_hash = ? AND j.retry_token_hash = ?`,
     )
@@ -1557,6 +1652,18 @@ export async function retryFailedEditJob(
   );
   if (!candidate) {
     throw new DomainError("NOT_FOUND", "That retryable contribution could not be found.");
+  }
+  const hasCanonicalInputShape =
+    candidate.executionMode === "placement"
+      ? candidate.placementBlobId !== null
+      : candidate.executionMode === "openai"
+        ? candidate.placementBlobId === null
+        : false;
+  if (!hasCanonicalInputShape) {
+    throw new DomainError(
+      "JOB_NOT_RETRYABLE",
+      "This attempt used a retired contribution format. Submit a new contribution instead.",
+    );
   }
   if (candidate.successorId) {
     return { ...(await getPublicJob(env, candidate.successorId)), retryToken: input.retryToken };
@@ -1569,19 +1676,25 @@ export async function retryFailedEditJob(
       "REFERENCE_REVIEW_FAILED",
     ].includes(candidate.errorCode ?? "") ||
       (candidate.errorCode === "QUEUE_LEASE_EXPIRED" && candidate.startedAt == null));
-  const requiredKeys = [
-    candidate.sourceKey,
-    candidate.maskKey,
-    candidate.displayMaskKey,
-    candidate.referenceKey,
-  ].filter((key): key is string => Boolean(key));
-  if (!technicallyRetryable || requiredKeys.length < 3) {
+  const requiredKeys =
+    candidate.executionMode === "placement"
+      ? [candidate.placementKey, candidate.displayMaskKey]
+      : candidate.executionMode === "openai"
+        ? [candidate.sourceKey, candidate.maskKey, candidate.displayMaskKey]
+        : [];
+  if (
+    !technicallyRetryable ||
+    requiredKeys.length === 0 ||
+    requiredKeys.some((key) => typeof key !== "string")
+  ) {
     throw new DomainError(
       "JOB_NOT_RETRYABLE",
       "This attempt cannot be retried safely. Submit a new contribution instead.",
     );
   }
-  const objects = await Promise.all(requiredKeys.map((key) => env.BLOBS.head(key)));
+  const objects = await Promise.all(
+    requiredKeys.map((key) => env.BLOBS.head(key as string)),
+  );
   if (objects.some((object) => object == null)) {
     throw new DomainError(
       "JOB_NOT_RETRYABLE",
@@ -1723,15 +1836,26 @@ export async function getPublicJob(env: AppEnv, jobId: string) {
            )
            OR (j.error_code = 'QUEUE_LEASE_EXPIRED' AND j.started_at IS NULL)
          )
-         AND j.source_blob_id IS NOT NULL
-         AND j.mask_blob_id IS NOT NULL
          AND j.display_mask_blob_id IS NOT NULL
-         AND EXISTS (SELECT 1 FROM blobs source WHERE source.id = j.source_blob_id)
-         AND EXISTS (SELECT 1 FROM blobs mask WHERE mask.id = j.mask_blob_id)
          AND EXISTS (SELECT 1 FROM blobs display WHERE display.id = j.display_mask_blob_id)
-         AND (j.reference_blob_id IS NULL OR EXISTS (
-           SELECT 1 FROM blobs reference WHERE reference.id = j.reference_blob_id
-         ))
+         AND (
+           (
+             j.execution_mode = 'openai'
+             AND j.reference_blob_id IS NULL
+             AND j.source_blob_id IS NOT NULL
+             AND j.mask_blob_id IS NOT NULL
+             AND EXISTS (SELECT 1 FROM blobs source WHERE source.id = j.source_blob_id)
+             AND EXISTS (SELECT 1 FROM blobs mask WHERE mask.id = j.mask_blob_id)
+           )
+           OR
+           (
+             j.execution_mode = 'placement'
+             AND j.reference_blob_id IS NOT NULL
+             AND EXISTS (
+               SELECT 1 FROM blobs placement WHERE placement.id = j.reference_blob_id
+             )
+           )
+         )
          AND NOT EXISTS (SELECT 1 FROM edit_jobs retry WHERE retry.retry_of_job_id = j.id)
          THEN 1 ELSE 0
        END AS retryable,

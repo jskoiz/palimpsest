@@ -492,11 +492,13 @@ body {
   inset: 0;
   z-index: 0;
   overflow: hidden;
-  background: rgba(var(--ink), 0.26);
+  background: transparent;
   pointer-events: none;
 }
 
 .mono-reference-safe-zone {
+  position: absolute;
+  inset: 0;
   overflow: hidden;
   border: 1px dashed rgba(255, 255, 255, 0.88);
   box-shadow:
@@ -508,8 +510,8 @@ body {
   width: 100%;
   height: 100%;
   display: block;
-  object-fit: contain;
-  opacity: 0.88;
+  object-fit: fill;
+  opacity: 1;
 }
 
 .mono-reference-on-canvas > span {
@@ -1262,6 +1264,10 @@ body {
   flex: 1;
 }
 
+.mono-reference-control.has-image {
+  flex-basis: 300px;
+}
+
 .mono-reference-remove {
   width: 22px;
   height: 100%;
@@ -1269,6 +1275,24 @@ body {
   color: var(--accent) !important;
   font-family: var(--font-mono) !important;
   font-size: 13px !important;
+}
+
+.mono-reference-background {
+  height: 100%;
+  flex: 0 0 auto;
+  padding: 0 5px !important;
+  color: rgba(255, 255, 255, 0.58) !important;
+  font-family: var(--font-mono) !important;
+  font-size: 7px !important;
+  white-space: nowrap;
+}
+
+.mono-reference-background.is-active {
+  color: rgba(255, 255, 255, 0.9) !important;
+}
+
+.mono-reference-background:disabled {
+  opacity: 0.45;
 }
 
 .mono-input {

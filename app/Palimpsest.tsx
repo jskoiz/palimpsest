@@ -21,9 +21,6 @@ import {
 } from "@/app/activity-ui.mjs";
 import {
   ARTWORK_SIZE,
-  REFERENCE_EDIT_MIN_EDGE,
-  REFERENCE_TARGET_FILL,
-  referencePlacementRegion,
 } from "@/lib/palimpsest/domain.mjs";
 import {
   canvasViewCanPan,
@@ -32,13 +29,16 @@ import {
   EDIT_REGION_MIN_EDGE,
   GENERATION_FRAME_SIZE,
   generationFrameForRegion,
+  initialReferencePlacementRegion,
   maskInGenerationFrame,
   positionEditRegion,
-  referenceSafeEditRegion,
+  REFERENCE_PLACEMENT_MIN_EDGE,
+  resizeReferencePlacementRegion,
   resizeEditRegion,
   regionsOverlap,
   timelineIndexAtPosition,
 } from "@/lib/palimpsest/geometry.mjs";
+import { prepareReferencePixels } from "@/lib/palimpsest/reference-image.mjs";
 
 type Region = {
   x: number;
@@ -54,7 +54,7 @@ type Revision = {
   author: string;
   prompt: string;
   createdAt: string;
-  origin: "seed" | "demo" | "openai" | "revert";
+  origin: "seed" | "demo" | "openai" | "placement" | "revert";
   status: "accepted";
   region: Region | null;
   revertTargetRevisionId: string | null;
@@ -101,7 +101,8 @@ type HistoryPayload = {
   revisions: Revision[];
   headRevisionId: string;
   editing: {
-    available: boolean;
+    generationAvailable: boolean;
+    placementAvailable: boolean;
   };
 };
 
@@ -192,10 +193,14 @@ type Stroke = {
 };
 
 type ReferenceImage = {
-  blob: Blob;
+  backgroundRemovalEnabled: boolean;
+  backgroundRemoved: boolean;
+  cutoutBlob: Blob;
+  cutoutPreviewUrl: string;
   fileName: string;
   height: number;
-  previewUrl: string;
+  originalBlob: Blob;
+  originalPreviewUrl: string;
   sourceBlob: Blob;
   width: number;
 };
@@ -211,6 +216,8 @@ const DEFAULT_REGION = { x: 800, y: 832, width: 448, height: 384 };
 const WELCOME_STORAGE_KEY = "palimpsest:welcome:v1";
 const RETRY_CAPABILITIES_STORAGE_KEY = "palimpsest:retry-capabilities:v1";
 const REFERENCE_IMAGE_SIZE = 1024;
+const REFERENCE_DECODE_MAX_EDGE = 1536;
+const REFERENCE_MAX_ASPECT_RATIO = 8;
 const MAX_REFERENCE_UPLOAD_BYTES = 10 * 1024 * 1024;
 const REFERENCE_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 
@@ -244,17 +251,6 @@ function regionStyle(region: Region): CSSProperties {
     top: `${(region.y / ARTWORK_SIZE) * 100}%`,
     width: `${(region.width / ARTWORK_SIZE) * 100}%`,
     height: `${(region.height / ARTWORK_SIZE) * 100}%`,
-  };
-}
-
-function referencePreviewStyle(): CSSProperties {
-  const offset = ((1 - REFERENCE_TARGET_FILL) / 2) * 100;
-  return {
-    position: "absolute",
-    width: `${REFERENCE_TARGET_FILL * 100}%`,
-    height: `${REFERENCE_TARGET_FILL * 100}%`,
-    left: `${offset}%`,
-    top: `${offset}%`,
   };
 }
 
@@ -643,8 +639,9 @@ function WelcomeDrawer({
                   Place and resize the patch, then paint what may change. GPT Image
                   makes one masked image pass; GPT-5.6 checks it once before acceptance.
                   Each submission is time-bounded and never silently replays a second generation.
-                  References use the preview as an exact protected placement area, so
-                  prior artwork outside it cannot be replaced. Live outlines lock only active work.
+                  Uploaded images skip generation and review: the transparent preview is
+                  placed exactly as shown, while every uncovered canvas pixel remains
+                  protected. Live outlines lock only active work.
                 </p>
               </section>
             </div>
@@ -707,7 +704,13 @@ function canvasBlob(canvas: HTMLCanvasElement, message: string): Promise<Blob> {
 
 async function normalizeReferenceImage(
   file: File,
-): Promise<{ blob: Blob; height: number; width: number }> {
+): Promise<{
+  backgroundRemoved: boolean;
+  cutoutBlob: Blob;
+  height: number;
+  originalBlob: Blob;
+  width: number;
+}> {
   let image: ImageBitmap;
   try {
     image = await createImageBitmap(file);
@@ -718,31 +721,96 @@ async function normalizeReferenceImage(
     if (image.width < 1 || image.height < 1) {
       throw new Error("That reference image has no visible pixels.");
     }
+    const decodeScale = Math.min(
+      1,
+      REFERENCE_DECODE_MAX_EDGE / Math.max(image.width, image.height),
+    );
+    const decodedWidth = Math.max(1, Math.round(image.width * decodeScale));
+    const decodedHeight = Math.max(1, Math.round(image.height * decodeScale));
+    const decoded = document.createElement("canvas");
+    decoded.width = decodedWidth;
+    decoded.height = decodedHeight;
+    const context = decoded.getContext("2d", { willReadFrequently: true });
+    if (!context) throw new Error("This browser cannot prepare reference images.");
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = "high";
+    context.drawImage(image, 0, 0, decodedWidth, decodedHeight);
+    const original = context.getImageData(0, 0, decodedWidth, decodedHeight);
+    const prepared = prepareReferencePixels({
+      data: original.data,
+      width: decodedWidth,
+      height: decodedHeight,
+    });
+    const { bounds } = prepared;
+    const aspectRatio = bounds.width / bounds.height;
+    if (
+      aspectRatio > REFERENCE_MAX_ASPECT_RATIO ||
+      aspectRatio < 1 / REFERENCE_MAX_ASPECT_RATIO
+    ) {
+      throw new Error(
+        "Crop this image so its width and height are within an 8:1 ratio.",
+      );
+    }
+
+    const crop = async (pixels: Uint8ClampedArray, message: string) => {
+      const canvas = document.createElement("canvas");
+      canvas.width = bounds.width;
+      canvas.height = bounds.height;
+      const cropContext = canvas.getContext("2d");
+      if (!cropContext) throw new Error("This browser cannot prepare reference images.");
+      const ownedPixels = new Uint8ClampedArray(pixels.length);
+      ownedPixels.set(pixels);
+      cropContext.putImageData(
+        new ImageData(ownedPixels, decodedWidth, decodedHeight),
+        -bounds.x,
+        -bounds.y,
+      );
+      return canvasBlob(canvas, message);
+    };
+    const [cutoutBlob, originalBlob] = await Promise.all([
+      crop(prepared.data, "The transparent reference could not be encoded."),
+      crop(original.data, "The original reference could not be encoded."),
+    ]);
+    return {
+      backgroundRemoved: prepared.backgroundRemoved,
+      cutoutBlob,
+      height: bounds.height,
+      originalBlob,
+      width: bounds.width,
+    };
+  } finally {
+    image.close();
+  }
+}
+
+async function referencePlacementLayer(
+  reference: Blob,
+  region: Region,
+  frame: Region,
+): Promise<Blob> {
+  let image: ImageBitmap;
+  try {
+    image = await createImageBitmap(reference);
+  } catch {
+    throw new Error("The prepared reference could not be placed.");
+  }
+  try {
     const canvas = document.createElement("canvas");
     canvas.width = REFERENCE_IMAGE_SIZE;
     canvas.height = REFERENCE_IMAGE_SIZE;
     const context = canvas.getContext("2d");
-    if (!context) throw new Error("This browser cannot prepare reference images.");
+    if (!context) throw new Error("This browser cannot place reference images.");
     context.imageSmoothingEnabled = true;
     context.imageSmoothingQuality = "high";
-    const scale = Math.min(
-      REFERENCE_IMAGE_SIZE / image.width,
-      REFERENCE_IMAGE_SIZE / image.height,
-    );
-    const width = Math.max(1, Math.round(image.width * scale));
-    const height = Math.max(1, Math.round(image.height * scale));
+    const placement = maskInGenerationFrame(region, [], frame).region;
     context.drawImage(
       image,
-      Math.round((REFERENCE_IMAGE_SIZE - width) / 2),
-      Math.round((REFERENCE_IMAGE_SIZE - height) / 2),
-      width,
-      height,
+      placement.x,
+      placement.y,
+      placement.width,
+      placement.height,
     );
-    return {
-      blob: await canvasBlob(canvas, "The reference image could not be encoded."),
-      height: image.height,
-      width: image.width,
-    };
+    return canvasBlob(canvas, "The exact reference placement could not be encoded.");
   } finally {
     image.close();
   }
@@ -946,7 +1014,6 @@ async function providerMask(
   frame: Region,
   strokes: Stroke[],
   fill: boolean,
-  referencePlacement: boolean,
 ): Promise<Blob> {
   const canvas = document.createElement("canvas");
   canvas.width = GENERATION_FRAME_SIZE;
@@ -957,9 +1024,7 @@ async function providerMask(
   context.fillRect(0, 0, GENERATION_FRAME_SIZE, GENERATION_FRAME_SIZE);
   context.globalCompositeOperation = "destination-out";
   const generationMask = maskInGenerationFrame(region, strokes, frame);
-  const frameRegion = referencePlacement
-    ? referencePlacementRegion(generationMask.region)
-    : generationMask.region;
+  const frameRegion = generationMask.region;
   if (fill) {
     context.clearRect(
       frameRegion.x,
@@ -1063,7 +1128,7 @@ export default function Palimpsest() {
   const overlayCoverRef = useRef<HTMLDivElement>(null);
   const maskCanvasRef = useRef<HTMLCanvasElement>(null);
   const referenceInputRef = useRef<HTMLInputElement>(null);
-  const referencePreviewUrlRef = useRef<string | null>(null);
+  const referencePreviewUrlsRef = useRef<string[]>([]);
 
   const revisions = history?.revisions ?? EMPTY_REVISIONS;
   const selectedRevision = revisions[selectedIndex] ?? null;
@@ -1076,22 +1141,41 @@ export default function Palimpsest() {
   const notCurrent = Boolean(selectedRevision && history && selectedRevision.id !== history.headRevisionId);
   const validMask = fillMask || strokes.length > 0;
   const patchCanMove =
-    !submitted && (step === 1 || (step === 3 && Boolean(referenceImage)));
+    !submitted &&
+    !isPreparing &&
+    (step === 1 || (step === 3 && Boolean(referenceImage)));
+  const patchCanResize =
+    !submitted &&
+    !isPreparing &&
+    (step === 1 || (step === 3 && Boolean(referenceImage)));
   const patchMinimumEdge = referenceImage
-    ? REFERENCE_EDIT_MIN_EDGE
+    ? REFERENCE_PLACEMENT_MIN_EDGE
     : EDIT_REGION_MIN_EDGE;
-  const referenceRegionIsSafe =
-    !referenceImage ||
-    (editRegion.width >= REFERENCE_EDIT_MIN_EDGE &&
-      editRegion.height >= REFERENCE_EDIT_MIN_EDGE);
+  const activeReferenceBlob = referenceImage
+    ? referenceImage.backgroundRemovalEnabled
+      ? referenceImage.cutoutBlob
+      : referenceImage.originalBlob
+    : null;
+  const activeReferencePreviewUrl = referenceImage
+    ? referenceImage.backgroundRemovalEnabled
+      ? referenceImage.cutoutPreviewUrl
+      : referenceImage.originalPreviewUrl
+    : null;
+  const referenceAspectRatio = referenceImage
+    ? referenceImage.width / referenceImage.height
+    : 1;
   const jobActive = Boolean(job && !terminalJobStates.has(job.state));
-  const liveActivityJobs = publicActivityJobs(activity.jobs);
+  const liveActivityJobs = publicActivityJobs(activity.jobs) as ActivityJob[];
   const queueTotal = liveActivityJobs.length;
   const queueBusy = queueTotal > 0 || jobActive;
   const hasRecoverableWork =
     activity.queue.queued > 0 ||
     activity.activeRegions.some((active) => !active.reservationActive);
-  const liveEditingAvailable = Boolean(history?.editing.available);
+  const generationAvailable = Boolean(history?.editing.generationAvailable);
+  const placementAvailable = Boolean(history?.editing.placementAvailable);
+  const requestedModeAvailable = referenceImage
+    ? placementAvailable
+    : generationAvailable;
   const canPanCanvas = canvasViewCanPan(view, viewport.width, viewport.height);
   const otherActiveRegions = activity.activeRegions.filter(
     (active) => active.jobId !== pendingEdit?.jobId,
@@ -1114,7 +1198,9 @@ export default function Palimpsest() {
     editOpen,
     step,
     submitted,
+    preparing: isPreparing,
     referenceActive: Boolean(referenceImage),
+    editRegion,
     jobActive,
     history,
     currentState,
@@ -1133,7 +1219,9 @@ export default function Palimpsest() {
       editOpen,
       step,
       submitted,
+      preparing: isPreparing,
       referenceActive: Boolean(referenceImage),
+      editRegion,
       jobActive,
       history,
       currentState,
@@ -1249,10 +1337,10 @@ export default function Palimpsest() {
   }, [saveRetryCapabilities]);
 
   const clearReferenceImage = useCallback(() => {
-    if (referencePreviewUrlRef.current) {
-      URL.revokeObjectURL(referencePreviewUrlRef.current);
-      referencePreviewUrlRef.current = null;
+    for (const url of referencePreviewUrlsRef.current) {
+      URL.revokeObjectURL(url);
     }
+    referencePreviewUrlsRef.current = [];
     if (referenceInputRef.current) referenceInputRef.current.value = "";
     setReferenceImage(null);
   }, []);
@@ -1419,9 +1507,10 @@ export default function Palimpsest() {
 
   useEffect(
     () => () => {
-      if (referencePreviewUrlRef.current) {
-        URL.revokeObjectURL(referencePreviewUrlRef.current);
+      for (const url of referencePreviewUrlsRef.current) {
+        URL.revokeObjectURL(url);
       }
+      referencePreviewUrlsRef.current = [];
     },
     [],
   );
@@ -1563,9 +1652,16 @@ export default function Palimpsest() {
       } catch {
         setJob((current) => (current ? { ...current } : current));
       }
-    }, 3000);
+    }, referenceImage ? 350 : 3000);
     return () => window.clearTimeout(timer);
-  }, [clearReferenceImage, job, refreshActivity, refreshHistory, showToast]);
+  }, [
+    clearReferenceImage,
+    job,
+    referenceImage,
+    refreshActivity,
+    refreshHistory,
+    showToast,
+  ]);
 
   useEffect(() => {
     if (!compareOn || selectedIndex <= 0) return;
@@ -1603,15 +1699,7 @@ export default function Palimpsest() {
     context.lineCap = "round";
     context.lineJoin = "round";
     if (fillMask) {
-      const fillRegion = referenceImage
-        ? referencePlacementRegion({ x: 0, y: 0, width, height })
-        : { x: 0, y: 0, width, height };
-      context.fillRect(
-        fillRegion.x,
-        fillRegion.y,
-        fillRegion.width,
-        fillRegion.height,
-      );
+      context.fillRect(0, 0, width, height);
     }
     for (const stroke of strokes) {
       const first = stroke.points[0];
@@ -1794,8 +1882,8 @@ export default function Palimpsest() {
   const openEditor = useCallback(async () => {
     const initial = latest.current;
     if (!initial.history || !initial.currentState || initial.jobActive) return;
-    if (!initial.history.editing.available) {
-      showToast("live AI editing is temporarily unavailable");
+    if (!initial.history.editing.placementAvailable) {
+      showToast("image contributions are temporarily unavailable");
       return;
     }
     let activeRegions = initial.activeRegions;
@@ -1899,7 +1987,7 @@ export default function Palimpsest() {
           if (current.editOpen) {
             const canMovePatch =
               current.step === 1 || (current.step === 3 && current.referenceActive);
-            if (canMovePatch && !current.submitted) {
+            if (canMovePatch && !current.submitted && !current.preparing) {
               const amount = event.shiftKey ? 32 : 8;
               const deltas: Record<string, [number, number]> = {
                 ArrowLeft: [-amount, 0],
@@ -2151,29 +2239,43 @@ export default function Palimpsest() {
 
   const resizePatch = (desiredWidth: number, desiredHeight: number) => {
     setEditRegion((region) =>
-      resizeEditRegion(
-        region,
-        desiredWidth,
-        desiredHeight,
-        patchMinimumEdge,
-      ),
+      referenceImage
+        ? resizeReferencePlacementRegion(
+            region,
+            desiredWidth,
+            desiredHeight,
+            referenceAspectRatio,
+          )
+        : resizeEditRegion(
+            region,
+            desiredWidth,
+            desiredHeight,
+            patchMinimumEdge,
+          ),
     );
   };
 
   const resizePatchBy = (amount: number) => {
     setEditRegion((region) =>
-      resizeEditRegion(
-        region,
-        region.width + amount,
-        region.height + amount,
-        patchMinimumEdge,
-      ),
+      referenceImage
+        ? resizeReferencePlacementRegion(
+            region,
+            region.width + amount,
+            region.height + amount,
+            referenceAspectRatio,
+          )
+        : resizeEditRegion(
+            region,
+            region.width + amount,
+            region.height + amount,
+            patchMinimumEdge,
+          ),
     );
     wake();
   };
 
   const patchResizeDown = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    if (step !== 1 || submitted) return;
+    if (!patchCanResize) return;
     if (event.pointerType === "mouse" && event.button !== 0) return;
     const point = artworkPoint(event);
     if (!point) return;
@@ -2194,12 +2296,19 @@ export default function Palimpsest() {
     const point = artworkPoint(event);
     if (!point) return;
     setEditRegion((region) =>
-      resizeEditRegion(
-        region,
-        point.x + resize.edgeOffsetX - region.x,
-        point.y + resize.edgeOffsetY - region.y,
-        patchMinimumEdge,
-      ),
+      referenceImage
+        ? resizeReferencePlacementRegion(
+            region,
+            point.x + resize.edgeOffsetX - region.x,
+            point.y + resize.edgeOffsetY - region.y,
+            referenceAspectRatio,
+          )
+        : resizeEditRegion(
+            region,
+            point.x + resize.edgeOffsetX - region.x,
+            point.y + resize.edgeOffsetY - region.y,
+            patchMinimumEdge,
+          ),
     );
     event.stopPropagation();
   };
@@ -2230,12 +2339,19 @@ export default function Palimpsest() {
     }
     if (widthDelta !== 0 || heightDelta !== 0) {
       setEditRegion((region) =>
-        resizeEditRegion(
-          region,
-          region.width + widthDelta,
-          region.height + heightDelta,
-          patchMinimumEdge,
-        ),
+        referenceImage
+          ? resizeReferencePlacementRegion(
+              region,
+              region.width + widthDelta,
+              region.height + heightDelta,
+              referenceAspectRatio,
+            )
+          : resizeEditRegion(
+              region,
+              region.width + widthDelta,
+              region.height + heightDelta,
+              patchMinimumEdge,
+            ),
       );
     }
     event.preventDefault();
@@ -2305,35 +2421,36 @@ export default function Palimpsest() {
     setIsPreparing(true);
     try {
       const normalized = await normalizeReferenceImage(file);
-      const safeRegion = referenceSafeEditRegion(
-        editRegion,
+      const placementRegion = initialReferencePlacementRegion(
+        latest.current.editRegion,
         normalized.width / normalized.height,
       );
-      const expanded =
-        safeRegion.x !== editRegion.x ||
-        safeRegion.y !== editRegion.y ||
-        safeRegion.width !== editRegion.width ||
-        safeRegion.height !== editRegion.height;
-      if (referencePreviewUrlRef.current) {
-        URL.revokeObjectURL(referencePreviewUrlRef.current);
+      for (const url of referencePreviewUrlsRef.current) {
+        URL.revokeObjectURL(url);
       }
-      const previewUrl = URL.createObjectURL(file);
-      referencePreviewUrlRef.current = previewUrl;
-      setEditRegion(safeRegion);
+      const cutoutPreviewUrl = URL.createObjectURL(normalized.cutoutBlob);
+      const originalPreviewUrl = URL.createObjectURL(normalized.originalBlob);
+      referencePreviewUrlsRef.current = [cutoutPreviewUrl, originalPreviewUrl];
+      setEditRegion(placementRegion);
       setStrokes([]);
       setFillMask(true);
+      setStep(3);
       setReferenceImage({
-        blob: normalized.blob,
+        backgroundRemovalEnabled: normalized.backgroundRemoved,
+        backgroundRemoved: normalized.backgroundRemoved,
+        cutoutBlob: normalized.cutoutBlob,
+        cutoutPreviewUrl,
         fileName: file.name,
         height: normalized.height,
-        previewUrl,
+        originalBlob: normalized.originalBlob,
+        originalPreviewUrl,
         sourceBlob: file,
         width: normalized.width,
       });
       showToast(
-        expanded
-          ? `Reference context expanded to ${safeRegion.width} × ${safeRegion.height}; drag the outer patch to position the exact preview.`
-          : "Reference placement ready — drag the outer patch to position the exact preview.",
+        normalized.backgroundRemoved
+          ? "Background removed — drag or resize the exact image before placing it."
+          : "Exact image ready — drag or resize it before placing it.",
       );
     } catch (error) {
       event.currentTarget.value = "";
@@ -2349,9 +2466,8 @@ export default function Palimpsest() {
     !isPreparing &&
     !submitted &&
     !jobActive &&
-    liveEditingAvailable &&
+    requestedModeAvailable &&
     !conflictingRegion &&
-    referenceRegionIsSafe &&
     prompt.trim().length >= 3 &&
     validMask &&
     step === 3;
@@ -2375,6 +2491,7 @@ export default function Palimpsest() {
       meta,
       reference: referenceImage
         ? {
+            backgroundRemovalEnabled: referenceImage.backgroundRemovalEnabled,
             fileName: referenceImage.fileName,
             size: referenceImage.sourceBlob.size,
             type: referenceImage.sourceBlob.type,
@@ -2392,22 +2509,23 @@ export default function Palimpsest() {
         ? localSubmissionFailure.retryToken
         : crypto.randomUUID();
     try {
-      const [source, mask] = await Promise.all([
-        flattenArtworkFrame(editBase.state, frame),
-        providerMask(
-          editRegion,
-          frame,
-          strokes,
-          fillMask,
-          Boolean(referenceImage),
-        ),
-      ]);
+      const placement =
+        referenceImage && activeReferenceBlob
+          ? await referencePlacementLayer(activeReferenceBlob, editRegion, frame)
+          : null;
+      const generationInputs = placement
+        ? null
+        : await Promise.all([
+            flattenArtworkFrame(editBase.state, frame),
+            providerMask(editRegion, frame, strokes, fillMask),
+          ]);
       const form = new FormData();
       form.append("meta", JSON.stringify(meta));
-      form.append("source", source, "source.png");
-      form.append("mask", mask, "mask.png");
-      if (referenceImage) {
-        form.append("reference", referenceImage.blob, "reference.png");
+      if (placement) {
+        form.append("placement", placement, "placement.png");
+      } else if (generationInputs) {
+        form.append("source", generationInputs[0], "source.png");
+        form.append("mask", generationInputs[1], "mask.png");
       }
       const payload = await fetchJson<{ job: Job }>("/api/edits", {
         method: "POST",
@@ -2552,10 +2670,16 @@ export default function Palimpsest() {
     : isPreparing
       ? "preparing…"
       : jobActive
-        ? "your edit is making…"
-        : !liveEditingAvailable
-          ? "live AI unavailable"
-          : "generate live →";
+        ? referenceImage
+          ? "placing image…"
+          : "your edit is making…"
+        : !requestedModeAvailable
+          ? referenceImage
+            ? "image placement unavailable"
+            : "live AI unavailable"
+          : referenceImage
+            ? "place image →"
+            : "generate live →";
 
   return (
     <main
@@ -2676,14 +2800,14 @@ export default function Palimpsest() {
             </div>
             {editOpen ? (
               <div
-                className={`mono-patch${patchCanMove ? " is-draggable" : " is-set"}${step === 2 && !submitted ? " is-masking" : ""}${conflictingRegion ? " is-unavailable" : ""}`}
+                className={`mono-patch${patchCanMove ? " is-draggable" : " is-set"}${step === 2 && !submitted ? " is-masking" : ""}${referenceImage && step === 3 ? " is-reference-placement" : ""}${conflictingRegion ? " is-unavailable" : ""}`}
                 style={patchStyle}
                 data-testid="edit-patch"
                 role="group"
                 tabIndex={patchCanMove ? 0 : -1}
                 aria-label={
                   step === 3 && referenceImage && !submitted
-                    ? `Selected reference placement patch, ${editRegion.width} by ${editRegion.height} pixels. Drag to reposition the exact preview, or use the arrow keys to nudge it.`
+                    ? `${referenceImage.fileName}, exact image placement at ${editRegion.x}, ${editRegion.y}, ${editRegion.width} by ${editRegion.height} pixels. Drag to move, pull the lower-right corner to resize, or use the arrow keys to nudge it.`
                     : `Selected edit patch, ${editRegion.width} by ${editRegion.height} pixels. Drag to move it, pull the lower-right corner to resize it, or use the arrow keys to nudge it.`
                 }
                 aria-describedby={conflictingRegion ? "overlap-note" : undefined}
@@ -2692,12 +2816,14 @@ export default function Palimpsest() {
                 onPointerUp={patchUp}
                 onPointerCancel={patchUp}
               >
-                {step === 1 && !submitted ? (
+                {patchCanResize ? (
                   <>
                     <span className="mono-patch-size" aria-hidden="true">
                       {editRegion.width} × {editRegion.height}
                     </span>
-                    <span className="mono-patch-label">drag to move</span>
+                    {step === 1 ? (
+                      <span className="mono-patch-label">drag to move</span>
+                    ) : null}
                     <button
                       type="button"
                       className="mono-patch-resize"
@@ -2715,16 +2841,13 @@ export default function Palimpsest() {
                 ) : null}
                 {referenceImage && step === 3 && !submitted ? (
                   <div className="mono-reference-on-canvas" aria-hidden="true">
-                    <div
-                      className="mono-reference-safe-zone"
-                      style={referencePreviewStyle()}
-                    >
-                      <img src={referenceImage.previewUrl} alt="" />
+                    <div className="mono-reference-safe-zone">
+                      <img src={activeReferencePreviewUrl ?? ""} alt="" />
                     </div>
-                    <span>drag to position · exact preview</span>
+                    <span>exact pixels · drag or resize</span>
                   </div>
                 ) : null}
-                {step >= 2 && !submitted ? (
+                {step >= 2 && !submitted && !(step === 3 && referenceImage) ? (
                   <canvas
                     ref={maskCanvasRef}
                     className={`mono-mask-canvas${step !== 2 ? " is-locked" : ""}${conflictingRegion ? " is-blocked" : ""}`}
@@ -2827,11 +2950,11 @@ export default function Palimpsest() {
           aria-label={
             jobActive
               ? "Your contribution is still being made"
-              : liveEditingAvailable
-                ? "Contribute with live AI"
-                : "Live AI editing is temporarily unavailable"
+              : placementAvailable
+                ? "Contribute an image or live AI edit"
+                : "Image contributions are temporarily unavailable"
           }
-          disabled={jobActive || !liveEditingAvailable}
+          disabled={jobActive || !placementAvailable}
           onClick={openEditor}
         >
           contribute
@@ -3150,6 +3273,16 @@ export default function Palimpsest() {
 
       {editOpen ? (
         <section className="mono-strip" aria-label="Contribute an edit">
+          <input
+            ref={referenceInputRef}
+            className="mono-reference-input"
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            hidden
+            tabIndex={-1}
+            disabled={submitted || isPreparing}
+            onChange={(event) => void selectReferenceImage(event)}
+          />
           <div className="mono-strip-head">
             <div className="mono-steps">
               <span className={`mono-step${step === 1 ? " is-active" : ""}`}>01 patch</span>
@@ -3197,6 +3330,18 @@ export default function Palimpsest() {
                   +
                 </button>
               </div>
+              <button
+                type="button"
+                className="mono-action"
+                disabled={Boolean(conflictingRegion) || isPreparing}
+                onClick={() => {
+                  if (!referenceInputRef.current) return;
+                  referenceInputRef.current.value = "";
+                  referenceInputRef.current.click();
+                }}
+              >
+                {isPreparing ? "preparing…" : "place an image →"}
+              </button>
               <button
                 type="button"
                 className="mono-action is-accent"
@@ -3263,16 +3408,6 @@ export default function Palimpsest() {
           ) : null}
           {step === 3 ? (
             <div className="mono-edit-form">
-              <input
-                ref={referenceInputRef}
-                className="mono-reference-input"
-                type="file"
-                accept="image/png,image/jpeg,image/webp"
-                aria-hidden="true"
-                tabIndex={-1}
-                disabled={submitted || isPreparing}
-                onChange={(event) => void selectReferenceImage(event)}
-              />
               <div className={`mono-reference-control${referenceImage ? " has-image" : ""}`}>
                 <button
                   type="button"
@@ -3292,7 +3427,7 @@ export default function Palimpsest() {
                 >
                   {referenceImage ? (
                     <>
-                      <img src={referenceImage.previewUrl} alt="" />
+                      <img src={activeReferencePreviewUrl ?? ""} alt="" />
                       <span>{referenceImage.fileName}</span>
                     </>
                   ) : (
@@ -3310,6 +3445,29 @@ export default function Palimpsest() {
                     ×
                   </button>
                 ) : null}
+                {referenceImage?.backgroundRemoved ? (
+                  <button
+                    type="button"
+                    className={`mono-reference-background${referenceImage.backgroundRemovalEnabled ? " is-active" : ""}`}
+                    aria-pressed={referenceImage.backgroundRemovalEnabled}
+                    disabled={submitted || isPreparing}
+                    onClick={() =>
+                      setReferenceImage((current) =>
+                        current
+                          ? {
+                              ...current,
+                              backgroundRemovalEnabled:
+                                !current.backgroundRemovalEnabled,
+                            }
+                          : current,
+                      )
+                    }
+                  >
+                    {referenceImage.backgroundRemovalEnabled
+                      ? "[x] background removed"
+                      : "[ ] background removed"}
+                  </button>
+                ) : null}
               </div>
               <input
                 className="mono-input"
@@ -3317,7 +3475,7 @@ export default function Palimpsest() {
                 maxLength={500}
                 placeholder={
                   referenceImage
-                    ? "describe how to use the reference…"
+                    ? "describe this placement for history…"
                     : "describe the change…"
                 }
                 aria-label="Describe the change"

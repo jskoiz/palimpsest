@@ -74,7 +74,7 @@ export const revisions = sqliteTable(
     parentRevisionId: text("parent_revision_id"),
     jobId: text("job_id").unique(),
     origin: text("origin", {
-      enum: ["seed", "demo", "openai", "revert"],
+      enum: ["seed", "demo", "openai", "placement", "revert"],
     }).notNull(),
     status: text("status", { enum: ["accepted"] }).notNull(),
     authorId: text("author_id")
@@ -175,7 +175,7 @@ export const editJobs = sqliteTable(
       ],
     }).notNull(),
     executionMode: text("execution_mode", {
-      enum: ["openai", "none"],
+      enum: ["openai", "placement", "none"],
     }).notNull(),
     authorId: text("author_id")
       .notNull()

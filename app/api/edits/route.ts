@@ -1,6 +1,5 @@
 import {
   DomainError,
-  assertReferenceEditRegion,
   normalizeDisplayName,
   normalizePrompt,
   validateRegion,
@@ -12,6 +11,10 @@ import {
   jsonError,
   readPngDimensions,
 } from "@/lib/palimpsest/runtime";
+import {
+  MAX_PLACEMENT_PNG_BYTES,
+  validatePlacementPng,
+} from "@/lib/palimpsest/png.mjs";
 import { contributionRatePolicy } from "@/lib/palimpsest/rate-policy.mjs";
 import {
   ensurePalimpsest,
@@ -37,12 +40,6 @@ export async function POST(request: Request) {
   try {
     const env = getRuntimeEnv();
     await ensurePalimpsest(env, request.url);
-    if (!env.OPENAI_API_KEY?.trim()) {
-      throw new DomainError(
-        "AI_NOT_CONFIGURED",
-        "Live AI editing is temporarily unavailable.",
-      );
-    }
     const contentLength = Number(request.headers.get("Content-Length") ?? 0);
     if (contentLength > 18 * 1024 * 1024) {
       throw new DomainError("PAYLOAD_TOO_LARGE", "The edit upload is too large.");
@@ -63,30 +60,79 @@ export async function POST(request: Request) {
     }
 
     const form = await request.formData();
-    const metaValue = form.get("meta");
-    const sourceValue = form.get("source");
-    const maskValue = form.get("mask");
-    const referenceValue = form.get("reference");
+    const allowedFields = new Set(["meta", "source", "mask", "placement"]);
+    if ([...form.keys()].some((name) => !allowedFields.has(name))) {
+      throw new DomainError(
+        "INVALID_REQUEST",
+        "The edit upload contains an unsupported multipart field.",
+      );
+    }
+    const metaValues = form.getAll("meta");
+    const sourceValues = form.getAll("source");
+    const maskValues = form.getAll("mask");
+    const placementValues = form.getAll("placement");
+    if (
+      metaValues.length !== 1 ||
+      sourceValues.length > 1 ||
+      maskValues.length > 1 ||
+      placementValues.length > 1
+    ) {
+      throw new DomainError(
+        "INVALID_REQUEST",
+        "Each edit multipart field may be supplied only once.",
+      );
+    }
+    const metaValue = metaValues[0];
+    const sourceValue = sourceValues[0] ?? null;
+    const maskValue = maskValues[0] ?? null;
+    const placementValue = placementValues[0] ?? null;
     if (typeof metaValue !== "string") {
       throw new DomainError("INVALID_REQUEST", "Edit metadata is required.");
     }
-    if (!(sourceValue instanceof File) || !(maskValue instanceof File)) {
-      throw new DomainError("INVALID_MASK", "A source context frame and PNG mask are required.");
+    for (const value of [sourceValue, maskValue, placementValue]) {
+      if (value !== null && !(value instanceof File)) {
+        throw new DomainError(
+          "INVALID_REQUEST",
+          "Edit image fields must contain files.",
+        );
+      }
     }
-    if (sourceValue.type !== "image/png" || maskValue.type !== "image/png") {
+    const hasPromptInputs =
+      sourceValue instanceof File && maskValue instanceof File;
+    const hasPlacement = placementValue instanceof File;
+    if (
+      hasPlacement
+        ? sourceValue !== null || maskValue !== null
+        : !hasPromptInputs
+    ) {
+      throw new DomainError(
+        "INVALID_REQUEST",
+        "Submit exactly one placement PNG, or one source PNG with one mask PNG.",
+      );
+    }
+    if (!env.OPENAI_API_KEY?.trim()) {
+      throw new DomainError(
+        "AI_NOT_CONFIGURED",
+        "Safety-checked image editing is temporarily unavailable.",
+      );
+    }
+    if (hasPlacement && placementValue.type !== "image/png") {
+      throw new DomainError("INVALID_REQUEST", "The placement must be a PNG file.");
+    }
+    if (
+      hasPromptInputs &&
+      (sourceValue.type !== "image/png" || maskValue.type !== "image/png")
+    ) {
       throw new DomainError("INVALID_MASK", "Source and mask files must be PNG images.");
     }
-    if (referenceValue !== null && !(referenceValue instanceof File)) {
-      throw new DomainError("INVALID_REQUEST", "The reference image upload is invalid.");
-    }
-    if (referenceValue instanceof File && referenceValue.type !== "image/png") {
-      throw new DomainError("INVALID_REQUEST", "The reference image must be a PNG file.");
-    }
-    if (sourceValue.size > 8 * 1024 * 1024 || maskValue.size > 2 * 1024 * 1024) {
+    if (
+      hasPromptInputs &&
+      (sourceValue.size > 8 * 1024 * 1024 || maskValue.size > 2 * 1024 * 1024)
+    ) {
       throw new DomainError("PAYLOAD_TOO_LARGE", "The source frame or mask is too large.");
     }
-    if (referenceValue instanceof File && referenceValue.size > 6 * 1024 * 1024) {
-      throw new DomainError("PAYLOAD_TOO_LARGE", "The reference image is too large.");
+    if (hasPlacement && placementValue.size > MAX_PLACEMENT_PNG_BYTES) {
+      throw new DomainError("PAYLOAD_TOO_LARGE", "The placement image is too large.");
     }
 
     let meta: EditMeta;
@@ -120,32 +166,26 @@ export async function POST(request: Request) {
     }
     const validated = validateRegion({
       region: meta.region,
-      fill: meta.fill,
-      strokes: meta.strokes,
+      fill: hasPlacement ? true : meta.fill,
+      strokes: hasPlacement ? [] : meta.strokes,
     });
-    if (referenceValue instanceof File) {
-      assertReferenceEditRegion(validated.region);
+    let sourceBytes: Uint8Array | undefined;
+    let maskBytes: Uint8Array | undefined;
+    let placementBytes: Uint8Array | undefined;
+    if (hasPlacement) {
+      placementBytes = new Uint8Array(await placementValue.arrayBuffer());
+      await validatePlacementPng(placementBytes);
+    } else if (hasPromptInputs) {
+      [sourceBytes, maskBytes] = await Promise.all([
+        sourceValue.arrayBuffer().then((value) => new Uint8Array(value)),
+        maskValue.arrayBuffer().then((value) => new Uint8Array(value)),
+      ]);
     }
-    const [sourceBytes, maskBytes, referenceBytes] = await Promise.all([
-      sourceValue.arrayBuffer().then((value) => new Uint8Array(value)),
-      maskValue.arrayBuffer().then((value) => new Uint8Array(value)),
-      referenceValue instanceof File
-        ? referenceValue.arrayBuffer().then((value) => new Uint8Array(value))
-        : Promise.resolve(undefined),
-    ]);
     for (const bytes of [sourceBytes, maskBytes]) {
+      if (!bytes) continue;
       const dimensions = readPngDimensions(bytes);
       if (dimensions.width !== 1024 || dimensions.height !== 1024) {
         throw new DomainError("INVALID_MASK", "Source and mask images must be exactly 1024 by 1024 pixels.");
-      }
-    }
-    if (referenceBytes) {
-      const dimensions = readPngDimensions(referenceBytes);
-      if (dimensions.width !== 1024 || dimensions.height !== 1024) {
-        throw new DomainError(
-          "INVALID_REQUEST",
-          "The reference image must be exactly 1024 by 1024 pixels.",
-        );
       }
     }
 
@@ -162,13 +202,14 @@ export async function POST(request: Request) {
       requesterHash: hash,
       sourceBytes,
       maskBytes,
-      referenceBytes,
+      placementBytes,
       rateLimits: ratePolicy.limits,
       requestId,
       retryToken,
     });
     console.info(`[palimpsest:${requestId}] contribution accepted`, {
       kind: "edit",
+      mode: hasPlacement ? "placement" : "openai",
       ratePolicy: ratePolicy.name,
     });
     return Response.json(

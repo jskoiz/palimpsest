@@ -2,14 +2,10 @@ import {
   ARTWORK_ID,
   DomainError,
   buildOpenAiEditPrompt,
-  referencePlacementRegion,
 } from "./domain.mjs";
 import {
   buildEditOutputReviewRequest,
   extractEditOutputReview,
-  buildReferenceEditReviewRequest,
-  extractReferenceEditReview,
-  referenceReviewOutcome,
 } from "./ai-review.mjs";
 import { isRetryableD1Reset, retryIdempotentD1 } from "./d1.mjs";
 import type { AppEnv } from "./runtime";
@@ -33,6 +29,8 @@ import {
   WORKER_TOTAL_BUDGET_MS,
   boundedStageTimeout,
 } from "./worker-policy.mjs";
+import { moderatePlacement } from "./moderation.mjs";
+import { validatePlacementPng } from "./png.mjs";
 
 type QueueJob = {
   id: string;
@@ -53,7 +51,8 @@ type QueueJob = {
   sourceBlobId: string | null;
   maskBlobId: string | null;
   displayMaskBlobId: string | null;
-  referenceBlobId: string | null;
+  placementBlobId: string | null;
+  executionMode: "openai" | "placement" | "none";
   leaseFence: number;
   workerToken: string;
   createdAt: number;
@@ -201,8 +200,14 @@ export const QUEUE_WORK_STATUS_SQL = `SELECT
       AND (
         (state IN ('queued', 'moderating', 'generating', 'committing')
          AND (lease_expires_at IS NULL OR lease_expires_at <= ?))
-        OR (kind = 'edit' AND execution_mode <> 'openai'
-            AND state IN ('queued', 'moderating', 'generating', 'committing'))
+        OR (
+          kind = 'edit'
+          AND (
+            execution_mode NOT IN ('openai', 'placement')
+            OR (execution_mode = 'openai' AND reference_blob_id IS NOT NULL)
+          )
+          AND state IN ('queued', 'moderating', 'generating', 'committing')
+        )
       )
     LIMIT 1
   ) AS needsRecovery`;
@@ -224,7 +229,19 @@ WHERE id = (
     AND candidate.state = 'queued'
     AND candidate.available_at <= ?
     AND candidate.lease_expires_at > ?
-    AND (candidate.kind = 'revert' OR candidate.execution_mode = 'openai')
+    AND (
+      candidate.kind = 'revert'
+      OR (
+        candidate.kind = 'edit'
+        AND (
+          (
+            candidate.execution_mode = 'openai'
+            AND candidate.reference_blob_id IS NULL
+          )
+          OR candidate.execution_mode = 'placement'
+        )
+      )
+    )
     AND NOT EXISTS (
       SELECT 1 FROM edit_jobs active
       WHERE active.artwork_id = candidate.artwork_id
@@ -261,7 +278,8 @@ RETURNING
   source_blob_id AS sourceBlobId,
   mask_blob_id AS maskBlobId,
   display_mask_blob_id AS displayMaskBlobId,
-  reference_blob_id AS referenceBlobId,
+  reference_blob_id AS placementBlobId,
+  execution_mode AS executionMode,
   lease_fence AS leaseFence,
   worker_token AS workerToken,
   created_at AS createdAt`;
@@ -316,7 +334,8 @@ export const CLAIMED_JOB_BY_TOKEN_SQL = `SELECT
   frame_x AS frameX, frame_y AS frameY,
   frame_width AS frameWidth, frame_height AS frameHeight,
   source_blob_id AS sourceBlobId, mask_blob_id AS maskBlobId,
-  display_mask_blob_id AS displayMaskBlobId, reference_blob_id AS referenceBlobId,
+  display_mask_blob_id AS displayMaskBlobId, reference_blob_id AS placementBlobId,
+  execution_mode AS executionMode,
   lease_fence AS leaseFence,
   worker_token AS workerToken, created_at AS createdAt
 FROM edit_jobs
@@ -385,14 +404,17 @@ WHERE job_id IN (
 export const RETIRE_NON_LIVE_EDIT_JOBS_SQL = `UPDATE edit_jobs
 SET state = 'failed',
     error_code = 'NON_LIVE_MODE_REMOVED',
-    public_error_message = 'This queued edit used a retired non-live renderer. Submit it again for live AI generation.',
+    public_error_message = 'This queued edit used a retired contribution format. Submit it again with the current editor.',
     worker_token = NULL,
     lease_expires_at = NULL,
     updated_at = ?,
     completed_at = ?
 WHERE artwork_id = ?
   AND kind = 'edit'
-  AND execution_mode <> 'openai'
+  AND (
+    execution_mode NOT IN ('openai', 'placement')
+    OR (execution_mode = 'openai' AND reference_blob_id IS NOT NULL)
+  )
   AND state IN ('queued', 'moderating', 'generating', 'committing')`;
 
 export const SUPERSEDE_EXPIRED_ACTIVE_RESERVATION_SQL = `UPDATE edit_jobs
@@ -552,6 +574,26 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
       throw new DomainError("INTERNAL_ERROR", "The generated layer mask is missing.");
     }
 
+    if (job.executionMode === "placement") {
+      heartbeat = startWorkerHeartbeat(env, job);
+      const patch = await loadPlacementPatch(env, job);
+      await heartbeat.checkpoint();
+      const moderation = await moderatePlacement({
+        apiKey: env.OPENAI_API_KEY,
+        prompt: job.prompt,
+        pngBytes: patch.bytes,
+      });
+      await heartbeat.checkpoint();
+      await updateStage(env, job, "moderating", "committing");
+      await heartbeat.stop();
+      heartbeat = null;
+      await commitPatch(env, job, {
+        ...patch,
+        providerRequestId: moderation.requestId,
+      });
+      return;
+    }
+
     const apiKey = env.OPENAI_API_KEY?.trim();
     if (!apiKey) {
       throw new DomainError(
@@ -562,9 +604,6 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
     const region = jobRegion(job);
     const frame = jobFrame(job);
     const generationRegion = regionInGenerationFrame(region, frame);
-    const editableRegion = job.referenceBlobId
-      ? referencePlacementRegion(generationRegion)
-      : generationRegion;
     const deadlineAt = Date.now() + WORKER_TOTAL_BUDGET_MS;
     heartbeat = startWorkerHeartbeat(env, job);
     await updateStage(env, job, "moderating", "generating");
@@ -576,75 +615,29 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
       deadlineAt,
     );
     await heartbeat.checkpoint();
-    if (job.referenceBlobId) {
-      const referenceBytes = patch.referenceBytes;
-      if (!referenceBytes) {
-        throw new DomainError("INTERNAL_ERROR", "The reference image could not be reviewed.");
-      }
-      await updateStage(env, job, "generating", "generating");
-      const review = await reviewReferenceEdit(
-        apiKey,
-        job.prompt,
-        patch.bytes,
-        patch.sourceBytes,
-        referenceBytes,
-        patch.providerMaskBytes,
-        editableRegion,
-        deadlineAt,
+    await updateStage(env, job, "generating", "generating");
+    const review = await reviewEditOutput(
+      apiKey,
+      job.prompt,
+      patch.bytes,
+      patch.providerMaskBytes,
+      generationRegion,
+      deadlineAt,
+    );
+    await heartbeat.checkpoint();
+    console.info(`[palimpsest:${job.id}] edit output review`, {
+      subjectContained: review.contained,
+      surroundingsBlended: review.blended,
+      reviewerReason: review.reason.slice(0, 240),
+    });
+    if (!review.contained || !review.blended) {
+      throw new DomainError(
+        "SUBJECT_OUT_OF_FRAME",
+        reviewFailureMessage(
+          "The generated edit did not pass the framing and blending check. Nothing was added to history; use retry for one fresh attempt.",
+          review.reason,
+        ),
       );
-      await heartbeat.checkpoint();
-      console.info(`[palimpsest:${job.id}] reference edit review`, {
-        subjectContained: review?.contained ?? null,
-        referenceFaithful: review?.faithful ?? null,
-        placementMatched: review?.placementMatched ?? null,
-        surroundingsBlended: review?.blended ?? null,
-        sourcePreserved: review?.sourcePreserved ?? null,
-        reviewerReason: review?.reason.slice(0, 240) ?? null,
-      });
-      const outcome = referenceReviewOutcome(review);
-      if (outcome === "reject-containment") {
-        throw new DomainError(
-          "SUBJECT_OUT_OF_FRAME",
-          reviewFailureMessage(
-            "The generated reference did not match the selected placement. Nothing was added to history; move or enlarge the patch and submit again.",
-            review.reason,
-          ),
-        );
-      }
-      if (outcome === "reject-reference") {
-        throw new DomainError(
-          "REFERENCE_REVIEW_FAILED",
-          reviewFailureMessage(
-            "The generated edit did not pass the reference and blending check. Nothing was added to history; use retry for one fresh attempt.",
-            review.reason,
-          ),
-        );
-      }
-    } else {
-      await updateStage(env, job, "generating", "generating");
-      const review = await reviewEditOutput(
-        apiKey,
-        job.prompt,
-        patch.bytes,
-        patch.providerMaskBytes,
-        editableRegion,
-        deadlineAt,
-      );
-      await heartbeat.checkpoint();
-      console.info(`[palimpsest:${job.id}] edit output review`, {
-        subjectContained: review.contained,
-        surroundingsBlended: review.blended,
-        reviewerReason: review.reason.slice(0, 240),
-      });
-      if (!review.contained || !review.blended) {
-        throw new DomainError(
-          "SUBJECT_OUT_OF_FRAME",
-          reviewFailureMessage(
-            "The generated edit did not pass the framing and blending check. Nothing was added to history; use retry for one fresh attempt.",
-            review.reason,
-          ),
-        );
-      }
     }
 
     await updateStage(env, job, "generating", "committing");
@@ -655,6 +648,45 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
     if (heartbeat) await heartbeat.stop();
     await handleFailure(env, job, error);
   }
+}
+
+async function loadPlacementPatch(
+  env: AppEnv,
+  job: QueueJob,
+): Promise<{ bytes: Uint8Array; contentType: string }> {
+  if (!job.placementBlobId) {
+    throw new DomainError("INTERNAL_ERROR", "The uploaded placement layer is missing.");
+  }
+  const record = await getBlobRecord(env, job.placementBlobId);
+  if (!record || record.kind !== "input" || record.contentType !== "image/png") {
+    throw new DomainError(
+      "PROVIDER_TEMPORARY",
+      "The uploaded placement layer could not be resolved.",
+    );
+  }
+  const object = await env.BLOBS.get(record.r2Key);
+  if (!object) {
+    throw new DomainError(
+      "PROVIDER_TEMPORARY",
+      "The uploaded placement layer is no longer available.",
+    );
+  }
+  const bytes = new Uint8Array(await object.arrayBuffer());
+  if (await sha256Hex(bytes) !== record.sha256) {
+    throw new DomainError(
+      "PROVIDER_TEMPORARY",
+      "The uploaded placement layer failed storage integrity validation.",
+    );
+  }
+  try {
+    await validatePlacementPng(bytes);
+  } catch {
+    throw new DomainError(
+      "PROVIDER_TEMPORARY",
+      "The uploaded placement layer failed storage integrity validation.",
+    );
+  }
+  return { bytes, contentType: "image/png" };
 }
 
 async function updateStage(
@@ -706,41 +738,28 @@ async function generateOpenAiPatch(
   contentType: string;
   providerRequestId?: string;
   providerMaskBytes: Uint8Array;
-  sourceBytes: Uint8Array;
-  referenceBytes: Uint8Array | null;
 }> {
   if (!job.sourceBlobId || !job.maskBlobId) {
     throw new DomainError("INTERNAL_ERROR", "The image-edit inputs are missing.");
   }
-  const [sourceRecord, maskRecord, referenceRecord] = await Promise.all([
+  const [sourceRecord, maskRecord] = await Promise.all([
     getBlobRecord(env, job.sourceBlobId),
     getBlobRecord(env, job.maskBlobId),
-    job.referenceBlobId ? getBlobRecord(env, job.referenceBlobId) : Promise.resolve(null),
   ]);
   if (!sourceRecord || !maskRecord) {
     throw new DomainError("INTERNAL_ERROR", "The image-edit inputs could not be resolved.");
   }
-  if (job.referenceBlobId && !referenceRecord) {
-    throw new DomainError("INTERNAL_ERROR", "The reference image could not be resolved.");
-  }
-  const [source, mask, reference] = await Promise.all([
+  const [source, mask] = await Promise.all([
     env.BLOBS.get(sourceRecord.r2Key),
     env.BLOBS.get(maskRecord.r2Key),
-    referenceRecord ? env.BLOBS.get(referenceRecord.r2Key) : Promise.resolve(null),
   ]);
   if (!source || !mask) {
     throw new DomainError("INTERNAL_ERROR", "The image-edit inputs are no longer available.");
   }
-  if (referenceRecord && !reference) {
-    throw new DomainError("INTERNAL_ERROR", "The reference image is no longer available.");
-  }
 
-  const [sourceBytes, providerMaskBytes, referenceBytes] = await Promise.all([
+  const [sourceBytes, providerMaskBytes] = await Promise.all([
     source.arrayBuffer().then((value) => new Uint8Array(value)),
     mask.arrayBuffer().then((value) => new Uint8Array(value)),
-    reference
-      ? reference.arrayBuffer().then((value) => new Uint8Array(value))
-      : Promise.resolve(null),
   ]);
 
   const form = new FormData();
@@ -751,14 +770,6 @@ async function generateOpenAiPatch(
       type: "image/png",
     }),
   );
-  if (referenceBytes) {
-    form.append(
-      "image[]",
-      new File([referenceBytes], "palimpsest-reference.png", {
-        type: "image/png",
-      }),
-    );
-  }
   form.append(
     "mask",
     new File([providerMaskBytes], "palimpsest-mask.png", {
@@ -767,10 +778,7 @@ async function generateOpenAiPatch(
   );
   form.append(
     "prompt",
-    buildOpenAiEditPrompt(
-      requestedPrompt,
-      Boolean(reference),
-    ),
+    buildOpenAiEditPrompt(requestedPrompt),
   );
   form.append("size", "1024x1024");
   form.append("quality", "medium");
@@ -861,8 +869,6 @@ async function generateOpenAiPatch(
     contentType: "image/png",
     providerRequestId,
     providerMaskBytes,
-    sourceBytes,
-    referenceBytes,
   };
 }
 
@@ -925,65 +931,6 @@ async function reviewEditOutput(
     throw new DomainError(
       "PROVIDER_TEMPORARY",
       "The generated image returned no usable framing review. Nothing was added to history.",
-    );
-  }
-  return review;
-}
-
-async function reviewReferenceEdit(
-  apiKey: string,
-  requestedChange: string,
-  generatedBytes: Uint8Array,
-  sourceBytes: Uint8Array,
-  referenceBytes: Uint8Array,
-  providerMaskBytes: Uint8Array,
-  editableRegion: GlobalRegion,
-  deadlineAt: number,
-) {
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    providerStageTimeout(deadlineAt, EDIT_REVIEW_TIMEOUT_MS),
-  );
-  let response: Response;
-  let body: { output?: Array<unknown> } | null;
-  try {
-    response = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(buildReferenceEditReviewRequest({
-        requestedChange,
-        generatedImageUrl: imageDataUrl(generatedBytes),
-        sourceImageUrl: imageDataUrl(sourceBytes),
-        referenceImageUrl: imageDataUrl(referenceBytes),
-        providerMaskUrl: imageDataUrl(providerMaskBytes),
-        editableRegion,
-      })),
-      signal: controller.signal,
-    });
-    body = (await response.json().catch(() => null)) as typeof body;
-  } catch {
-    throw new DomainError(
-      "PROVIDER_TEMPORARY",
-      "The generated image could not be checked for reference fidelity. Nothing was added to history.",
-    );
-  } finally {
-    clearTimeout(timeout);
-  }
-  if (!response.ok) {
-    throw new DomainError(
-      "PROVIDER_TEMPORARY",
-      "The generated image could not be checked for reference fidelity. Nothing was added to history.",
-    );
-  }
-  const review = extractReferenceEditReview(body);
-  if (!review) {
-    throw new DomainError(
-      "PROVIDER_TEMPORARY",
-      "The generated image returned no usable reference review. Nothing was added to history.",
     );
   }
   return review;
@@ -1150,7 +1097,23 @@ JOIN artwork_commit_locks commit_lock
   ON commit_lock.artwork_id = job.artwork_id
 WHERE job.state = 'committing'
   AND job.kind = 'edit'
-  AND job.execution_mode = 'openai'
+  AND (
+    (
+      job.execution_mode = 'openai'
+      AND job.reference_blob_id IS NULL
+    )
+    OR (
+      job.execution_mode = 'placement'
+      AND job.reference_blob_id IS NOT NULL
+      AND EXISTS (
+        SELECT 1
+        FROM blobs placement
+        WHERE placement.id = job.reference_blob_id
+          AND placement.artwork_id = job.artwork_id
+          AND placement.kind = 'input'
+      )
+    )
+  )
   AND job.worker_token = c.worker_token
   AND job.lease_fence = c.lease_fence
   AND job.lease_expires_at > c.now_ms
@@ -1192,13 +1155,54 @@ async function commitPatch(
   }
 
   const revisionId = crypto.randomUUID();
-  const blobId = crypto.randomUUID();
-  const hash = await sha256Hex(patch.bytes);
-  const key = `artworks/palimpsest/patches/${revisionId}/frame-${frame.x}-${frame.y}-${hash}.png`;
-  await env.BLOBS.put(key, patch.bytes, {
-    httpMetadata: { contentType: patch.contentType },
-    customMetadata: { sha256: hash, immutable: "true" },
-  });
+  const placementBlobId =
+    job.executionMode === "placement" ? job.placementBlobId : null;
+  if (job.executionMode === "placement" && !placementBlobId) {
+    throw new DomainError("INTERNAL_ERROR", "The uploaded placement layer is missing.");
+  }
+  const blobId = placementBlobId ?? crypto.randomUUID();
+  let insertOrPromoteBlob: D1PreparedStatement;
+  if (job.executionMode === "placement") {
+    insertOrPromoteBlob = env.DB.prepare(
+      `UPDATE blobs
+       SET kind = 'patch'
+       WHERE id = ?
+         AND artwork_id = ?
+         AND kind = 'input'
+         AND EXISTS (SELECT 1 FROM revisions WHERE id = ?)
+         AND EXISTS (
+           SELECT 1 FROM edit_jobs
+           WHERE id = ?
+             AND execution_mode = 'placement'
+             AND reference_blob_id = ?
+         )`,
+    ).bind(blobId, ARTWORK_ID, revisionId, job.id, blobId);
+  } else {
+    const hash = await sha256Hex(patch.bytes);
+    const key =
+      `artworks/palimpsest/patches/${revisionId}/frame-${frame.x}-${frame.y}-${hash}.png`;
+    await env.BLOBS.put(key, patch.bytes, {
+      httpMetadata: { contentType: patch.contentType },
+      customMetadata: { sha256: hash, immutable: "true" },
+    });
+    insertOrPromoteBlob = env.DB.prepare(
+      `INSERT INTO blobs (
+         id, artwork_id, kind, r2_key, content_type, byte_length,
+         sha256, width, height, created_at
+       )
+       SELECT ?, ?, 'patch', ?, ?, ?, ?, 1024, 1024, ?
+       WHERE EXISTS (SELECT 1 FROM revisions WHERE id = ?)`,
+    ).bind(
+      blobId,
+      ARTWORK_ID,
+      key,
+      patch.contentType,
+      patch.bytes.byteLength,
+      hash,
+      Date.now(),
+      revisionId,
+    );
+  }
 
   const lock = await acquireCommitLock(env, job.id);
   try {
@@ -1214,35 +1218,21 @@ async function commitPatch(
         lock.fence,
         now,
       ),
-      env.DB.prepare(
-        `INSERT INTO blobs (
-           id, artwork_id, kind, r2_key, content_type, byte_length,
-           sha256, width, height, created_at
-         )
-         SELECT ?, ?, 'patch', ?, ?, ?, ?, 1024, 1024, ?
-         WHERE EXISTS (SELECT 1 FROM revisions WHERE id = ?)`,
-      ).bind(
-        blobId,
-        ARTWORK_ID,
-        key,
-        patch.contentType,
-        patch.bytes.byteLength,
-        hash,
-        now,
-        revisionId,
-      ),
+      insertOrPromoteBlob,
       env.DB.prepare(
         `INSERT INTO revision_patches (
            revision_id, patch_blob_id, display_mask_blob_id,
            frame_x, frame_y, frame_width, frame_height
          )
-         SELECT ?, ?, ?, frame_x, frame_y, frame_width, frame_height
-         FROM edit_jobs
-         WHERE id = ? AND EXISTS (SELECT 1 FROM revisions WHERE id = ?)`,
+         SELECT ?, ?, ?, job.frame_x, job.frame_y, job.frame_width, job.frame_height
+         FROM edit_jobs job
+         JOIN blobs patch ON patch.id = ? AND patch.kind = 'patch'
+         WHERE job.id = ? AND EXISTS (SELECT 1 FROM revisions WHERE id = ?)`,
       ).bind(
         revisionId,
         blobId,
         displayMaskBlobId,
+        blobId,
         job.id,
         revisionId,
       ),
@@ -1252,10 +1242,20 @@ async function commitPatch(
              head_sequence = (SELECT sequence FROM revisions WHERE id = ?)
          WHERE id = ?
            AND EXISTS (SELECT 1 FROM revisions WHERE id = ?)
+           AND EXISTS (
+             SELECT 1 FROM revision_patches WHERE revision_id = ?
+           )
            AND head_revision_id = (
              SELECT parent_revision_id FROM revisions WHERE id = ?
            )`,
-      ).bind(revisionId, revisionId, ARTWORK_ID, revisionId, revisionId),
+      ).bind(
+        revisionId,
+        revisionId,
+        ARTWORK_ID,
+        revisionId,
+        revisionId,
+        revisionId,
+      ),
       env.DB.prepare(
         `UPDATE edit_jobs
          SET state = 'succeeded',
@@ -1268,7 +1268,14 @@ async function commitPatch(
          WHERE id = ?
            AND worker_token = ?
            AND lease_fence = ?
-           AND EXISTS (SELECT 1 FROM revisions WHERE id = ?)`,
+           AND EXISTS (SELECT 1 FROM revisions WHERE id = ?)
+           AND EXISTS (
+             SELECT 1 FROM revision_patches WHERE revision_id = ?
+           )
+           AND EXISTS (
+             SELECT 1 FROM artworks
+             WHERE id = ? AND head_revision_id = ?
+           )`,
       ).bind(
         revisionId,
         patch.providerRequestId ?? null,
@@ -1277,6 +1284,9 @@ async function commitPatch(
         job.id,
         job.workerToken,
         job.leaseFence,
+        revisionId,
+        revisionId,
+        ARTWORK_ID,
         revisionId,
       ),
       env.DB.prepare(
@@ -1291,6 +1301,17 @@ async function commitPatch(
       throw new DomainError(
         "STALE_BASE_REVISION",
         "This generated patch could not be rebased safely. Nothing was added to history.",
+      );
+    }
+    if (
+      Number(committed[1]?.meta.changes ?? 0) !== 1 ||
+      Number(committed[2]?.meta.changes ?? 0) !== 1 ||
+      Number(committed[3]?.meta.changes ?? 0) !== 1 ||
+      Number(committed[4]?.meta.changes ?? 0) !== 1
+    ) {
+      throw new DomainError(
+        "INTERNAL_ERROR",
+        "The accepted patch could not be committed completely.",
       );
     }
   } finally {

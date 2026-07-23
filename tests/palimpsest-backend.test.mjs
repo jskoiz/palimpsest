@@ -233,6 +233,8 @@ function insertCommittingJob(db, {
   region,
   now,
   baseRevisionId = "r0",
+  executionMode = "openai",
+  placementBlobId = null,
   token = `worker-${id}`,
   fence = 1,
 }) {
@@ -241,18 +243,21 @@ function insertCommittingJob(db, {
       id, artwork_id, kind, state, execution_mode, author_id, requester_hash,
       base_revision_id, prompt, region_x, region_y, region_width, region_height,
       frame_x, frame_y, frame_width, frame_height, display_mask_blob_id,
+      reference_blob_id,
       idempotency_key, request_fingerprint, available_at, worker_token,
       lease_fence, lease_expires_at, created_at, updated_at
-    ) VALUES (?, 'palimpsest', 'edit', 'committing', 'openai', 'author-a', 'shared-nat',
+    ) VALUES (?, 'palimpsest', 'edit', 'committing', ?, 'author-a', 'shared-nat',
       ?, 'Commit patch', ?, ?, ?, ?, 0, 0, 1024, 1024, 'display-mask',
-      ?, ?, ?, ?, ?, ?, ?, ?)
+      ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
+    executionMode,
     baseRevisionId,
     region.x,
     region.y,
     region.width,
     region.height,
+    placementBlobId,
     `idem-${id}`,
     `fingerprint-${id}`,
     now,
@@ -1236,13 +1241,14 @@ test("full-artwork reverts wait for every active reservation", async () => {
   db.close();
 });
 
-test("queue retires non-live jobs before claiming independent live work", async () => {
+test("queue skips and retires obsolete edit shapes before claiming canonical work", async () => {
   const db = await migratedDatabase();
   seedArtwork(db);
-  const [insertSql, claimSql, retireSql] = await Promise.all([
+  const [insertSql, claimSql, retireSql, workStatusSql] = await Promise.all([
     readSqlConstant("lib/palimpsest/store.ts", "INSERT_EDIT_RESERVATION_SQL"),
     readSqlConstant("lib/palimpsest/queue.ts", "CLAIM_NEXT_JOB_SQL"),
     readSqlConstant("lib/palimpsest/queue.ts", "RETIRE_NON_LIVE_EDIT_JOBS_SQL"),
+    readSqlConstant("lib/palimpsest/queue.ts", "QUEUE_WORK_STATUS_SQL"),
   ]);
   const now = 30_000;
   const insert = db.prepare(insertSql);
@@ -1255,22 +1261,54 @@ test("queue retires non-live jobs before claiming independent live work", async 
   retiredValues[2] = "demo";
   insert.run(...retiredValues);
   insert.run(...reservationValues({
-    jobId: "claim-a",
+    jobId: "queued-legacy-reference",
     authorId: "author-a",
     region: { x: 0, y: 0, width: 100, height: 100 },
-    now,
-    referenceBlobId: "reference-claim-a",
+    now: now - 2,
+    referenceBlobId: "legacy-reference-a",
   }));
   insert.run(...reservationValues({
-    jobId: "claim-b",
+    jobId: "active-legacy-reference",
     authorId: "author-b",
+    region: { x: 250, y: 250, width: 100, height: 100 },
+    now: now - 1,
+    referenceBlobId: "legacy-reference-b",
+  }));
+  db.exec(`
+    UPDATE edit_jobs
+    SET state = 'moderating', worker_token = 'legacy-worker'
+    WHERE id = 'active-legacy-reference';
+  `);
+  const placementValues = reservationValues({
+    jobId: "claim-placement",
+    authorId: "author-a",
     region: { x: 500, y: 500, width: 100, height: 100 },
+    now,
+    referenceBlobId: "placement-claim",
+  });
+  placementValues[2] = "placement";
+  placementValues[15] = null;
+  placementValues[16] = null;
+  insert.run(...placementValues);
+  insert.run(...reservationValues({
+    jobId: "claim-openai",
+    authorId: "author-c",
+    region: { x: 1500, y: 1500, width: 100, height: 100 },
     now: now + 1,
   }));
 
-  assert.equal(
-    db.prepare(retireSql).run(now + 2, now + 2, "palimpsest").changes,
-    1,
+  assert.deepEqual(
+    {
+      ...db.prepare(workStatusSql).get(
+        "palimpsest",
+        Number.MAX_SAFE_INTEGER,
+        now + 2,
+        now + 2,
+        "palimpsest",
+        now + 2,
+      ),
+    },
+    { hasReady: 1, needsRecovery: 1 },
   );
 
   const claim = db.prepare(claimSql);
@@ -1286,6 +1324,15 @@ test("queue retires non-live jobs before claiming independent live work", async 
     now + 2,
     now + 2,
   );
+  assert.equal(first.id, "claim-placement");
+  assert.equal(first.executionMode, "placement");
+  assert.equal(first.placementBlobId, "placement-claim");
+
+  assert.equal(
+    db.prepare(retireSql).run(now + 2, now + 2, "palimpsest").changes,
+    3,
+  );
+
   const second = claim.get(
     "worker-b",
     now + 60_000,
@@ -1298,18 +1345,162 @@ test("queue retires non-live jobs before claiming independent live work", async 
     now + 2,
     now + 2,
   );
-  assert.deepEqual(new Set([first.id, second.id]), new Set(["claim-a", "claim-b"]));
-  assert.equal(first.referenceBlobId, "reference-claim-a");
+  assert.equal(second.id, "claim-openai");
+  assert.equal(second.executionMode, "openai");
+  assert.equal(second.placementBlobId, null);
   assert.equal(first.state, "moderating");
   assert.equal(second.state, "moderating");
   assert.notEqual(first.workerToken, second.workerToken);
   assert.deepEqual(
+    db.prepare(
+      `SELECT id, state, error_code, worker_token, lease_expires_at
+       FROM edit_jobs
+       WHERE id IN (
+         'claim-retired',
+         'queued-legacy-reference',
+         'active-legacy-reference'
+       )
+       ORDER BY id`,
+    ).all().map((row) => ({ ...row })),
+    [
+      {
+        id: "active-legacy-reference",
+        state: "failed",
+        error_code: "NON_LIVE_MODE_REMOVED",
+        worker_token: null,
+        lease_expires_at: null,
+      },
+      {
+        id: "claim-retired",
+        state: "failed",
+        error_code: "NON_LIVE_MODE_REMOVED",
+        worker_token: null,
+        lease_expires_at: null,
+      },
+      {
+        id: "queued-legacy-reference",
+        state: "failed",
+        error_code: "NON_LIVE_MODE_REMOVED",
+        worker_token: null,
+        lease_expires_at: null,
+      },
+    ],
+  );
+  db.close();
+});
+
+test("placement jobs are claimed without provider mode coercion", async () => {
+  const db = await migratedDatabase();
+  seedArtwork(db);
+  const [insertSql, claimSql] = await Promise.all([
+    readSqlConstant("lib/palimpsest/store.ts", "INSERT_EDIT_RESERVATION_SQL"),
+    readSqlConstant("lib/palimpsest/queue.ts", "CLAIM_NEXT_JOB_SQL"),
+  ]);
+  const now = 35_000;
+  const values = reservationValues({
+    jobId: "claim-placement",
+    authorId: "author-a",
+    region: { x: 200, y: 300, width: 149, height: 224 },
+    now,
+    referenceBlobId: "placement-blob",
+  });
+  values[2] = "placement";
+  assert.equal(db.prepare(insertSql).run(...values).changes, 1);
+
+  const claimed = db.prepare(claimSql).get(
+    "placement-worker",
+    now + 60_000,
+    now,
+    now,
+    "palimpsest",
+    now,
+    now,
+    now,
+    now,
+    now,
+  );
+  assert.equal(claimed.id, "claim-placement");
+  assert.equal(claimed.state, "moderating");
+  assert.equal(claimed.executionMode, "placement");
+  assert.equal(claimed.placementBlobId, "placement-blob");
+  db.close();
+});
+
+test("rejected placement moderation cannot create permanent history", async () => {
+  const db = await migratedDatabase();
+  seedArtwork(db);
+  const [insertSql, claimSql, failSql] = await Promise.all([
+    readSqlConstant("lib/palimpsest/store.ts", "INSERT_EDIT_RESERVATION_SQL"),
+    readSqlConstant("lib/palimpsest/queue.ts", "CLAIM_NEXT_JOB_SQL"),
+    readSqlConstant("lib/palimpsest/queue.ts", "FAIL_CLAIMED_JOB_SQL"),
+  ]);
+  const now = 37_000;
+  const values = reservationValues({
+    jobId: "flagged-placement",
+    authorId: "author-a",
+    region: { x: 200, y: 300, width: 149, height: 224 },
+    now,
+    referenceBlobId: "flagged-placement-blob",
+  });
+  values[2] = "placement";
+  values[15] = null;
+  values[16] = null;
+  assert.equal(db.prepare(insertSql).run(...values).changes, 1);
+
+  const claimed = db.prepare(claimSql).get(
+    "moderation-worker",
+    now + 60_000,
+    now,
+    now,
+    "palimpsest",
+    now,
+    now,
+    now,
+    now,
+    now,
+  );
+  assert.equal(claimed.id, "flagged-placement");
+  assert.equal(claimed.executionMode, "placement");
+  assert.equal(claimed.state, "moderating");
+
+  assert.equal(
+    db.prepare(failSql).run(
+      "rejected",
+      "CONTENT_POLICY",
+      "The placement did not meet safety requirements.",
+      now + 1,
+      now + 1,
+      claimed.id,
+      claimed.workerToken,
+      claimed.leaseFence,
+    ).changes,
+    1,
+  );
+  assert.deepEqual(
     {
       ...db.prepare(
-        "SELECT state, error_code FROM edit_jobs WHERE id = 'claim-retired'",
+        "SELECT state, error_code, result_revision_id FROM edit_jobs WHERE id = 'flagged-placement'",
       ).get(),
     },
-    { state: "failed", error_code: "NON_LIVE_MODE_REMOVED" },
+    {
+      state: "rejected",
+      error_code: "CONTENT_POLICY",
+      result_revision_id: null,
+    },
+  );
+  assert.equal(
+    db.prepare(
+      "SELECT COUNT(*) AS count FROM revisions WHERE job_id = 'flagged-placement'",
+    ).get().count,
+    0,
+  );
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        "SELECT head_revision_id, head_sequence FROM artworks WHERE id = 'palimpsest'",
+      ).get(),
+    },
+    { head_revision_id: "r0", head_sequence: 0 },
   );
   db.close();
 });
@@ -1382,6 +1573,57 @@ test("stale non-overlapping generation rebases onto the current head", async () 
       ).get(),
     },
     { sequence: 2, parent_revision_id: "r1" },
+  );
+  db.close();
+});
+
+test("placement revisions commit under the same fenced history contract", async () => {
+  const db = await migratedDatabase();
+  seedArtwork(db);
+  db.exec(`
+    INSERT INTO blobs (
+      id, artwork_id, kind, r2_key, content_type, byte_length,
+      sha256, width, height, created_at
+    ) VALUES (
+      'placement-commit-input', 'palimpsest', 'input', 'placement-commit.png',
+      'image/png', 1, 'placement-commit-hash', 1024, 1024, 1
+    );
+  `);
+  const now = 45_000;
+  const lease = insertCommittingJob(db, {
+    id: "placement-commit",
+    region: { x: 200, y: 300, width: 149, height: 224 },
+    now,
+    executionMode: "placement",
+    placementBlobId: "placement-commit-input",
+  });
+  const commitSql = await readSqlConstant(
+    "lib/palimpsest/queue.ts",
+    "COMMIT_PATCH_REVISION_SQL",
+  );
+  assert.equal(
+    db.prepare(commitSql).run(
+      "placement-revision",
+      "placement-commit",
+      lease.token,
+      lease.fence,
+      lease.commitToken,
+      lease.fence,
+      now + 1,
+    ).changes,
+    1,
+  );
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        "SELECT origin, parent_revision_id, sequence FROM revisions WHERE id = 'placement-revision'",
+      ).get(),
+    },
+    {
+      origin: "placement",
+      parent_revision_id: "r0",
+      sequence: 1,
+    },
   );
   db.close();
 });
@@ -1568,5 +1810,165 @@ test("safe manual retry creates one immutable successor and keeps the failure vi
   assert.equal(parent.retryable, 0, "a parent with an existing successor is no longer retryable");
   assert.equal(reviewParent.errorCode, "SUBJECT_OUT_OF_FRAME");
   assert.equal(reviewParent.retryable, 0);
+  db.close();
+});
+
+test("legacy OpenAI reference failures cannot retry as prompt-only jobs", async () => {
+  const db = await migratedDatabase();
+  seedArtwork(db);
+  db.exec(`
+    INSERT INTO blobs (
+      id, artwork_id, kind, r2_key, content_type, byte_length,
+      sha256, width, height, created_at
+    ) VALUES
+      ('legacy-source', 'palimpsest', 'input', 'legacy-source.png',
+        'image/png', 1, 'legacy-source-hash', 1024, 1024, 1),
+      ('legacy-mask', 'palimpsest', 'mask', 'legacy-mask.png',
+        'image/png', 1, 'legacy-mask-hash', 1024, 1024, 1),
+      ('legacy-display', 'palimpsest', 'display_mask', 'legacy-display.svg',
+        'image/svg+xml', 1, 'legacy-display-hash', 1024, 1024, 1),
+      ('legacy-reference', 'palimpsest', 'input', 'legacy-reference.png',
+        'image/png', 1, 'legacy-reference-hash', 1024, 1024, 1);
+    INSERT INTO edit_jobs (
+      id, artwork_id, kind, state, execution_mode, author_id, requester_hash,
+      base_revision_id, prompt, region_x, region_y, region_width, region_height,
+      frame_x, frame_y, frame_width, frame_height,
+      source_blob_id, mask_blob_id, display_mask_blob_id, reference_blob_id,
+      idempotency_key, request_fingerprint, retry_token_hash, request_id,
+      available_at, lease_expires_at, error_code, public_error_message,
+      created_at, updated_at, completed_at
+    ) VALUES (
+      'failed-legacy-reference', 'palimpsest', 'edit', 'failed', 'openai',
+      'author-a', 'owner', 'r0', 'Old reference prompt', 10, 20, 100, 120,
+      0, 0, 1024, 1024, 'legacy-source', 'legacy-mask', 'legacy-display',
+      'legacy-reference', 'legacy-parent-key', 'legacy-fingerprint',
+      'legacy-token-hash', 'legacy-request', 1, NULL, 'PROVIDER_TEMPORARY',
+      'Try again.', 1000, 2000, 2000
+    );
+  `);
+  const [retrySql, recentSql] = await Promise.all([
+    readSqlConstant("lib/palimpsest/store.ts", "INSERT_RETRY_JOB_SQL"),
+    readSqlConstant("lib/palimpsest/store.ts", "RECENT_JOBS_SQL"),
+  ]);
+  const recent = db.prepare(recentSql).all(
+    2500,
+    "palimpsest",
+    "palimpsest",
+  );
+  assert.equal(
+    recent.find((row) => row.jobId === "failed-legacy-reference").retryable,
+    0,
+  );
+  assert.equal(
+    db.prepare(retrySql).run(
+      "legacy-retry-child",
+      "failed-legacy-reference",
+      "palimpsest",
+      "owner",
+      "legacy-token-hash",
+      "legacy-child-key",
+      "legacy-child-request",
+      3000,
+      63000,
+      0,
+      0,
+      3,
+      0,
+      12,
+    ).changes,
+    0,
+  );
+  assert.equal(
+    db.prepare(
+      "SELECT COUNT(*) AS count FROM edit_jobs WHERE retry_of_job_id = 'failed-legacy-reference'",
+    ).get().count,
+    0,
+  );
+  db.close();
+});
+
+test("placement retry reuses one canonical PNG blob without source or mask copies", async () => {
+  const db = await migratedDatabase();
+  seedArtwork(db);
+  db.exec(`
+    INSERT INTO blobs (
+      id, artwork_id, kind, r2_key, content_type, byte_length,
+      sha256, width, height, created_at
+    ) VALUES
+      ('placement-input', 'palimpsest', 'input', 'placement.png', 'image/png',
+        1, 'placement-hash', 1024, 1024, 1),
+      ('placement-display', 'palimpsest', 'display_mask', 'placement-display.svg',
+        'image/svg+xml', 1, 'display-hash', 1024, 1024, 1);
+    INSERT INTO edit_jobs (
+      id, artwork_id, kind, state, execution_mode, author_id, requester_hash,
+      base_revision_id, prompt, region_x, region_y, region_width, region_height,
+      frame_x, frame_y, frame_width, frame_height,
+      source_blob_id, mask_blob_id, display_mask_blob_id, reference_blob_id,
+      idempotency_key, request_fingerprint, retry_token_hash, request_id,
+      available_at, lease_expires_at, error_code, public_error_message,
+      created_at, updated_at, completed_at
+    ) VALUES (
+      'failed-placement', 'palimpsest', 'edit', 'failed', 'placement',
+      'author-a', 'owner', 'r0', 'Place mascot', 20, 30, 149, 224,
+      0, 0, 1024, 1024, NULL, NULL, 'placement-display', 'placement-input',
+      'placement-parent-key', 'placement-fingerprint', 'placement-token-hash',
+      'placement-parent-request', 1, NULL, 'PROVIDER_TEMPORARY',
+      'Safety review was temporarily unavailable.', 1000, 2000, 2000
+    );
+  `);
+  const [retrySql, recentSql] = await Promise.all([
+    readSqlConstant("lib/palimpsest/store.ts", "INSERT_RETRY_JOB_SQL"),
+    readSqlConstant("lib/palimpsest/store.ts", "RECENT_JOBS_SQL"),
+  ]);
+  const beforeRetry = db.prepare(recentSql).all(
+    2500,
+    "palimpsest",
+    "palimpsest",
+  );
+  assert.equal(
+    beforeRetry.find((row) => row.jobId === "failed-placement").retryable,
+    1,
+  );
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM blobs").get().count, 2);
+
+  const values = [
+    "placement-retry",
+    "failed-placement",
+    "palimpsest",
+    "owner",
+    "placement-token-hash",
+    "placement-child-key",
+    "placement-child-request",
+    3000,
+    63000,
+    0,
+    0,
+    3,
+    0,
+    12,
+  ];
+  assert.equal(db.prepare(retrySql).run(...values).changes, 1);
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        `SELECT execution_mode, source_blob_id, mask_blob_id,
+                display_mask_blob_id, reference_blob_id, retry_of_job_id
+         FROM edit_jobs WHERE id = 'placement-retry'`,
+      ).get(),
+    },
+    {
+      execution_mode: "placement",
+      source_blob_id: null,
+      mask_blob_id: null,
+      display_mask_blob_id: "placement-display",
+      reference_blob_id: "placement-input",
+      retry_of_job_id: "failed-placement",
+    },
+  );
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS count FROM blobs").get().count,
+    2,
+    "retry must reuse the immutable placement and display mask blobs",
+  );
   db.close();
 });
