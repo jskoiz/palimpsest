@@ -538,7 +538,13 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
       Boolean(job.referenceBlobId),
     );
     await updateStage(env, job, "moderating", "generating");
-    let patch = await generateOpenAiPatch(env, job, apiKey, plannedPrompt);
+    let patch = await generateOpenAiPatch(
+      env,
+      job,
+      apiKey,
+      plannedPrompt,
+      job.referenceBlobId ? "high" : "medium",
+    );
     if (job.referenceBlobId) {
       const referenceBytes = patch.referenceBytes;
       if (!referenceBytes) {
@@ -576,6 +582,7 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
           job,
           apiKey,
           referenceRetryPrompt(plannedPrompt, review),
+          "medium",
         );
       }
     } else {
@@ -613,6 +620,7 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
           job,
           apiKey,
           generalRetryPrompt(plannedPrompt, review),
+          "medium",
         );
       }
     }
@@ -786,6 +794,7 @@ async function generateOpenAiPatch(
   job: QueueJob,
   apiKey: string,
   plannedPrompt: string,
+  quality: "medium" | "high",
 ): Promise<{
   bytes: Uint8Array;
   contentType: string;
@@ -851,7 +860,7 @@ async function generateOpenAiPatch(
   );
   form.append("prompt", buildOpenAiEditPrompt(plannedPrompt, Boolean(reference)));
   form.append("size", "1024x1024");
-  form.append("quality", referenceBytes ? "high" : "medium");
+  form.append("quality", quality);
   form.append("output_format", "png");
   form.append("moderation", "auto");
 

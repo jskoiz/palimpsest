@@ -518,7 +518,9 @@ test("reference images stay optional, visible in the patch, and reach live gener
   assert.doesNotMatch(storeSource, /kind[^\n]*'reference'|VALUES \([^\n]*'reference'/);
   assert.match(storeSource, /referenceBlobId,[\s\S]*VALUES \(\?, \?, 'input'/);
   assert.match(queueSource, /palimpsest-reference\.png/);
-  assert.match(queueSource, /referenceBytes \? "high" : "medium"/);
+  assert.match(queueSource, /job\.referenceBlobId \? "high" : "medium"/);
+  assert.match(queueSource, /referenceRetryPrompt\(plannedPrompt, review\),\s*"medium"/);
+  assert.match(queueSource, /form\.append\("quality", quality\)/);
   assert.match(queueSource, /form\.append\("model", "gpt-image-2"\)/);
   assert.doesNotMatch(queueSource, /gpt-image-1\.5/);
   assert.doesNotMatch(queueSource, /form\.append\("background", "transparent"\)/);
