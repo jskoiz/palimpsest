@@ -232,12 +232,20 @@ test("region constraints reject legacy tile fields and unsafe masks", () => {
   );
 });
 
-test("display masks keep exact hard edit boundaries without feathering", () => {
+test("filled display masks feather their edges while painted masks stay exact", () => {
   const region = { x: 100, y: 200, width: 384, height: 320 };
-  const svg = createDisplayMaskSvg({ region, fill: true, strokes: [] });
-  assert.doesNotMatch(svg, /feGaussianBlur|filter=/);
-  assert.match(svg, /clipPath id="edit-bounds"/);
-  assert.match(svg, /<rect x="100" y="200" width="384" height="320" fill="white"/);
+  const filledSvg = createDisplayMaskSvg({ region, fill: true, strokes: [] });
+  assert.match(filledSvg, /feGaussianBlur stdDeviation="16"/);
+  assert.match(filledSvg, /clipPath id="edit-bounds"/);
+  assert.match(filledSvg, /<rect x="132" y="232" width="320" height="256" fill="white"/);
+
+  const paintedSvg = createDisplayMaskSvg({
+    region,
+    fill: false,
+    strokes: [{ width: 16, points: [{ x: 10, y: 20 }, { x: 30, y: 40 }] }],
+  });
+  assert.doesNotMatch(paintedSvg, /feGaussianBlur|filter=/);
+  assert.match(paintedSvg, /<polyline points="110,220 130,240"/);
 });
 
 test("generated layers retain the reservation mask", () => {
