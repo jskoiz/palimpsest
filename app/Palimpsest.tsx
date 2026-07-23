@@ -349,6 +349,44 @@ function ArtworkLayers({
   );
 }
 
+type MobileDockIconName = "canvas" | "history" | "queue" | "contribute";
+
+function MobileDockIcon({ name }: { name: MobileDockIconName }) {
+  if (name === "canvas") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <rect x="3.5" y="3.5" width="17" height="17" rx="2" />
+        <circle cx="16.5" cy="16.5" r="1.5" className="is-filled" />
+      </svg>
+    );
+  }
+  if (name === "history") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path d="M4 8.5A8.5 8.5 0 1 1 3.8 15" />
+        <path d="M4 4.5v4h4" />
+        <path d="M12 7.5v5l3.25 1.75" />
+      </svg>
+    );
+  }
+  if (name === "queue") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <circle cx="5" cy="7" r="1" className="is-filled" />
+        <circle cx="5" cy="12" r="1" className="is-filled" />
+        <circle cx="5" cy="17" r="1" className="is-filled" />
+        <path d="M9 7h11M9 12h11M9 17h11" />
+      </svg>
+    );
+  }
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <circle cx="12" cy="12" r="8.5" />
+      <path d="M12 7.5v9M7.5 12h9" />
+    </svg>
+  );
+}
+
 function WelcomeDrawer({
   open,
   onClose,
@@ -532,14 +570,14 @@ function WelcomeDrawer({
                 <span>01</span>
                 <h2>Move</h2>
                 <p>
-                  Drag when the artwork extends past the window. Scroll or use [−] [+]
+                  Drag when the artwork extends past the window. Scroll or use − and +
                   to zoom.
                 </p>
               </section>
               <section>
                 <span>02</span>
                 <h2>History</h2>
-                <p>Open the bottom timeline and drag to inspect any revision.</p>
+                <p>Open History and drag the timeline to inspect any revision.</p>
               </section>
               <section>
                 <span>03</span>
@@ -578,6 +616,21 @@ function WelcomeDrawer({
                   <dd>queue</dd>
                 </div>
               </dl>
+            </div>
+
+            <div className="mono-welcome-touch" aria-label="Touch controls">
+              <div>
+                <strong>drag the artwork</strong>
+                <span>move around the canvas</span>
+              </div>
+              <div>
+                <strong>use − and +</strong>
+                <span>zoom with clear tap targets</span>
+              </div>
+              <div>
+                <strong>use the bottom dock</strong>
+                <span>open History, Queue, or Contribute</span>
+              </div>
             </div>
 
             <div className="mono-welcome-foot">
@@ -852,6 +905,13 @@ export default function Palimpsest() {
   const queueTotal = activity.queue.queued + activity.queue.active;
   const queueBusy = activity.queue.active > 0 || jobActive;
   const liveEditingAvailable = Boolean(history?.editing.available);
+  const mobileSection = editOpen
+    ? "contribute"
+    : queueOpen
+      ? "queue"
+      : historyOpen
+        ? "history"
+        : "canvas";
   const canPanCanvas = canvasViewCanPan(view, viewport.width, viewport.height);
   const otherActiveRegions = activity.activeRegions.filter(
     (active) => active.jobId !== pendingEdit?.jobId,
@@ -1335,6 +1395,19 @@ export default function Palimpsest() {
     wake();
   }, [clearReferenceImage, wake]);
 
+  const toggleHistory = useCallback(() => {
+    setHistoryOpen((open) => !open);
+    setQueueOpen(false);
+    setEditOpen(false);
+    setEditBase(null);
+    setPlaying(false);
+    setCompareOn(false);
+    setSubmitted(false);
+    setConfirmRestore(false);
+    clearReferenceImage();
+    wake();
+  }, [clearReferenceImage, wake]);
+
   const openEditor = useCallback(async () => {
     const initial = latest.current;
     if (!initial.history || !initial.currentState || initial.jobActive) return;
@@ -1409,6 +1482,24 @@ export default function Palimpsest() {
     setConfirmRestore(false);
     wake();
   }, [wake]);
+
+  const showCanvas = useCallback(() => {
+    setEditOpen(false);
+    setEditBase(null);
+    setQueueOpen(false);
+    setHistoryOpen(false);
+    setCompareOn(false);
+    setPlaying(false);
+    setSubmitted(false);
+    setConfirmRestore(false);
+    setHoverIdx(-1);
+    clearReferenceImage();
+    if (latest.current.revLen) {
+      setSelectedIndex(latest.current.revLen - 1);
+    }
+    if (closeTimer.current) window.clearTimeout(closeTimer.current);
+    wake();
+  }, [clearReferenceImage, wake]);
 
   const nudgePatch = useCallback((deltaX: number, deltaY: number) => {
     setEditRegion((region) =>
@@ -2282,6 +2373,63 @@ export default function Palimpsest() {
         </button>
       </div>
 
+      {!editOpen && !welcomeOpen ? (
+        <nav className="mono-mobile-dock" aria-label="Primary mobile navigation">
+          <button
+            type="button"
+            className={mobileSection === "canvas" ? "is-active" : ""}
+            aria-label="Show current canvas"
+            aria-pressed={mobileSection === "canvas"}
+            onClick={showCanvas}
+          >
+            <MobileDockIcon name="canvas" />
+            <span>Canvas</span>
+          </button>
+          <button
+            type="button"
+            className={mobileSection === "history" ? "is-active" : ""}
+            aria-label="Open revision history"
+            aria-controls="revision-history"
+            aria-expanded={historyOpen}
+            aria-pressed={mobileSection === "history"}
+            onClick={toggleHistory}
+          >
+            <MobileDockIcon name="history" />
+            <span>History</span>
+          </button>
+          <button
+            type="button"
+            className={mobileSection === "queue" ? "is-active" : ""}
+            aria-label={`Open contribution queue, ${queueTotal} pending`}
+            aria-controls="contribution-queue"
+            aria-expanded={queueOpen}
+            aria-pressed={mobileSection === "queue"}
+            onClick={toggleQueue}
+          >
+            <MobileDockIcon name="queue" />
+            <span>Queue {queueTotal}</span>
+          </button>
+          <button
+            type="button"
+            className={`is-contribute${mobileSection === "contribute" ? " is-active" : ""}`}
+            aria-label={
+              jobActive
+                ? "Your contribution is still being made"
+                : liveEditingAvailable
+                  ? "Contribute with live AI"
+                  : "Live AI editing is temporarily unavailable"
+            }
+            aria-controls="contribution-editor"
+            aria-pressed={mobileSection === "contribute"}
+            disabled={jobActive || !liveEditingAvailable}
+            onClick={() => void openEditor()}
+          >
+            <MobileDockIcon name="contribute" />
+            <span>Contribute</span>
+          </button>
+        </nav>
+      ) : null}
+
       {playing && selectedRevision ? (
         <div className="mono-ghost" aria-hidden="true">
           {seqTag(selectedRevision.sequence)}
@@ -2347,16 +2495,27 @@ export default function Palimpsest() {
 
       {showHistory && selectedRevision && headRevision ? (
         <section
-          className="mono-strip"
+          id="revision-history"
+          className="mono-strip mono-history-strip"
           aria-label="Revision history"
-          onPointerLeave={() => {
-            if (playing || compareOn) return;
+          onPointerLeave={(event) => {
+            if (event.pointerType !== "mouse" || playing || compareOn) return;
             setHistoryOpen(false);
             setHoverIdx(-1);
             setConfirmRestore(false);
             wake();
           }}
         >
+          <div className="mono-mobile-panel-head">
+            <span>revision history</span>
+            <button
+              type="button"
+              aria-label="Close revision history"
+              onClick={toggleHistory}
+            >
+              ×
+            </button>
+          </div>
           <div className="mono-history-row">
             <button
               type="button"
@@ -2458,7 +2617,11 @@ export default function Palimpsest() {
       ) : null}
 
       {queueOpen ? (
-        <section className="mono-strip" aria-label="Contribution queue">
+        <section
+          id="contribution-queue"
+          className="mono-strip mono-queue-strip"
+          aria-label="Contribution queue"
+        >
           <div className="mono-strip-head">
             <span className="mono-strip-summary">
               live work — {activity.queue.queued} reserved · {activity.queue.active} making ·
@@ -2492,7 +2655,11 @@ export default function Palimpsest() {
       ) : null}
 
       {editOpen ? (
-        <section className="mono-strip" aria-label="Contribute an edit">
+        <section
+          id="contribution-editor"
+          className="mono-strip mono-edit-strip"
+          aria-label="Contribute an edit"
+        >
           <div className="mono-strip-head">
             <div className="mono-steps">
               <span className={`mono-step${step === 1 ? " is-active" : ""}`}>01 patch</span>
@@ -2511,7 +2678,8 @@ export default function Palimpsest() {
           {step === 1 ? (
             <div className="mono-edit-row">
               <span className="mono-edit-hint">
-                live outlines are locked · drag to move · pull the corner to resize
+                drag the patch to move it · pull the corner or use the size controls ·
+                live outlines are locked
               </span>
               <div className="mono-patch-size-control" role="group" aria-label="Edit patch size">
                 <button
@@ -2542,14 +2710,14 @@ export default function Palimpsest() {
               </div>
               <button
                 type="button"
-                className="mono-action is-accent"
+                className="mono-action mono-next-action is-accent"
                 disabled={Boolean(conflictingRegion)}
                 onClick={() => {
                   setStep(2);
                   wake();
                 }}
               >
-                use this patch →
+                use this patch
               </button>
             </div>
           ) : null}
@@ -2593,7 +2761,7 @@ export default function Palimpsest() {
               </button>
               <button
                 type="button"
-                className={`mono-action${validMask ? " is-accent" : ""}`}
+                className={`mono-action mono-next-action${validMask ? " is-accent" : ""}`}
                 disabled={!validMask || Boolean(conflictingRegion)}
                 onClick={() => {
                   setStep(3);
@@ -2671,13 +2839,16 @@ export default function Palimpsest() {
                 className="mono-input is-name"
                 value={displayName}
                 maxLength={32}
+                placeholder="your name"
                 aria-label="Name shown in history"
                 disabled={submitted}
                 onChange={(event) => setDisplayName(event.target.value)}
               />
               <button
                 type="button"
-                className={`mono-action${canSubmit || submitted ? " is-accent" : ""}`}
+                className={`mono-action mono-next-action${
+                  canSubmit || submitted ? " is-accent" : ""
+                }`}
                 disabled={!canSubmit}
                 onClick={() => void submitEdit()}
               >
