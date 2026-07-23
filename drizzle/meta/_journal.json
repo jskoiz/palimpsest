@@ -78,6 +78,13 @@
       "when": 1784774061000,
       "tag": "0010_reset_framing_test_archive",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1784825202000,
+      "tag": "0011_clear_canvas_and_history",
+      "breakpoints": true
     }
   ]
 }

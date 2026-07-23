@@ -594,7 +594,7 @@ test("live-canvas reset targets the current archive with validated SQL", async (
   );
 });
 
-test("framing-test reset clears the current archive and durable job state", async () => {
+test("canvas-and-history reset clears the current archive and durable job state", async () => {
   const db = await migratedDatabase();
   db.exec(`
     INSERT INTO artworks (
@@ -639,7 +639,7 @@ test("framing-test reset clears the current archive and durable job state", asyn
   `);
 
   const reset = await readFile(
-    new URL("drizzle/0010_reset_framing_test_archive.sql", root),
+    new URL("drizzle/0011_clear_canvas_and_history.sql", root),
     "utf8",
   );
   applyMigration(db, reset);
@@ -661,7 +661,7 @@ test("framing-test reset clears the current archive and durable job state", asyn
     assert.equal(
       db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count,
       0,
-      `${table} must be empty after the framing-test reset`,
+      `${table} must be empty after the canvas-and-history reset`,
     );
   }
 
