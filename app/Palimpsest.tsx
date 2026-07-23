@@ -11,11 +11,11 @@ import type {
 } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  activityJobCounts,
   activityJobIsInProcess,
   activityJobNeedsAttention,
   activityJobState,
   collaborationPollDelay,
+  publicActivityJobs,
   queueRecoveryDelay,
   viewForActivityRegion,
 } from "@/app/activity-ui.mjs";
@@ -1133,9 +1133,8 @@ export default function Palimpsest() {
     (editRegion.width >= REFERENCE_EDIT_MIN_EDGE &&
       editRegion.height >= REFERENCE_EDIT_MIN_EDGE);
   const jobActive = Boolean(job && !terminalJobStates.has(job.state));
-  const activityCounts = activityJobCounts(activity.jobs);
-  const queueTotal = activityCounts.inProcess;
-  const queueFailed = activityCounts.failed + (localSubmissionFailure ? 1 : 0);
+  const liveActivityJobs = publicActivityJobs(activity.jobs);
+  const queueTotal = liveActivityJobs.length;
   const queueBusy = queueTotal > 0 || jobActive;
   const hasRecoverableWork =
     activity.queue.queued > 0 ||
@@ -1749,32 +1748,6 @@ export default function Palimpsest() {
     },
     [showToast, wake],
   );
-
-  const resumeLocalSubmission = useCallback(() => {
-    if (!localSubmissionFailure || !editBase) return;
-    setQueueOpen(false);
-    setHistoryOpen(false);
-    setPlaying(false);
-    setCompareOn(false);
-    setEditOpen(true);
-    setStep(3);
-    setSubmitted(false);
-    setSubmitError(localSubmissionFailure.errorMessage);
-    setView(
-      constrainCanvasView(
-        viewForActivityRegion(
-          localSubmissionFailure.region,
-          window.innerWidth,
-          window.innerHeight,
-          ARTWORK_SIZE,
-        ),
-        window.innerWidth,
-        window.innerHeight,
-      ),
-    );
-    showToast("Submission restored — review it, then generate again.");
-    wake();
-  }, [editBase, localSubmissionFailure, showToast, wake]);
 
   const retryActivityJob = useCallback(
     async (activityJob: ActivityJob) => {
@@ -2879,19 +2852,14 @@ export default function Palimpsest() {
         </button>
         <button
           type="button"
-          className={`mono-queue-toggle${queueFailed > 0 ? " has-attention" : ""}`}
-          aria-label={`Queue, ${queueTotal} in process${
-            queueFailed > 0 ? `, ${queueFailed} failed and needs attention` : ""
-          }`}
+          className="mono-queue-toggle"
+          aria-label={`Queue, ${queueTotal} in process`}
           aria-controls="contribution-activity"
           aria-expanded={queueOpen}
           onClick={toggleQueue}
         >
           <span className={`mono-live-dot${queueBusy ? " is-pulsing" : ""}`} aria-hidden="true" />
           <span>queue/{queueTotal}</span>
-          {queueFailed > 0 ? (
-            <span className="mono-queue-alert" aria-hidden="true">!{queueFailed}</span>
-          ) : null}
         </button>
         <button
           type="button"
@@ -3094,7 +3062,6 @@ export default function Palimpsest() {
           <div className="mono-strip-head">
             <span className="mono-strip-summary">
               live work — {queueTotal} in process
-              {queueFailed > 0 ? ` · ${queueFailed} failed — attention needed` : ""}
               {queueTotal > 0 ? " · use show to find work on the canvas" : ""}
             </span>
             <button
@@ -3110,46 +3077,13 @@ export default function Palimpsest() {
             <section className="mono-activity-group" aria-labelledby="activity-jobs-title">
               <div className="mono-activity-group-head">
                 <h2 id="activity-jobs-title">contributions</h2>
-                <span>{activity.jobs.length + (localSubmissionFailure ? 1 : 0)} shown</span>
+                <span>{liveActivityJobs.length} shown</span>
               </div>
-              {activity.jobs.length === 0 && !localSubmissionFailure ? (
-                <p className="mono-queue-empty">No contributions are in process or waiting for attention.</p>
+              {liveActivityJobs.length === 0 ? (
+                <p className="mono-queue-empty">No contributions are currently in process.</p>
               ) : (
                 <div className="mono-queue-list" role="list" aria-live="polite">
-                  {localSubmissionFailure ? (
-                    <article
-                      className="mono-queue-entry is-failed is-local-failure"
-                      role="listitem"
-                    >
-                      <div className="mono-queue-entry-head">
-                        <span className="mono-queue-author">{localSubmissionFailure.author}</span>
-                        <span className="mono-queue-state is-failed">failed · not accepted</span>
-                        <time
-                          dateTime={localSubmissionFailure.updatedAt}
-                          title={new Date(localSubmissionFailure.updatedAt).toLocaleString()}
-                        >
-                          {compactTime(localSubmissionFailure.updatedAt)} ago
-                        </time>
-                      </div>
-                      <p className="mono-queue-summary">&quot;{localSubmissionFailure.prompt}&quot;</p>
-                      <p className="mono-queue-error">{localSubmissionFailure.errorMessage}</p>
-                      <div className="mono-queue-detail">
-                        <span>not accepted into the queue</span>
-                        {localSubmissionFailure.errorCode ? (
-                          <span>{localSubmissionFailure.errorCode}</span>
-                        ) : null}
-                        {localSubmissionFailure.requestId ? (
-                          <span>request {localSubmissionFailure.requestId}</span>
-                        ) : null}
-                      </div>
-                      <div className="mono-queue-actions">
-                        <button type="button" onClick={resumeLocalSubmission}>
-                          review &amp; retry
-                        </button>
-                      </div>
-                    </article>
-                  ) : null}
-                  {activity.jobs.map((activityJob, index) => {
+                  {liveActivityJobs.map((activityJob, index) => {
                     const state = activityJobState(activityJob);
                     const failed = activityJobNeedsAttention(activityJob);
                     const canRetry = Boolean(

@@ -43,6 +43,7 @@ import {
   activityJobCounts,
   activityJobState,
   collaborationPollDelay,
+  publicActivityJobs,
   queueRecoveryDelay,
   viewForActivityRegion,
 } from "../app/activity-ui.mjs";
@@ -72,6 +73,7 @@ test("activity jobs use stable visitor-facing states and separate failures from 
     "done",
   ]);
   assert.deepEqual(activityJobCounts(jobs), { inProcess: 5, failed: 1, done: 1 });
+  assert.deepEqual(publicActivityJobs(jobs), jobs.slice(0, 5));
 });
 
 test("queue recovery and collaboration polling back off with bounded jitter", () => {

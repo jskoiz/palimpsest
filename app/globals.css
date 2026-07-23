@@ -673,20 +673,6 @@ body {
   opacity: 0.9;
 }
 
-.mono-queue-toggle.has-attention {
-  opacity: 1;
-}
-
-.mono-queue-alert {
-  border: 1px solid rgba(255, 194, 179, 0.72);
-  border-radius: 999px;
-  padding: 1px 4px;
-  background: rgba(88, 17, 11, 0.58);
-  color: #ffd4ca;
-  font-size: 8px;
-  font-variant-numeric: tabular-nums;
-}
-
 .mono-live-dot {
   flex: 0 0 auto;
   width: 5px;

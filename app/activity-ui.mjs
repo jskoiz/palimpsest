@@ -54,6 +54,17 @@ export function activityJobCounts(jobs) {
 }
 
 /**
+ * Keep the public queue focused on work that is happening now. Terminal
+ * attempts remain durable for operations and accepted outcomes are presented
+ * through revision history, so neither belongs in the live-work list.
+ *
+ * @param {Array<{ state: string, reservationActive: boolean }>} jobs
+ */
+export function publicActivityJobs(jobs) {
+  return jobs.filter(activityJobIsInProcess);
+}
+
+/**
  * Exponential recovery delay with bounded jitter. Supplying randomValue keeps
  * the helper deterministic in tests while production passes Math.random().
  *
