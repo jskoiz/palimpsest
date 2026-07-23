@@ -30,6 +30,8 @@ import {
   EDIT_PLANNER_MODEL,
   buildEditPlanRequest,
   extractEditPlan,
+  buildEditOutputReviewRequest,
+  extractEditOutputReview,
   buildReferenceEditReviewRequest,
   extractReferenceEditReview,
 } from "../lib/palimpsest/ai-planner.mjs";
@@ -395,6 +397,49 @@ test("GPT-5.6 edit plans are read from message output rather than reasoning item
   assert.equal(extractEditPlan({ output: [{ type: "reasoning" }] }), null);
 });
 
+test("every generated subject receives a structured framing review", () => {
+  const request = buildEditOutputReviewRequest({
+    requestedChange: "handwritten note that says 'Codex is awesome'",
+    generatedImageUrl: "data:image/png;base64,generated",
+    providerMaskUrl: "data:image/png;base64,mask",
+    editableRegion: { x: 0, y: 382, width: 326, height: 260 },
+  });
+
+  assert.equal(request.model, "gpt-5.6");
+  assert.equal(request.store, false);
+  assert.equal(request.max_output_tokens, 500);
+  assert.equal(request.input[0].content[1].image_url, "data:image/png;base64,generated");
+  assert.equal(request.input[0].content[2].image_url, "data:image/png;base64,mask");
+  assert.match(request.instructions, /handwriting, printed text/i);
+  assert.match(request.instructions, /every requested word, letter/i);
+  assert.match(request.instructions, /touching, crossing, or appearing truncated/i);
+  assert.match(request.input[0].content[0].text, /right edge is x=326/i);
+  assert.match(request.input[0].content[0].text, /bottom edge is y=642/i);
+  assert.deepEqual(request.text.format.schema.required, [
+    "contained",
+    "blended",
+    "reason",
+  ]);
+
+  assert.deepEqual(
+    extractEditOutputReview({
+      output: [{
+        type: "message",
+        content: [{
+          type: "output_text",
+          text: '{"contained":false,"blended":true,"reason":"The word ends at the right boundary."}',
+        }],
+      }],
+    }),
+    {
+      contained: false,
+      blended: true,
+      reason: "The word ends at the right boundary.",
+    },
+  );
+  assert.equal(extractEditOutputReview({ output: [] }), null);
+});
+
 test("reference generations receive structured fidelity and blending review", () => {
   const request = buildReferenceEditReviewRequest({
     requestedChange: "Place the mini keyboard.",
@@ -477,6 +522,11 @@ test("reference images stay optional, visible in the patch, and reach live gener
   assert.match(queueSource, /buildOpenAiEditPrompt\(plannedPrompt, Boolean\(reference\)\)/);
   assert.match(queueSource, /reviewReferenceEdit/);
   assert.match(queueSource, /review\.contained && review\.faithful && review\.blended/);
+  assert.match(queueSource, /reviewEditOutput/);
+  assert.match(queueSource, /review\.contained && review\.blended/);
+  assert.match(queueSource, /MAX_GENERAL_EDIT_ATTEMPTS = 3/);
+  assert.match(queueSource, /every requested word, letter, punctuation mark/);
+  assert.match(queueSource, /SUBJECT_OUT_OF_FRAME/);
   assert.match(queueSource, /MAX_REFERENCE_ATTEMPTS = 2/);
   assert.match(queueSource, /already contains the reference subject at the intended position, scale, and maximum footprint/);
   assert.match(queueSource, /https:\/\/api\.openai\.com\/v1\/responses/);

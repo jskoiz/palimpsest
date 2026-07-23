@@ -6,6 +6,8 @@ import {
 import {
   buildEditPlanRequest,
   extractEditPlan,
+  buildEditOutputReviewRequest,
+  extractEditOutputReview,
   buildReferenceEditReviewRequest,
   extractReferenceEditReview,
 } from "./ai-planner.mjs";
@@ -58,8 +60,10 @@ const COMMIT_LOCK_RETRY_MS = 25;
 const MODERATION_TIMEOUT_MS = 30_000;
 const EDIT_PLANNING_TIMEOUT_MS = 30_000;
 const IMAGE_EDIT_TIMEOUT_MS = 150_000;
-const REFERENCE_REVIEW_TIMEOUT_MS = 75_000;
+const EDIT_REVIEW_TIMEOUT_MS = 75_000;
+const MAX_GENERAL_EDIT_ATTEMPTS = 3;
 const MAX_REFERENCE_ATTEMPTS = 2;
+const GENERAL_EDIT_RETRY = "The previous result failed the framing review. Regenerate from the original current-canvas input. Center every discrete requested subject inside the editable area and scale it to no more than 55% of the editable width or height, leaving obvious unchanged background space on all four sides. For handwriting or other text, render every requested word, letter, punctuation mark, decorative stroke, and underline completely; no visible mark may touch or end at an editable boundary. Do not crop, truncate, or enlarge the subject to fill the mask.";
 const REFERENCE_EDIT_RETRY = "The previous result failed reference review. Regenerate from the original current-canvas input. It already contains the reference subject at the intended position, scale, and maximum footprint. Preserve those visible subject pixels and their exact identity, geometry, proportions, perspective, materials, control layout, symbols, labels, and fine details; do not enlarge, crop, reposition, redraw, redesign, or substitute any component. Edit away its source background and blend it naturally into the current surroundings without a rectangular patch, matte, halo, wash, or tonal seam.";
 
 export type QueueProcessResult = {
@@ -517,6 +521,45 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
           `${plannedPrompt} ${REFERENCE_EDIT_RETRY}`,
         );
       }
+    } else {
+      const region = jobRegion(job);
+      const frame = jobFrame(job);
+      const editableRegion = {
+        x: region.x - frame.x,
+        y: region.y - frame.y,
+        width: region.width,
+        height: region.height,
+      };
+      for (let attempt = 0; attempt < MAX_GENERAL_EDIT_ATTEMPTS; attempt += 1) {
+        await updateStage(env, job, "generating", "generating");
+        const review = await reviewEditOutput(
+          apiKey,
+          job.prompt,
+          patch.bytes,
+          patch.providerMaskBytes,
+          editableRegion,
+        );
+        console.info(`[palimpsest:${job.id}] edit output review`, {
+          attempt: attempt + 1,
+          subjectContained: review.contained,
+          surroundingsBlended: review.blended,
+          reviewerReason: review.reason.slice(0, 240),
+        });
+        if (review.contained && review.blended) break;
+        if (attempt === MAX_GENERAL_EDIT_ATTEMPTS - 1) {
+          throw new DomainError(
+            "SUBJECT_OUT_OF_FRAME",
+            "The generated edit could not keep the complete requested subject inside the selected region. Nothing was added to history; choose a larger region or try again.",
+          );
+        }
+        await updateStage(env, job, "generating", "generating");
+        patch = await generateOpenAiPatch(
+          env,
+          job,
+          apiKey,
+          `${plannedPrompt} ${GENERAL_EDIT_RETRY}`,
+        );
+      }
     }
 
     await updateStage(env, job, "generating", "committing");
@@ -843,6 +886,57 @@ function imageDataUrl(bytes: Uint8Array) {
   return `data:image/png;base64,${btoa(binary)}`;
 }
 
+async function reviewEditOutput(
+  apiKey: string,
+  requestedChange: string,
+  generatedBytes: Uint8Array,
+  providerMaskBytes: Uint8Array,
+  editableRegion: { x: number; y: number; width: number; height: number },
+) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), EDIT_REVIEW_TIMEOUT_MS);
+  let response: Response;
+  let body: { output?: Array<unknown> } | null;
+  try {
+    response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(buildEditOutputReviewRequest({
+        requestedChange,
+        generatedImageUrl: imageDataUrl(generatedBytes),
+        providerMaskUrl: imageDataUrl(providerMaskBytes),
+        editableRegion,
+      })),
+      signal: controller.signal,
+    });
+    body = (await response.json().catch(() => null)) as typeof body;
+  } catch {
+    throw new DomainError(
+      "PROVIDER_TEMPORARY",
+      "The generated image could not be checked for complete framing. Nothing was added to history.",
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (!response.ok) {
+    throw new DomainError(
+      "PROVIDER_TEMPORARY",
+      "The generated image could not be checked for complete framing. Nothing was added to history.",
+    );
+  }
+  const review = extractEditOutputReview(body);
+  if (!review) {
+    throw new DomainError(
+      "PROVIDER_TEMPORARY",
+      "The generated image returned no usable framing review. Nothing was added to history.",
+    );
+  }
+  return review;
+}
+
 async function reviewReferenceEdit(
   apiKey: string,
   requestedChange: string,
@@ -851,7 +945,7 @@ async function reviewReferenceEdit(
   providerMaskBytes: Uint8Array,
 ) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REFERENCE_REVIEW_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), EDIT_REVIEW_TIMEOUT_MS);
   let response: Response;
   let body: { output?: Array<unknown> } | null;
   try {

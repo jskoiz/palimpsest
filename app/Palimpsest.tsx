@@ -330,6 +330,7 @@ function activityFailureQualifier(job: ActivityJob) {
   if (job.error?.code.includes("LEASE_EXPIRED")) return "expired";
   if (job.error?.code === "PROVIDER_TEMPORARY") return "temporary";
   if (job.error?.code === "REFERENCE_REVIEW_FAILED") return "fidelity check";
+  if (job.error?.code === "SUBJECT_OUT_OF_FRAME") return "framing check";
   if (job.state === "stale") return "superseded";
   if (!job.startedAt) return "never started";
   return "attention";
