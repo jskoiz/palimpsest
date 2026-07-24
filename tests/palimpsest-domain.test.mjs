@@ -560,7 +560,7 @@ test("prompt generation uses one image pass and resilient review without a time 
 
   assert.match(clientSource, /flattenArtworkFrame\(editBase\.state, frame\)/);
   assert.match(clientSource, /providerMask\(editRegion, frame, strokes, fillMask\)/);
-  assert.match(clientSource, /makes one masked image pass/);
+  assert.match(clientSource, /GPT Image makes the edit, GPT-5\.6 reviews it/);
   assert.doesNotMatch(clientSource, /automatic retry/);
   assert.doesNotMatch(clientSource, /plans the request/);
   assert.equal(queueSource.match(/await generateOpenAiPatch\(/gu)?.length, 1);
