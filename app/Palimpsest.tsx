@@ -683,11 +683,28 @@ function WelcomeDrawer({
           </div>
 
           <div className="mono-welcome-guide">
-            <p id="welcome-description" className="mono-welcome-summary">
-              A palimpsest is a surface rewritten while traces of what came before
-              remain. Here, every accepted edit becomes the next revision; earlier
-              versions stay available.
-            </p>
+            <div className="mono-welcome-intro">
+              <p id="welcome-description" className="mono-welcome-summary">
+                A palimpsest is a surface rewritten while traces of what came before
+                remain. Here, every accepted edit becomes the next revision; earlier
+                versions stay available.
+              </p>
+              <p className="mono-welcome-credit">
+                Made by{" "}
+                <a href="https://x.com/saboorow" target="_blank" rel="noreferrer">
+                  @saboorow on X
+                </a>
+                . Open source at{" "}
+                <a
+                  href="https://github.com/jskoiz/palimpsest"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  jskoiz/palimpsest
+                </a>
+                .
+              </p>
+            </div>
 
             <div className="mono-welcome-path">
               <section>
@@ -707,14 +724,9 @@ function WelcomeDrawer({
                 <span>03</span>
                 <h2>Contribute</h2>
                 <p>
-                  Place and resize the patch, then paint what may change. GPT Image
-                  makes one masked image pass; GPT-5.6 checks it once before acceptance.
-                  Each submission stays connected until that pass and review finish,
-                  and never silently replays a second generation.
-                  Uploaded images become positioned visual references for the same
-                  generation and review path, so GPT Image can preserve their identity
-                  while blending them into the surrounding canvas. Live outlines lock
-                  only active work.
+                  Place and resize the patch, then paint what may change. Add an image
+                  as a visual reference. GPT Image makes the edit, GPT-5.6 reviews it,
+                  and only active work is locked.
                 </p>
               </section>
             </div>
