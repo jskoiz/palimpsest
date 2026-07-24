@@ -8,7 +8,7 @@ export async function generateMetadata(): Promise<Metadata> {
   const metadataBase = siteUrlFromHeaders(requestHeaders);
   const title = "Palimpsest";
   const description =
-    "A shared canvas edited with GPT Image 2. Add to the image and explore every revision.";
+    "Palimpsest is a shared canvas edited with GPT Image 2—named for a surface rewritten while traces of what came before remain.";
 
   return {
     metadataBase,
@@ -51,7 +51,7 @@ export async function generateMetadata(): Promise<Metadata> {
           url: "/og.png",
           width: 1200,
           height: 630,
-          alt: "Palimpsest — a shared canvas edited with GPT Image 2",
+          alt: "Purple Palimpsest social card with its GPT Image 2 description and the meaning of palimpsest",
         },
       ],
     },

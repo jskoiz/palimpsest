@@ -5,7 +5,7 @@ export default function manifest(): MetadataRoute.Manifest {
     name: "Palimpsest",
     short_name: "Palimpsest",
     description:
-      "A shared canvas edited with GPT Image 2. Add to the image and explore every revision.",
+      "Palimpsest is a shared canvas edited with GPT Image 2—named for a surface rewritten while traces of what came before remain.",
     start_url: "/",
     display: "standalone",
     background_color: "#4f46d8",

@@ -684,7 +684,8 @@ function WelcomeDrawer({
 
           <div className="mono-welcome-guide">
             <p id="welcome-description" className="mono-welcome-summary">
-              One shared canvas. Every accepted edit becomes the next revision; earlier
+              A palimpsest is a surface rewritten while traces of what came before
+              remain. Here, every accepted edit becomes the next revision; earlier
               versions stay available.
             </p>
 
