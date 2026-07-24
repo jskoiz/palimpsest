@@ -6,6 +6,7 @@ import {
 import {
   buildEditOutputReviewRequest,
   buildReferenceEditReviewRequest,
+  describeEditReviewResponse,
   extractEditOutputReview,
   extractReferenceEditReview,
 } from "./ai-review.mjs";
@@ -66,6 +67,16 @@ type ReferenceEditReview = EditOutputReview & {
   sourcePreserved: boolean;
 };
 
+type EditReviewResult =
+  | {
+      status: "reviewed";
+      review: EditOutputReview | ReferenceEditReview;
+    }
+  | {
+      status: "unavailable";
+      detail: string;
+    };
+
 type CommitLock = {
   ownerToken: string;
   fence: number;
@@ -74,6 +85,8 @@ type CommitLock = {
 const COMMIT_LOCK_LEASE_MS = 15_000;
 const COMMIT_LOCK_ATTEMPTS = 40;
 const COMMIT_LOCK_RETRY_MS = 25;
+const EDIT_REVIEW_MAX_ATTEMPTS = 3;
+const EDIT_REVIEW_RETRY_DELAY_MS = 400;
 
 function cleanReviewReason(reason: string) {
   return reason.replace(/\s+/g, " ").trim().slice(0, 320);
@@ -590,7 +603,8 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
     );
     await heartbeat.checkpoint();
     await updateStage(env, job, "generating", "generating");
-    const review = await reviewEditOutput(
+    const reviewResult = await reviewEditOutput(
+      job.id,
       apiKey,
       job.prompt,
       patch.bytes,
@@ -600,34 +614,45 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
       generationRegion,
     );
     await heartbeat.checkpoint();
-    console.info(`[palimpsest:${job.id}] edit output review`, {
-      referenceGuided: Boolean(patch.referenceBytes),
-      subjectContained: review.contained,
-      surroundingsBlended: review.blended,
-      faithful: "faithful" in review ? review.faithful : null,
-      placementMatched: "placementMatched" in review ? review.placementMatched : null,
-      sourcePreserved: "sourcePreserved" in review ? review.sourcePreserved : null,
-      reviewerReason: review.reason.slice(0, 240),
-    });
-    const accepted = patch.referenceBytes
-      ? (
-          "faithful" in review &&
-          review.contained &&
-          review.faithful &&
-          review.placementMatched &&
-          review.blended &&
-          review.sourcePreserved
-        )
-      : review.contained && review.blended;
-    if (!accepted) {
-      throw new DomainError(
-        patch.referenceBytes ? "REFERENCE_REVIEW_FAILED" : "SUBJECT_OUT_OF_FRAME",
-        reviewFailureMessage(
-          patch.referenceBytes
-            ? "The generated reference did not pass the fidelity and blending check. Nothing was added to history; use retry for one fresh attempt."
-            : "The generated edit did not pass the framing and blending check. Nothing was added to history; use retry for one fresh attempt.",
-          review.reason,
-        ),
+    if (reviewResult.status === "reviewed") {
+      const review = reviewResult.review;
+      console.info(`[palimpsest:${job.id}] edit output review`, {
+        referenceGuided: Boolean(patch.referenceBytes),
+        subjectContained: review.contained,
+        surroundingsBlended: review.blended,
+        faithful: "faithful" in review ? review.faithful : null,
+        placementMatched: "placementMatched" in review ? review.placementMatched : null,
+        sourcePreserved: "sourcePreserved" in review ? review.sourcePreserved : null,
+        reviewerReason: review.reason.slice(0, 240),
+      });
+      const accepted = patch.referenceBytes
+        ? (
+            "faithful" in review &&
+            review.contained &&
+            review.faithful &&
+            review.placementMatched &&
+            review.blended &&
+            review.sourcePreserved
+          )
+        : review.contained && review.blended;
+      if (!accepted) {
+        throw new DomainError(
+          patch.referenceBytes ? "REFERENCE_REVIEW_FAILED" : "SUBJECT_OUT_OF_FRAME",
+          reviewFailureMessage(
+            patch.referenceBytes
+              ? "The generated reference did not pass the fidelity and blending check. Nothing was added to history; use retry for one fresh attempt."
+              : "The generated edit did not pass the framing and blending check. Nothing was added to history; use retry for one fresh attempt.",
+            review.reason,
+          ),
+        );
+      }
+    } else {
+      console.warn(
+        `[palimpsest:${job.id}] visual review unavailable; accepting completed image generation`,
+        {
+          referenceGuided: Boolean(patch.referenceBytes),
+          detail: reviewResult.detail,
+        },
       );
     }
 
@@ -852,6 +877,7 @@ function imageDataUrl(bytes: Uint8Array) {
 }
 
 async function reviewEditOutput(
+  jobId: string,
   apiKey: string,
   requestedChange: string,
   generatedBytes: Uint8Array,
@@ -859,63 +885,93 @@ async function reviewEditOutput(
   providerMaskBytes: Uint8Array,
   referenceBytes: Uint8Array | null,
   editableRegion: { x: number; y: number; width: number; height: number },
-): Promise<EditOutputReview | ReferenceEditReview> {
-  let response: Response;
-  let body: { output?: Array<unknown> } | null;
-  try {
-    response = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(
-        referenceBytes
-          ? buildReferenceEditReviewRequest({
-              requestedChange,
-              generatedImageUrl: imageDataUrl(generatedBytes),
-              sourceImageUrl: imageDataUrl(sourceBytes),
-              referenceImageUrl: imageDataUrl(referenceBytes),
-              providerMaskUrl: imageDataUrl(providerMaskBytes),
-              editableRegion,
-            })
-          : buildEditOutputReviewRequest({
-              requestedChange,
-              generatedImageUrl: imageDataUrl(generatedBytes),
-              providerMaskUrl: imageDataUrl(providerMaskBytes),
-              editableRegion,
-            }),
-      ),
+): Promise<EditReviewResult> {
+  const requestBody = JSON.stringify(
+    referenceBytes
+      ? buildReferenceEditReviewRequest({
+          requestedChange,
+          generatedImageUrl: imageDataUrl(generatedBytes),
+          sourceImageUrl: imageDataUrl(sourceBytes),
+          referenceImageUrl: imageDataUrl(referenceBytes),
+          providerMaskUrl: imageDataUrl(providerMaskBytes),
+          editableRegion,
+        })
+      : buildEditOutputReviewRequest({
+          requestedChange,
+          generatedImageUrl: imageDataUrl(generatedBytes),
+          providerMaskUrl: imageDataUrl(providerMaskBytes),
+          editableRegion,
+        }),
+  );
+  let lastDetail = "no_response";
+
+  for (let attempt = 1; attempt <= EDIT_REVIEW_MAX_ATTEMPTS; attempt += 1) {
+    if (attempt > 1) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, EDIT_REVIEW_RETRY_DELAY_MS * (attempt - 1));
+      });
+    }
+
+    let response: Response;
+    let body: Record<string, unknown> | null;
+    try {
+      response = await fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: requestBody,
+      });
+      body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+    } catch (error) {
+      lastDetail = "connection_error";
+      console.warn(`[palimpsest:${jobId}] visual review request failed`, {
+        attempt,
+        name: error instanceof Error ? error.name : "UnknownError",
+        message: error instanceof Error ? error.message : "Unknown fetch failure",
+      });
+      continue;
+    }
+
+    const providerRequestId = response.headers.get("x-request-id");
+    const diagnostics = describeEditReviewResponse(body);
+    if (!response.ok) {
+      lastDetail = `http_${response.status}`;
+      console.warn(`[palimpsest:${jobId}] visual review request rejected`, {
+        attempt,
+        status: response.status,
+        requestId: providerRequestId,
+        responseId: diagnostics.responseId,
+      });
+      if (response.status < 500 && response.status !== 429) break;
+      continue;
+    }
+
+    const review = referenceBytes
+      ? extractReferenceEditReview(body)
+      : extractEditOutputReview(body);
+    if (review) {
+      return { status: "reviewed", review };
+    }
+
+    lastDetail = diagnostics.refused
+      ? "refusal"
+      : diagnostics.incompleteReason ?? diagnostics.status;
+    console.warn(`[palimpsest:${jobId}] visual review returned no structured result`, {
+      attempt,
+      requestId: providerRequestId,
+      ...diagnostics,
     });
-    body = (await response.json().catch(() => null)) as typeof body;
-  } catch {
-    throw new DomainError(
-      "PROVIDER_TEMPORARY",
-      referenceBytes
-        ? "The generated image could not be checked for reference fidelity. Nothing was added to history."
-        : "The generated image could not be checked for complete framing. Nothing was added to history.",
-    );
+    if (diagnostics.refused) {
+      throw new DomainError(
+        "CONTENT_POLICY",
+        "The generated image could not be accepted because its review was refused for safety.",
+      );
+    }
   }
-  if (!response.ok) {
-    throw new DomainError(
-      "PROVIDER_TEMPORARY",
-      referenceBytes
-        ? "The generated image could not be checked for reference fidelity. Nothing was added to history."
-        : "The generated image could not be checked for complete framing. Nothing was added to history.",
-    );
-  }
-  const review = referenceBytes
-    ? extractReferenceEditReview(body)
-    : extractEditOutputReview(body);
-  if (!review) {
-    throw new DomainError(
-      "PROVIDER_TEMPORARY",
-      referenceBytes
-        ? "The generated image returned no usable reference review. Nothing was added to history."
-        : "The generated image returned no usable framing review. Nothing was added to history.",
-    );
-  }
-  return review;
+
+  return { status: "unavailable", detail: lastDetail };
 }
 
 async function acquireCommitLock(env: AppEnv, jobId: string): Promise<CommitLock> {

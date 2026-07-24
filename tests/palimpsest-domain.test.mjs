@@ -31,6 +31,7 @@ import {
   EDIT_REVIEW_MODEL,
   buildEditOutputReviewRequest,
   buildReferenceEditReviewRequest,
+  describeEditReviewResponse,
   extractEditOutputReview,
   extractReferenceEditReview,
 } from "../lib/palimpsest/ai-review.mjs";
@@ -414,7 +415,8 @@ test("every generated subject receives a structured framing review", () => {
   assert.equal(request.model, EDIT_REVIEW_MODEL);
   assert.equal(request.model, "gpt-5.6");
   assert.equal(request.store, false);
-  assert.equal(request.max_output_tokens, 500);
+  assert.deepEqual(request.reasoning, { effort: "minimal" });
+  assert.equal("max_output_tokens" in request, false);
   assert.equal(request.input[0].content[1].image_url, "data:image/png;base64,generated");
   assert.equal(request.input[0].content[2].image_url, "data:image/png;base64,mask");
   assert.match(request.instructions, /handwriting, printed text/i);
@@ -430,6 +432,7 @@ test("every generated subject receives a structured framing review", () => {
 
   assert.deepEqual(
     extractEditOutputReview({
+      status: "completed",
       output: [{
         type: "message",
         content: [{
@@ -483,6 +486,7 @@ test("reference-guided edits receive fidelity, placement, blending, and source r
   ]);
   assert.deepEqual(
     extractReferenceEditReview({
+      status: "completed",
       output: [{
         type: "message",
         content: [{
@@ -503,7 +507,52 @@ test("reference-guided edits receive fidelity, placement, blending, and source r
   assert.equal(extractReferenceEditReview({ output: [] }), null);
 });
 
-test("prompt generation uses one image pass and one review pass without a time cutoff", async () => {
+test("structured review diagnostics expose incomplete and refused responses", () => {
+  assert.deepEqual(
+    describeEditReviewResponse({
+      id: "resp_incomplete",
+      status: "incomplete",
+      incomplete_details: { reason: "max_output_tokens" },
+      output: [{ type: "reasoning" }],
+      usage: {
+        output_tokens: 500,
+        output_tokens_details: { reasoning_tokens: 500 },
+      },
+    }),
+    {
+      responseId: "resp_incomplete",
+      status: "incomplete",
+      incompleteReason: "max_output_tokens",
+      outputTypes: ["reasoning"],
+      contentTypes: [],
+      refused: false,
+      outputTokens: 500,
+      reasoningTokens: 500,
+    },
+  );
+  assert.deepEqual(
+    describeEditReviewResponse({
+      id: "resp_refusal",
+      status: "completed",
+      output: [{
+        type: "message",
+        content: [{ type: "refusal", refusal: "I cannot review this." }],
+      }],
+    }),
+    {
+      responseId: "resp_refusal",
+      status: "completed",
+      incompleteReason: null,
+      outputTypes: ["message"],
+      contentTypes: ["refusal"],
+      refused: true,
+      outputTokens: null,
+      reasoningTokens: null,
+    },
+  );
+});
+
+test("prompt generation uses one image pass and resilient review without a time cutoff", async () => {
   const [clientSource, queueSource] = await Promise.all([
     readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8"),
     readFile(new URL("../lib/palimpsest/queue.ts", import.meta.url), "utf8"),
@@ -530,6 +579,9 @@ test("prompt generation uses one image pass and one review pass without a time c
   assert.match(queueSource, /buildReferenceEditReviewRequest/);
   assert.match(queueSource, /extractReferenceEditReview/);
   assert.match(queueSource, /reviewEditOutput/);
+  assert.match(queueSource, /EDIT_REVIEW_MAX_ATTEMPTS = 3/);
+  assert.match(queueSource, /status: "unavailable"/);
+  assert.match(queueSource, /accepting completed image generation/);
   assert.match(queueSource, /: review\.contained && review\.blended/);
   assert.match(
     queueSource,
