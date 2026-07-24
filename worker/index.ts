@@ -1,0 +1,72 @@
+/** Cloudflare Worker entry point for Palimpsest. */
+import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
+import handler from "vinext/server/app-router-entry";
+import { processQueue } from "../lib/palimpsest/queue";
+import { recordVisitorEvent } from "../lib/palimpsest/store";
+
+interface Env {
+  ASSETS: Fetcher;
+  DB: D1Database;
+  BLOBS: R2Bucket;
+  OPENAI_API_KEY?: string;
+  RATE_LIMIT_SALT?: string;
+  VISITOR_LOG_SALT?: string;
+  IMAGES: {
+    input(stream: ReadableStream): {
+      transform(options: Record<string, unknown>): {
+        output(options: { format: string; quality: number }): Promise<{ response(): Response }>;
+      };
+    };
+  };
+}
+
+interface ExecutionContext {
+  waitUntil(promise: Promise<unknown>): void;
+  passThroughOnException(): void;
+}
+
+// Image security config. SVG sources with .svg extension auto-skip the
+// optimization endpoint on the client side (served directly, no proxy).
+// To route SVGs through the optimizer (with security headers), set
+// dangerouslyAllowSVG: true in next.config.js and uncomment below:
+// const imageConfig: ImageConfig = { dangerouslyAllowSVG: true };
+
+const worker = {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/_vinext/image") {
+      const allowedWidths = [...DEFAULT_DEVICE_SIZES, ...DEFAULT_IMAGE_SIZES];
+      return handleImageOptimization(request, {
+        fetchAsset: (path) => env.ASSETS.fetch(new Request(new URL(path, request.url))),
+        transformImage: async (body, { width, format, quality }) => {
+          const result = await env.IMAGES.input(body).transform(width > 0 ? { width } : {}).output({ format, quality });
+          return result.response();
+        },
+      }, allowedWidths);
+    }
+
+    const response = await handler.fetch(request, env, ctx);
+    if (request.method === "POST" && url.pathname === "/api/edits" && response.status === 202) {
+      ctx.waitUntil(
+        processQueue(env, 1).catch((error: unknown) => {
+          console.error("[palimpsest] background queue processing failed", {
+            name: error instanceof Error ? error.name : "UnknownError",
+            message: error instanceof Error ? error.message : "Unknown worker failure",
+          });
+        }),
+      );
+    }
+    if (request.method === "GET" && url.pathname === "/" && response.ok) {
+      ctx.waitUntil(
+        recordVisitorEvent(env, request, "page_view").catch((error) => {
+          console.warn("[palimpsest] visitor page-view logging failed", error);
+        }),
+      );
+    }
+
+    return response;
+  },
+};
+
+export default worker;

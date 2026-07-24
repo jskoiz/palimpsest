@@ -1,0 +1,104 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1784340760969,
+      "tag": "0000_slow_gambit",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1784587029866,
+      "tag": "0001_parallel_regions",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1784666018076,
+      "tag": "0002_live_ai_only",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1784666426000,
+      "tag": "0003_white_canvas_reset",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1784670000000,
+      "tag": "0004_reference_images",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1784687104000,
+      "tag": "0005_purple_canvas_reset",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1784693344000,
+      "tag": "0006_live_canvas_reset",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1784693817000,
+      "tag": "0007_current_live_canvas_reset",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1784746104000,
+      "tag": "0008_clear_live_archive",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1784750400000,
+      "tag": "0009_durable_job_attempts",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1784774061000,
+      "tag": "0010_reset_framing_test_archive",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1784825202000,
+      "tag": "0011_clear_canvas_and_history",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1784839324633,
+      "tag": "0012_visitor_activity",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1784851295000,
+      "tag": "0013_remove_logo_mascot_generations",
+      "breakpoints": true
+    }
+  ]
+}
