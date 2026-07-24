@@ -1,6 +1,5 @@
 import {
   ARTWORK_ID,
-  ARTWORK_SIZE,
   DomainError,
   createDisplayMaskSvg,
   displayMaskForLayer,
@@ -546,12 +545,11 @@ export const VISITOR_INTERACTION_TYPES = [
 ] as const;
 
 export type VisitorInteractionType = (typeof VISITOR_INTERACTION_TYPES)[number];
-export type VisitorEventType = VisitorInteractionType | "page_view" | "generation_requested" | "restore_requested";
+export type VisitorEventType = VisitorInteractionType | "page_view" | "generation_requested";
 
 const VISITOR_EVENT_TYPES = new Set<VisitorEventType>([
   "page_view",
   "generation_requested",
-  "restore_requested",
   ...VISITOR_INTERACTION_TYPES,
 ]);
 
@@ -826,9 +824,6 @@ const EDIT_RATE_RULES = [
   { scope: "edit-10m", limit: 3, windowMs: 10 * 60 * 1000 },
   { scope: "edit-day", limit: 12, windowMs: 24 * 60 * 60 * 1000 },
 ] as const;
-const REVERT_RATE_RULES = [
-  { scope: "revert-10m", limit: 2, windowMs: 10 * 60 * 1000 },
-] as const;
 
 type InsertEditInput = {
   baseRevisionId: string;
@@ -985,50 +980,6 @@ AND NOT EXISTS (
     AND accepted.region_x + accepted.region_width > c.region_x
     AND accepted.region_y < c.region_y + c.region_height
     AND accepted.region_y + accepted.region_height > c.region_y
-)`;
-
-export const INSERT_REVERT_RESERVATION_SQL = `WITH candidate(
-  job_id, artwork_id, author_id, requester_hash, base_revision_id,
-  target_revision_id, prompt, idempotency_key, request_fingerprint,
-  available_at, lease_expires_at, now_ms, retry_token_hash, request_id,
-  rate_enforced, rate_window_start, rate_limit
-) AS (VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?))
-INSERT OR IGNORE INTO edit_jobs (
-  id, artwork_id, kind, state, execution_mode, author_id, requester_hash,
-  base_revision_id, target_revision_id, prompt,
-  region_x, region_y, region_width, region_height,
-  idempotency_key, request_fingerprint, retry_token_hash, request_id,
-  available_at, lease_expires_at,
-  created_at, updated_at
-)
-SELECT
-  c.job_id, c.artwork_id, 'revert', 'queued', 'none', c.author_id,
-  c.requester_hash, c.base_revision_id, c.target_revision_id, c.prompt,
-  0, 0, 2048, 2048,
-  c.idempotency_key, c.request_fingerprint, c.retry_token_hash, c.request_id,
-  c.available_at, c.lease_expires_at,
-  c.now_ms, c.now_ms
-FROM candidate c
-JOIN artworks artwork
-  ON artwork.id = c.artwork_id AND artwork.head_revision_id = c.base_revision_id
-JOIN revisions base
-  ON base.artwork_id = c.artwork_id AND base.id = c.base_revision_id
-JOIN revisions target
-  ON target.artwork_id = c.artwork_id
- AND target.id = c.target_revision_id
- AND target.sequence < base.sequence
-WHERE NOT EXISTS (
-  SELECT 1 FROM edit_jobs active
-  WHERE active.artwork_id = c.artwork_id
-    AND active.state IN ('queued', 'moderating', 'generating', 'committing')
-    AND active.lease_expires_at > c.now_ms
-)
-AND (
-  c.rate_enforced = 0 OR
-  (SELECT COUNT(*) FROM rate_limit_claims claim
-   WHERE claim.requester_hash = c.requester_hash
-     AND claim.scope = 'revert-10m'
-     AND claim.window_start = c.rate_window_start) < c.rate_limit
 )`;
 
 async function markPreparationFailed(
@@ -1545,163 +1496,6 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
 
   const publicJob = await getPublicJob(env, selectedJobId);
   return selectedRetryToken ? { ...publicJob, retryToken: selectedRetryToken } : publicJob;
-}
-
-export async function insertRevertJob(
-  env: AppEnv,
-  input: {
-    baseRevisionId: string;
-    targetRevisionId: string;
-    displayName: string;
-    requesterHash: string;
-    idempotencyKey: string;
-    rateLimits: readonly ContributionRateLimit[];
-    requestId: string;
-  },
-) {
-  const targetRevision = await runIdempotentD1(() =>
-    env.DB.prepare(
-      "SELECT sequence FROM revisions WHERE artwork_id = ? AND id = ? LIMIT 1",
-    )
-      .bind(ARTWORK_ID, input.targetRevisionId)
-      .first<{ sequence: number }>(),
-  );
-  if (!targetRevision) {
-    throw new DomainError("INVALID_REQUEST", "Choose an earlier revision to restore.");
-  }
-  const fingerprint = await sha256Hex(
-    JSON.stringify({ base: input.baseRevisionId, target: input.targetRevisionId }),
-  );
-  const authorId = crypto.randomUUID();
-  const jobId = crypto.randomUUID();
-  const now = Date.now();
-  const leaseExpiresAt = now + RESERVATION_LEASE_MS;
-  const rate = prepareRateLimits(input.rateLimits, REVERT_RATE_RULES, now);
-  const [revertRate] = rate.values;
-  const reservation = await runIdempotentD1(() => env.DB.batch([
-    env.DB.prepare(
-      `SELECT id, request_fingerprint AS requestFingerprint
-       FROM edit_jobs WHERE artwork_id = ? AND idempotency_key = ? LIMIT 1`,
-    ).bind(ARTWORK_ID, input.idempotencyKey),
-    env.DB.prepare(activeConflictSql).bind(
-      ARTWORK_ID,
-      now,
-      0,
-      ARTWORK_SIZE,
-      0,
-      0,
-      ARTWORK_SIZE,
-      0,
-    ),
-    env.DB.prepare(
-      `SELECT
-         base.sequence AS baseSequence,
-         target.sequence AS targetSequence,
-         artwork.head_revision_id AS headRevisionId
-       FROM artworks artwork
-       JOIN revisions base
-         ON base.artwork_id = artwork.id AND base.id = ?
-       JOIN revisions target
-         ON target.artwork_id = artwork.id AND target.id = ?
-       WHERE artwork.id = ?`,
-    ).bind(input.baseRevisionId, input.targetRevisionId, ARTWORK_ID),
-    env.DB.prepare(
-      `SELECT CASE WHEN ? = 0 OR (
-         SELECT COUNT(*) FROM rate_limit_claims
-         WHERE requester_hash = ? AND scope = 'revert-10m' AND window_start = ?
-       ) < ? THEN 1 ELSE 0 END AS allowed`,
-    ).bind(
-      rate.enforced,
-      input.requesterHash,
-      revertRate.windowStart,
-      revertRate.limit,
-    ),
-    env.DB.prepare(
-      "INSERT OR IGNORE INTO authors (id, display_name, source, created_at) VALUES (?, ?, 'visitor', ?)",
-    ).bind(authorId, input.displayName, now),
-    env.DB.prepare(INSERT_REVERT_RESERVATION_SQL).bind(
-      jobId,
-      ARTWORK_ID,
-      authorId,
-      input.requesterHash,
-      input.baseRevisionId,
-      input.targetRevisionId,
-      `Restore revision ${targetRevision.sequence} as a new layer of history.`,
-      input.idempotencyKey,
-      fingerprint,
-      now,
-      leaseExpiresAt,
-      now,
-      null,
-      input.requestId,
-      rate.enforced,
-      revertRate.windowStart,
-      revertRate.limit,
-    ),
-    env.DB.prepare(
-      `INSERT OR IGNORE INTO rate_limit_claims
-       (requester_hash, scope, window_start, idempotency_key, job_id, created_at)
-       SELECT ?, 'revert-10m', ?, ?, ?, ?
-       WHERE ? = 1 AND EXISTS (SELECT 1 FROM edit_jobs WHERE id = ?)`,
-    ).bind(
-      input.requesterHash,
-      revertRate.windowStart,
-      input.idempotencyKey,
-      jobId,
-      now,
-      rate.enforced,
-      jobId,
-    ),
-    env.DB.prepare(
-      `DELETE FROM authors
-       WHERE id = ? AND NOT EXISTS (SELECT 1 FROM edit_jobs WHERE id = ?)`,
-    ).bind(authorId, jobId),
-  ]));
-
-  const existing = firstResult<ExistingIdempotencyRow>(reservation[0]);
-  if (existing) {
-    if (existing.requestFingerprint !== fingerprint) {
-      throw new DomainError(
-        "IDEMPOTENCY_CONFLICT",
-        "That submission key was already used for a different restore request.",
-      );
-    }
-    return getPublicJob(env, existing.id);
-  }
-
-  if (Number(reservation[5]?.meta.changes ?? 0) === 0) {
-    const racedIdempotency = await getIdempotentJob(env, input.idempotencyKey);
-    if (racedIdempotency) {
-      if (racedIdempotency.requestFingerprint !== fingerprint) {
-        throw new DomainError(
-          "IDEMPOTENCY_CONFLICT",
-          "That submission key was already used for a different restore request.",
-        );
-      }
-      return getPublicJob(env, racedIdempotency.id);
-    }
-    if (!Boolean(firstResult<{ allowed: number }>(reservation[3])?.allowed)) {
-      throw new DomainError(
-        "RATE_LIMITED",
-        "Too many contributions from this connection. Try again later.",
-      );
-    }
-    const conflict = firstResult<ActiveRegionRow>(reservation[1]);
-    if (conflict) throw regionBusyError(conflict);
-    const target = firstResult<{
-      baseSequence: number;
-      targetSequence: number;
-      headRevisionId: string;
-    }>(reservation[2]);
-    if (!target || target.targetSequence >= target.baseSequence) {
-      throw new DomainError("INVALID_REQUEST", "Choose an earlier revision to restore.");
-    }
-    throw new DomainError(
-      "STALE_BASE_REVISION",
-      "The artwork changed before the full-canvas restore could be reserved.",
-    );
-  }
-  return getPublicJob(env, jobId);
 }
 
 type RetryCandidateRow = {

@@ -31,11 +31,10 @@ import {
 
 type QueueJob = {
   id: string;
-  kind: "edit" | "revert";
+  kind: "edit";
   state: "moderating" | "generating" | "committing";
   authorId: string;
   baseRevisionId: string;
-  targetRevisionId: string | null;
   prompt: string;
   regionX: number | null;
   regionY: number | null;
@@ -209,6 +208,8 @@ export const QUEUE_WORK_STATUS_SQL = `SELECT
   EXISTS (
     SELECT 1 FROM edit_jobs
     WHERE artwork_id = ?
+      AND kind = 'edit'
+      AND execution_mode = 'openai'
       AND state = 'queued'
       AND available_at <> ?
       AND available_at <= ?
@@ -222,10 +223,7 @@ export const QUEUE_WORK_STATUS_SQL = `SELECT
         (state IN ('queued', 'moderating', 'generating', 'committing')
          AND (lease_expires_at IS NULL OR lease_expires_at <= ?))
         OR (
-          kind = 'edit'
-          AND (
-            execution_mode <> 'openai'
-          )
+          (kind <> 'edit' OR execution_mode <> 'openai')
           AND state IN ('queued', 'moderating', 'generating', 'committing')
         )
       )
@@ -233,10 +231,7 @@ export const QUEUE_WORK_STATUS_SQL = `SELECT
   ) AS needsRecovery`;
 
 export const CLAIM_NEXT_JOB_SQL = `UPDATE edit_jobs
-SET state = CASE
-      WHEN kind = 'revert' THEN 'committing'
-      ELSE 'moderating'
-    END,
+SET state = 'moderating',
     worker_token = ?,
     lease_fence = lease_fence + 1,
     lease_expires_at = ?,
@@ -249,13 +244,8 @@ WHERE id = (
     AND candidate.state = 'queued'
     AND candidate.available_at <= ?
     AND candidate.lease_expires_at > ?
-    AND (
-      candidate.kind = 'revert'
-      OR (
-        candidate.kind = 'edit'
-        AND candidate.execution_mode = 'openai'
-      )
-    )
+    AND candidate.kind = 'edit'
+    AND candidate.execution_mode = 'openai'
     AND NOT EXISTS (
       SELECT 1 FROM edit_jobs active
       WHERE active.artwork_id = candidate.artwork_id
@@ -279,7 +269,6 @@ RETURNING
   state,
   author_id AS authorId,
   base_revision_id AS baseRevisionId,
-  target_revision_id AS targetRevisionId,
   prompt,
   region_x AS regionX,
   region_y AS regionY,
@@ -342,7 +331,7 @@ async function claimNextJob(env: AppEnv): Promise<QueueJob | null> {
 
 export const CLAIMED_JOB_BY_TOKEN_SQL = `SELECT
   id, kind, state, author_id AS authorId,
-  base_revision_id AS baseRevisionId, target_revision_id AS targetRevisionId,
+  base_revision_id AS baseRevisionId,
   prompt, region_x AS regionX, region_y AS regionY,
   region_width AS regionWidth, region_height AS regionHeight,
   frame_x AS frameX, frame_y AS frameY,
@@ -354,6 +343,8 @@ export const CLAIMED_JOB_BY_TOKEN_SQL = `SELECT
   worker_token AS workerToken, created_at AS createdAt
 FROM edit_jobs
 WHERE artwork_id = ? AND worker_token = ?
+  AND kind = 'edit'
+  AND execution_mode = 'openai'
   AND state IN ('moderating', 'generating', 'committing')
 LIMIT 1`;
 
@@ -415,19 +406,16 @@ WHERE job_id IN (
     AND error_code = 'QUEUE_PREPARATION_EXPIRED'
 )`;
 
-export const RETIRE_NON_LIVE_EDIT_JOBS_SQL = `UPDATE edit_jobs
+export const RETIRE_UNSUPPORTED_JOBS_SQL = `UPDATE edit_jobs
 SET state = 'failed',
-    error_code = 'NON_LIVE_MODE_REMOVED',
-    public_error_message = 'This queued edit used a retired contribution format. Submit it again with the current editor.',
+    error_code = 'CONTRIBUTION_MODE_REMOVED',
+    public_error_message = 'This queued request used a retired contribution format. Nothing was added to history.',
     worker_token = NULL,
     lease_expires_at = NULL,
     updated_at = ?,
     completed_at = ?
 WHERE artwork_id = ?
-  AND kind = 'edit'
-  AND (
-    execution_mode <> 'openai'
-  )
+  AND (kind <> 'edit' OR execution_mode <> 'openai')
   AND state IN ('queued', 'moderating', 'generating', 'committing')`;
 
 export const SUPERSEDE_EXPIRED_ACTIVE_RESERVATION_SQL = `UPDATE edit_jobs
@@ -467,7 +455,7 @@ WHERE artwork_id = ?
 
 async function recoverExpiredJobs(env: AppEnv, now: number) {
   await env.DB.batch([
-    env.DB.prepare(RETIRE_NON_LIVE_EDIT_JOBS_SQL).bind(
+    env.DB.prepare(RETIRE_UNSUPPORTED_JOBS_SQL).bind(
       now,
       now,
       ARTWORK_ID,
@@ -567,11 +555,6 @@ function startWorkerHeartbeat(env: AppEnv, job: QueueJob): WorkerHeartbeat {
 async function processClaimedJob(env: AppEnv, job: QueueJob) {
   let heartbeat: WorkerHeartbeat | null = null;
   try {
-    if (job.kind === "revert") {
-      await commitRevert(env, job);
-      return;
-    }
-
     if (!job.displayMaskBlobId) {
       throw new DomainError("INTERNAL_ERROR", "The generated layer mask is missing.");
     }
@@ -1321,138 +1304,6 @@ async function commitPatch(
       throw new DomainError(
         "INTERNAL_ERROR",
         "The accepted patch could not be committed completely.",
-      );
-    }
-  } finally {
-    await releaseCommitLock(env, lock);
-  }
-}
-
-export const COMMIT_REVERT_REVISION_SQL = `WITH candidate(
-  revision_id, job_id, worker_token, lease_fence,
-  commit_token, commit_fence, now_ms
-) AS (VALUES (?, ?, ?, ?, ?, ?, ?))
-INSERT INTO revisions (
-  id, artwork_id, sequence, parent_revision_id, job_id, origin, status,
-  author_id, prompt, region_x, region_y, region_width, region_height,
-  revert_target_revision_id, created_at
-)
-SELECT
-  c.revision_id,
-  job.artwork_id,
-  artwork.head_sequence + 1,
-  artwork.head_revision_id,
-  job.id,
-  'revert',
-  'accepted',
-  job.author_id,
-  job.prompt,
-  job.region_x,
-  job.region_y,
-  job.region_width,
-  job.region_height,
-  job.target_revision_id,
-  c.now_ms
-FROM candidate c
-JOIN edit_jobs job ON job.id = c.job_id
-JOIN artworks artwork ON artwork.id = job.artwork_id
-JOIN revisions base
-  ON base.artwork_id = job.artwork_id AND base.id = job.base_revision_id
-JOIN artwork_commit_locks commit_lock
-  ON commit_lock.artwork_id = job.artwork_id
-WHERE job.kind = 'revert'
-  AND job.state = 'committing'
-  AND job.worker_token = c.worker_token
-  AND job.lease_fence = c.lease_fence
-  AND job.lease_expires_at > c.now_ms
-  AND commit_lock.owner_token = c.commit_token
-  AND commit_lock.fence = c.commit_fence
-  AND commit_lock.job_id = job.id
-  AND commit_lock.lease_expires_at > c.now_ms
-  AND NOT EXISTS (
-    SELECT 1 FROM revisions accepted
-    WHERE accepted.artwork_id = job.artwork_id
-      AND accepted.sequence > base.sequence
-      AND accepted.region_x IS NOT NULL
-      AND accepted.region_x < job.region_x + job.region_width
-      AND accepted.region_x + accepted.region_width > job.region_x
-      AND accepted.region_y < job.region_y + job.region_height
-      AND accepted.region_y + accepted.region_height > job.region_y
-  )
-  AND NOT EXISTS (
-    SELECT 1 FROM edit_jobs active
-    WHERE active.artwork_id = job.artwork_id
-      AND active.id <> job.id
-      AND active.state IN ('queued', 'moderating', 'generating', 'committing')
-      AND active.lease_expires_at > c.now_ms
-      AND active.region_x < job.region_x + job.region_width
-      AND active.region_x + active.region_width > job.region_x
-      AND active.region_y < job.region_y + job.region_height
-      AND active.region_y + active.region_height > job.region_y
-  )`;
-
-async function commitRevert(env: AppEnv, job: QueueJob) {
-  if (!job.targetRevisionId) {
-    throw new DomainError("INTERNAL_ERROR", "The restore target is missing.");
-  }
-  jobRegion(job);
-  const revisionId = crypto.randomUUID();
-  const lock = await acquireCommitLock(env, job.id);
-  try {
-    await assertCommitStillValid(env, job, lock);
-    const now = Date.now();
-    const committed = await env.DB.batch([
-      env.DB.prepare(COMMIT_REVERT_REVISION_SQL).bind(
-        revisionId,
-        job.id,
-        job.workerToken,
-        job.leaseFence,
-        lock.ownerToken,
-        lock.fence,
-        now,
-      ),
-      env.DB.prepare(
-        `UPDATE artworks
-         SET head_revision_id = ?,
-             head_sequence = (SELECT sequence FROM revisions WHERE id = ?)
-         WHERE id = ?
-           AND EXISTS (SELECT 1 FROM revisions WHERE id = ?)
-           AND head_revision_id = (
-             SELECT parent_revision_id FROM revisions WHERE id = ?
-           )`,
-      ).bind(revisionId, revisionId, ARTWORK_ID, revisionId, revisionId),
-      env.DB.prepare(
-        `UPDATE edit_jobs
-         SET state = 'succeeded',
-             result_revision_id = ?,
-             worker_token = NULL,
-             lease_expires_at = NULL,
-             updated_at = ?,
-             completed_at = ?
-         WHERE id = ?
-           AND worker_token = ?
-           AND lease_fence = ?
-           AND EXISTS (SELECT 1 FROM revisions WHERE id = ?)`,
-      ).bind(
-        revisionId,
-        now,
-        now,
-        job.id,
-        job.workerToken,
-        job.leaseFence,
-        revisionId,
-      ),
-      env.DB.prepare(
-        `UPDATE artwork_commit_locks
-         SET owner_token = NULL, job_id = NULL, acquired_at = NULL,
-             lease_expires_at = NULL
-         WHERE artwork_id = ? AND owner_token = ? AND fence = ?`,
-      ).bind(ARTWORK_ID, lock.ownerToken, lock.fence),
-    ]);
-    if (Number(committed[0]?.meta.changes ?? 0) === 0) {
-      throw new DomainError(
-        "STALE_BASE_REVISION",
-        "The full-canvas restore could not commit against the current artwork.",
       );
     }
   } finally {

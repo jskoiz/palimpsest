@@ -1522,70 +1522,13 @@ test("a fenced worker can record failure after its lease lapses", async () => {
   db.close();
 });
 
-test("full-artwork reverts wait for every active reservation", async () => {
-  const db = await migratedDatabase();
-  seedArtwork(db);
-  const [insertEditSql, insertRevertSql] = await Promise.all([
-    readSqlConstant("lib/palimpsest/store.ts", "INSERT_EDIT_RESERVATION_SQL"),
-    readSqlConstant("lib/palimpsest/store.ts", "INSERT_REVERT_RESERVATION_SQL"),
-  ]);
-  const now = 20_000;
-  db.exec(`
-    INSERT INTO revisions (
-      id, artwork_id, sequence, parent_revision_id, origin, status,
-      author_id, prompt, region_x, region_y, region_width, region_height, created_at
-    ) VALUES ('target', 'palimpsest', -1, NULL, 'seed', 'accepted', 'archive',
-      'Target', NULL, NULL, NULL, NULL, 0);
-  `);
-  db.prepare(insertEditSql).run(...reservationValues({
-    jobId: "active-edit",
-    authorId: "author-a",
-    region: { x: 1800, y: 1800, width: 100, height: 100 },
-    now,
-  }));
-  const revert = db.prepare(insertRevertSql);
-  const revertValues = [
-    "revert-job",
-    "palimpsest",
-    "author-b",
-    "shared-nat",
-    "r0",
-    "target",
-    "Restore",
-    "idem-revert",
-    "fingerprint-revert",
-    now,
-    now + 60_000,
-    now,
-    null,
-    "request-revert",
-    0,
-    0,
-    2,
-  ];
-  assert.equal(revert.run(...revertValues).changes, 0);
-
-  db.exec("UPDATE edit_jobs SET state = 'failed', lease_expires_at = NULL");
-  assert.equal(revert.run(...revertValues).changes, 1);
-  const region = db.prepare(
-    "SELECT region_x, region_y, region_width, region_height FROM edit_jobs WHERE id = 'revert-job'",
-  ).get();
-  assert.deepEqual({ ...region }, {
-    region_x: 0,
-    region_y: 0,
-    region_width: 2048,
-    region_height: 2048,
-  });
-  db.close();
-});
-
-test("queue retires obsolete modes while keeping reference-guided OpenAI work", async () => {
+test("queue retires restore requests and obsolete modes while keeping OpenAI edits", async () => {
   const db = await migratedDatabase();
   seedArtwork(db);
   const [insertSql, claimSql, retireSql, workStatusSql] = await Promise.all([
     readSqlConstant("lib/palimpsest/store.ts", "INSERT_EDIT_RESERVATION_SQL"),
     readSqlConstant("lib/palimpsest/queue.ts", "CLAIM_NEXT_JOB_SQL"),
-    readSqlConstant("lib/palimpsest/queue.ts", "RETIRE_NON_LIVE_EDIT_JOBS_SQL"),
+    readSqlConstant("lib/palimpsest/queue.ts", "RETIRE_UNSUPPORTED_JOBS_SQL"),
     readSqlConstant("lib/palimpsest/queue.ts", "QUEUE_WORK_STATUS_SQL"),
   ]);
   const now = 30_000;
@@ -1634,6 +1577,20 @@ test("queue retires obsolete modes while keeping reference-guided OpenAI work", 
     region: { x: 1500, y: 1500, width: 100, height: 100 },
     now: now + 1,
   }));
+  db.exec(`
+    INSERT INTO edit_jobs (
+      id, artwork_id, kind, state, execution_mode, author_id, requester_hash,
+      base_revision_id, target_revision_id, prompt,
+      region_x, region_y, region_width, region_height,
+      idempotency_key, request_fingerprint, available_at, lease_expires_at,
+      created_at, updated_at
+    ) VALUES (
+      'legacy-restore', 'palimpsest', 'revert', 'queued', 'none', 'author-b',
+      'shared-nat', 'r0', 'r0', 'Restore', 0, 0, 2048, 2048,
+      'idem-legacy-restore', 'fingerprint-legacy-restore',
+      30000, 90000, 30000, 30000
+    )
+  `);
 
   assert.deepEqual(
     {
@@ -1647,6 +1604,11 @@ test("queue retires obsolete modes while keeping reference-guided OpenAI work", 
       ),
     },
     { hasReady: 1, needsRecovery: 1 },
+  );
+
+  assert.equal(
+    db.prepare(retireSql).run(now + 2, now + 2, "palimpsest").changes,
+    3,
   );
 
   const claim = db.prepare(claimSql);
@@ -1665,11 +1627,6 @@ test("queue retires obsolete modes while keeping reference-guided OpenAI work", 
   assert.equal(first.id, "claim-reference");
   assert.equal(first.executionMode, "openai");
   assert.equal(first.referenceBlobId, "reference-a");
-
-  assert.equal(
-    db.prepare(retireSql).run(now + 2, now + 2, "palimpsest").changes,
-    2,
-  );
 
   const second = claim.get(
     "worker-b",
@@ -1696,7 +1653,8 @@ test("queue retires obsolete modes while keeping reference-guided OpenAI work", 
        WHERE id IN (
          'claim-retired',
          'claim-placement',
-         'active-reference'
+         'active-reference',
+         'legacy-restore'
        )
        ORDER BY id`,
     ).all().map((row) => ({ ...row })),
@@ -1711,14 +1669,21 @@ test("queue retires obsolete modes while keeping reference-guided OpenAI work", 
       {
         id: "claim-placement",
         state: "failed",
-        error_code: "NON_LIVE_MODE_REMOVED",
+        error_code: "CONTRIBUTION_MODE_REMOVED",
         worker_token: null,
         lease_expires_at: null,
       },
       {
         id: "claim-retired",
         state: "failed",
-        error_code: "NON_LIVE_MODE_REMOVED",
+        error_code: "CONTRIBUTION_MODE_REMOVED",
+        worker_token: null,
+        lease_expires_at: null,
+      },
+      {
+        id: "legacy-restore",
+        state: "failed",
+        error_code: "CONTRIBUTION_MODE_REMOVED",
         worker_token: null,
         lease_expires_at: null,
       },
