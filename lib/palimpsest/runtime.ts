@@ -9,6 +9,7 @@ export interface AppEnv {
   ADMIN_EMAIL_ALLOWLIST?: string;
   RATE_LIMIT_SALT?: string;
   VISITOR_LOG_SALT?: string;
+  AUTOMATION_RETRY_TOKEN?: string;
 }
 
 export function getRuntimeEnv(): AppEnv {

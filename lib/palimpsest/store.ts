@@ -1889,18 +1889,17 @@ WHERE parent.artwork_id = c.artwork_id
     )
   )`;
 
-export async function retryFailedEditJob(
+async function retryFailedEditJobWithIdentity(
   env: AppEnv,
   input: {
     jobId: string;
     requesterHash: string;
-    retryToken: string;
+    retryTokenHash: string;
     idempotencyKey: string;
     rateLimits: readonly ContributionRateLimit[];
     requestId: string;
   },
 ) {
-  const retryTokenHash = await sha256Hex(input.retryToken);
   const candidate = await runIdempotentD1(() =>
     env.DB.prepare(
       `SELECT j.id, j.state, j.execution_mode AS executionMode,
@@ -1918,7 +1917,7 @@ export async function retryFailedEditJob(
        WHERE j.id = ? AND j.artwork_id = ? AND j.kind = 'edit'
          AND j.requester_hash = ? AND j.retry_token_hash = ?`,
     )
-      .bind(input.jobId, ARTWORK_ID, input.requesterHash, retryTokenHash)
+      .bind(input.jobId, ARTWORK_ID, input.requesterHash, input.retryTokenHash)
       .first<RetryCandidateRow>(),
   );
   if (!candidate) {
@@ -1932,7 +1931,7 @@ export async function retryFailedEditJob(
     );
   }
   if (candidate.successorId) {
-    return { ...(await getPublicJob(env, candidate.successorId)), retryToken: input.retryToken };
+    return getPublicJob(env, candidate.successorId);
   }
   const technicallyRetryable =
     candidate.state === "failed" &&
@@ -2003,7 +2002,7 @@ export async function retryFailedEditJob(
         input.jobId,
         ARTWORK_ID,
         input.requesterHash,
-        retryTokenHash,
+        input.retryTokenHash,
         successorKey,
         input.requestId,
         now,
@@ -2069,7 +2068,62 @@ export async function retryFailedEditJob(
       "The original region is no longer safe to retry. Submit against the latest canvas instead.",
     );
   }
-  return { ...(await getPublicJob(env, resolvedId)), retryToken: input.retryToken };
+  return getPublicJob(env, resolvedId);
+}
+
+export async function retryFailedEditJob(
+  env: AppEnv,
+  input: {
+    jobId: string;
+    requesterHash: string;
+    retryToken: string;
+    idempotencyKey: string;
+    rateLimits: readonly ContributionRateLimit[];
+    requestId: string;
+  },
+) {
+  const job = await retryFailedEditJobWithIdentity(env, {
+    jobId: input.jobId,
+    requesterHash: input.requesterHash,
+    retryTokenHash: await sha256Hex(input.retryToken),
+    idempotencyKey: input.idempotencyKey,
+    rateLimits: input.rateLimits,
+    requestId: input.requestId,
+  });
+  return { ...job, retryToken: input.retryToken };
+}
+
+export async function retryFailedEditJobAsAutomation(
+  env: AppEnv,
+  input: {
+    jobId: string;
+    idempotencyKey: string;
+    requestId: string;
+  },
+) {
+  const identity = await runIdempotentD1(() =>
+    env.DB.prepare(
+      `SELECT requester_hash AS requesterHash, retry_token_hash AS retryTokenHash
+       FROM edit_jobs
+       WHERE id = ? AND artwork_id = ? AND kind = 'edit'`,
+    )
+      .bind(input.jobId, ARTWORK_ID)
+      .first<{ requesterHash: string; retryTokenHash: string | null }>(),
+  );
+  if (!identity?.requesterHash || !identity.retryTokenHash) {
+    throw new DomainError(
+      "JOB_NOT_RETRYABLE",
+      "This attempt cannot be retried safely.",
+    );
+  }
+  return retryFailedEditJobWithIdentity(env, {
+    jobId: input.jobId,
+    requesterHash: identity.requesterHash,
+    retryTokenHash: identity.retryTokenHash,
+    idempotencyKey: input.idempotencyKey,
+    rateLimits: [],
+    requestId: input.requestId,
+  });
 }
 
 export async function getPublicJob(env: AppEnv, jobId: string) {

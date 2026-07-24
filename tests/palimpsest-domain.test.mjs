@@ -48,6 +48,7 @@ import {
   WORKER_LEASE_MS,
 } from "../lib/palimpsest/worker-policy.mjs";
 import { isGenerationCreditExhaustion } from "../lib/palimpsest/provider-errors.mjs";
+import { hasAutomationAccess } from "../lib/palimpsest/automation-auth.mjs";
 
 function expectCode(callback, code) {
   assert.throws(callback, (error) => error instanceof DomainError && error.code === code);
@@ -117,6 +118,15 @@ test("generation credit exhaustion stays distinct from ordinary rate limits", ()
     }),
     false,
   );
+});
+
+test("automation retry access requires the exact configured bearer secret", async () => {
+  const token = "automation-secret-with-at-least-thirty-two-characters";
+  assert.equal(await hasAutomationAccess(`Bearer ${token}`, token), true);
+  assert.equal(await hasAutomationAccess(`Bearer ${token}-wrong`, token), false);
+  assert.equal(await hasAutomationAccess(token, token), false);
+  assert.equal(await hasAutomationAccess("Bearer short", "short"), false);
+  assert.equal(await hasAutomationAccess(null, token), false);
 });
 
 test("queue recovery and collaboration polling back off with bounded jitter", () => {
@@ -909,11 +919,22 @@ test("extreme reference aspects are rejected after visible bounds are prepared",
 });
 
 test("generation stays attached to submission and retry requests", async () => {
-  const [clientSource, workerSource, editRoute, retryRoute, revertRoute] = await Promise.all([
+  const [
+    clientSource,
+    workerSource,
+    editRoute,
+    retryRoute,
+    automationRetryRoute,
+    revertRoute,
+  ] = await Promise.all([
     readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8"),
     readFile(new URL("../worker/index.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/api/edits/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/api/jobs/[jobId]/retry/route.ts", import.meta.url), "utf8"),
+    readFile(
+      new URL("../app/api/automation/jobs/[jobId]/retry/route.ts", import.meta.url),
+      "utf8",
+    ),
     readFile(new URL("../app/api/reverts/route.ts", import.meta.url), "utf8"),
   ]);
   const submitStart = clientSource.indexOf("const submitEdit = async");
@@ -925,10 +946,13 @@ test("generation stays attached to submission and retry requests", async () => {
   assert.doesNotMatch(submit, /if \(!placement\) void requestQueueDrain/);
   assert.match(clientSource, /referenceImage \? 350 : 3000/);
   assert.match(clientSource, /fetchJson<\{ job: Job \}>\(`\/api\/jobs\//);
-  for (const route of [editRoute, retryRoute, revertRoute]) {
+  for (const route of [editRoute, retryRoute, automationRetryRoute, revertRoute]) {
     assert.match(route, /await processQueue\(env, 1\)/);
     assert.match(route, /await getPublicJob\(env, job\.id\)/);
   }
+  assert.match(automationRetryRoute, /env\.AUTOMATION_RETRY_TOKEN/);
+  assert.match(automationRetryRoute, /retryFailedEditJobAsAutomation/);
+  assert.doesNotMatch(automationRetryRoute, /X-Palimpsest-Retry-Token/);
   assert.doesNotMatch(workerSource, /processQueue|\/api\/edits/);
 });
 
