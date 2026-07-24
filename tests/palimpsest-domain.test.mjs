@@ -826,6 +826,25 @@ test("one-click image upload skips mask painting and opens the blending prompt",
   assert.match(stepOne, /referenceInputRef\.current\.click\(\)/);
 });
 
+test("contributions default to the entire patch with fine details as the alternative", async () => {
+  const source = await readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8");
+  const openEditorStart = source.indexOf("const openEditor = useCallback");
+  const closeEditorStart = source.indexOf("const closeEditor = useCallback", openEditorStart);
+  assert.ok(openEditorStart >= 0 && closeEditorStart > openEditorStart);
+  const openEditor = source.slice(openEditorStart, closeEditorStart);
+  assert.match(openEditor, /setStrokes\(\[\]\);\s*setFillMask\(true\)/);
+
+  const editorStart = source.indexOf('aria-label="Contribute an edit"');
+  const stepTwoStart = source.indexOf("{step === 2 ? (", editorStart);
+  const stepThreeStart = source.indexOf("{step === 3 ? (", stepTwoStart);
+  assert.ok(editorStart >= 0 && stepTwoStart > editorStart && stepThreeStart > stepTwoStart);
+  const stepTwo = source.slice(stepTwoStart, stepThreeStart);
+  assert.match(stepTwo, /use entire patch/);
+  assert.match(stepTwo, /fine details/);
+  assert.match(stepTwo, /aria-pressed=\{fillMask\}/);
+  assert.match(stepTwo, /aria-pressed=\{!fillMask\}/);
+});
+
 test("extreme reference aspects are rejected after visible bounds are prepared", async () => {
   const source = await readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8");
   const normalizeStart = source.indexOf("async function normalizeReferenceImage");

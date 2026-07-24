@@ -724,9 +724,10 @@ function WelcomeDrawer({
                 <span>03</span>
                 <h2>Contribute</h2>
                 <p>
-                  Place and resize the patch, then paint what may change. Add an image
-                  as a visual reference. GPT Image makes the edit, GPT-5.6 reviews it,
-                  and only active work is locked.
+                  Place and resize the patch. The entire patch is ready by default;
+                  paint fine details only when needed. Add an image as a visual
+                  reference. GPT Image makes the edit, GPT-5.6 reviews it, and only
+                  active work is locked.
                 </p>
               </section>
             </div>
@@ -1924,7 +1925,7 @@ export default function Palimpsest() {
     setEditOpen(true);
     setStep(1);
     setStrokes([]);
-    setFillMask(false);
+    setFillMask(true);
     setPrompt("");
     clearReferenceImage();
     setLocalSubmissionFailure(null);
@@ -3428,12 +3429,14 @@ export default function Palimpsest() {
           {step === 2 ? (
             <div className="mono-edit-row">
               <span className="mono-edit-hint">
-                drag your cursor inside the patch to paint what may change
+                {fillMask
+                  ? "the entire patch can change · choose fine details only to limit the edit"
+                  : "drag inside the patch to paint only the details that may change"}
               </span>
               <button
                 type="button"
                 className="mono-action"
-                disabled={strokes.length === 0}
+                disabled={fillMask || strokes.length === 0}
                 onClick={() => setStrokes((current) => current.slice(0, -1))}
               >
                 [undo]
@@ -3441,7 +3444,7 @@ export default function Palimpsest() {
               <button
                 type="button"
                 className="mono-action"
-                disabled={!validMask}
+                disabled={fillMask || strokes.length === 0}
                 onClick={() => {
                   setStrokes([]);
                   setFillMask(false);
@@ -3455,13 +3458,23 @@ export default function Palimpsest() {
                 aria-pressed={fillMask}
                 disabled={Boolean(conflictingRegion)}
                 onClick={() => {
-                  setFillMask((value) => {
-                    if (!value) setStrokes([]);
-                    return !value;
-                  });
+                  setStrokes([]);
+                  setFillMask(true);
                 }}
               >
                 {fillMask ? "[x] use entire patch" : "[ ] use entire patch"}
+              </button>
+              <button
+                type="button"
+                className={`mono-action${!fillMask ? " is-accent" : ""}`}
+                aria-pressed={!fillMask}
+                disabled={Boolean(conflictingRegion)}
+                onClick={() => {
+                  setStrokes([]);
+                  setFillMask(false);
+                }}
+              >
+                {!fillMask ? "[x] fine details" : "[ ] fine details"}
               </button>
               <button
                 type="button"
