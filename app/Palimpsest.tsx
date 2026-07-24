@@ -708,7 +708,8 @@ function WelcomeDrawer({
                 <p>
                   Place and resize the patch, then paint what may change. GPT Image
                   makes one masked image pass; GPT-5.6 checks it once before acceptance.
-                  Each submission is time-bounded and never silently replays a second generation.
+                  Each submission stays connected until that pass and review finish,
+                  and never silently replays a second generation.
                   Uploaded images become positioned visual references for the same
                   generation and review path, so GPT Image can preserve their identity
                   while blending them into the surrounding canvas. Live outlines lock

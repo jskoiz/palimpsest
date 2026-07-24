@@ -1,8 +1,10 @@
 import { DomainError } from "@/lib/palimpsest/domain.mjs";
+import { processQueue } from "@/lib/palimpsest/queue";
 import { contributionRatePolicy } from "@/lib/palimpsest/rate-policy.mjs";
 import { createRequestId, getRuntimeEnv, jsonError } from "@/lib/palimpsest/runtime";
 import {
   ensurePalimpsest,
+  getPublicJob,
   requesterHash,
   retryFailedEditJob,
 } from "@/lib/palimpsest/store";
@@ -34,8 +36,10 @@ export async function POST(
       rateLimits: ratePolicy.limits,
       requestId,
     });
+    await processQueue(env, 1);
+    const processedJob = await getPublicJob(env, job.id);
     return Response.json(
-      { job },
+      { job: { ...processedJob, retryToken } },
       { status: 202, headers: { "Cache-Control": "no-store", "X-Request-Id": requestId } },
     );
   } catch (error) {

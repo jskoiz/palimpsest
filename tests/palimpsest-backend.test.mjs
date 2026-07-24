@@ -1963,19 +1963,25 @@ test("safe manual retry creates one immutable successor and keeps the failure vi
       source_blob_id, mask_blob_id, display_mask_blob_id,
       idempotency_key, request_fingerprint, retry_token_hash, request_id,
       available_at, lease_expires_at, error_code, public_error_message,
-      created_at, updated_at, completed_at
+      created_at, updated_at, started_at, completed_at
     ) VALUES (
       'failed-parent', 'palimpsest', 'edit', 'failed', 'openai', 'author-a', 'owner',
       'r0', 'Private prompt', 10, 20, 100, 120, 0, 0, 1024, 1024,
       'retry-source', 'retry-mask', 'retry-display', 'parent-key', 'fingerprint',
       'token-hash', 'request-parent', 1, NULL, 'PROVIDER_TEMPORARY', 'Try again.',
-      1000, 2000, 2000
+      1000, 2000, NULL, 2000
     ), (
       'failed-review', 'palimpsest', 'edit', 'failed', 'openai', 'author-a', 'owner',
       'r0', 'Private prompt', 140, 20, 100, 120, 0, 0, 1024, 1024,
       'retry-source', 'retry-mask', 'retry-display', 'review-parent-key', 'review-fingerprint',
       'token-hash', 'request-review-parent', 1, NULL, 'SUBJECT_OUT_OF_FRAME',
-      'Use retry for one fresh attempt.', 1100, 2100, 2100
+      'Use retry for one fresh attempt.', 1100, 2100, NULL, 2100
+    ), (
+      'failed-worker', 'palimpsest', 'edit', 'failed', 'openai', 'author-a', 'owner',
+      'r0', 'Private prompt', 270, 20, 100, 120, 0, 0, 1024, 1024,
+      'retry-source', 'retry-mask', 'retry-display', 'worker-parent-key', 'worker-fingerprint',
+      'token-hash', 'request-worker-parent', 1, NULL, 'QUEUE_LEASE_EXPIRED',
+      'The generation worker stopped before finishing.', 1200, 2200, 1300, 2200
     );
   `);
   const retrySql = await readSqlConstant(
@@ -1986,7 +1992,9 @@ test("safe manual retry creates one immutable successor and keeps the failure vi
   const beforeRetry = db.prepare(recentSql).all(2500, "palimpsest", "palimpsest");
   assert.equal(beforeRetry.find((row) => row.jobId === "failed-parent").retryable, 1);
   assert.equal(beforeRetry.find((row) => row.jobId === "failed-review").retryable, 1);
+  assert.equal(beforeRetry.find((row) => row.jobId === "failed-worker").retryable, 1);
   assert.match(retrySql, /REFERENCE_REVIEW_FAILED/u);
+  assert.match(retrySql, /QUEUE_LEASE_EXPIRED/u);
 
   const values = [
     "retry-child", "failed-parent", "palimpsest", "owner", "token-hash",
@@ -1999,6 +2007,11 @@ test("safe manual retry creates one immutable successor and keeps the failure vi
     "review-child-key", "request-review-child", 3100, 63100, 0, 0, 3, 0, 12,
   ];
   assert.equal(db.prepare(retrySql).run(...reviewValues).changes, 1);
+  const workerValues = [
+    "retry-worker-child", "failed-worker", "palimpsest", "owner", "token-hash",
+    "worker-child-key", "request-worker-child", 3200, 63200, 0, 0, 3, 0, 12,
+  ];
+  assert.equal(db.prepare(retrySql).run(...workerValues).changes, 1);
   assert.deepEqual(
     {
       ...db.prepare(

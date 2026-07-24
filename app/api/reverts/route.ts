@@ -2,10 +2,12 @@ import {
   DomainError,
   normalizeDisplayName,
 } from "@/lib/palimpsest/domain.mjs";
+import { processQueue } from "@/lib/palimpsest/queue";
 import { contributionRatePolicy } from "@/lib/palimpsest/rate-policy.mjs";
 import { createRequestId, getRuntimeEnv, jsonError } from "@/lib/palimpsest/runtime";
 import {
   ensurePalimpsest,
+  getPublicJob,
   insertRevertJob,
   recordVisitorEvent,
   requesterHash,
@@ -56,8 +58,13 @@ export async function POST(request: Request) {
       kind: "revert",
       ratePolicy: ratePolicy.name,
     });
+    await processQueue(env, 1);
+    const processedJob = await getPublicJob(env, job.id);
     return Response.json(
-      { job, notice: "The earlier appearance will be restored as a new revision. Existing history remains unchanged." },
+      {
+        job: processedJob,
+        notice: "The earlier appearance will be restored as a new revision. Existing history remains unchanged.",
+      },
       { status: 202, headers: { "Cache-Control": "no-store", "X-Request-Id": requestId } },
     );
   } catch (error) {

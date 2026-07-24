@@ -267,13 +267,14 @@ export function DebugDashboard() {
         }
         saveRetryCapabilities(nextCapabilities);
         setRetryNotice(
-          FAILURE_STATES.has(payload.job.state)
-            ? payload.job.error?.message ??
+          payload.job.state === "succeeded"
+            ? "The retry was accepted and added to permanent history."
+            : FAILURE_STATES.has(payload.job.state)
+              ? payload.job.error?.message ??
                 payload.job.message ??
                 "The retry ended without an accepted revision."
-            : "Retry reserved. The queue worker has been asked to start.",
+              : "Retry reserved. Keep this page open while it finishes.",
         );
-        void fetch("/api/queue/drain", { method: "POST" }).catch(() => undefined);
         await load();
       } catch (retryError) {
         setRetryNotice(

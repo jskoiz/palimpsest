@@ -43,12 +43,8 @@ import {
   viewForActivityRegion,
 } from "../app/activity-ui.mjs";
 import {
-  EDIT_REVIEW_TIMEOUT_MS,
-  IMAGE_EDIT_TIMEOUT_MS,
   WORKER_HEARTBEAT_MS,
   WORKER_LEASE_MS,
-  WORKER_TOTAL_BUDGET_MS,
-  boundedStageTimeout,
 } from "../lib/palimpsest/worker-policy.mjs";
 
 function expectCode(callback, code) {
@@ -92,16 +88,10 @@ test("queue recovery and collaboration polling back off with bounded jitter", ()
   assert.equal(collaborationPollDelay(false, true, 0.5), 30_000);
 });
 
-test("worker timing stays bounded and renews well before expiry", () => {
+test("worker lease renews without imposing a generation deadline", () => {
   assert.equal(WORKER_LEASE_MS, 60_000);
   assert.equal(WORKER_HEARTBEAT_MS, 15_000);
   assert.ok(WORKER_HEARTBEAT_MS * 3 < WORKER_LEASE_MS);
-  assert.equal(IMAGE_EDIT_TIMEOUT_MS, 120_000);
-  assert.equal(EDIT_REVIEW_TIMEOUT_MS, 45_000);
-  assert.equal(WORKER_TOTAL_BUDGET_MS, 180_000);
-  assert.ok(IMAGE_EDIT_TIMEOUT_MS + EDIT_REVIEW_TIMEOUT_MS < WORKER_TOTAL_BUDGET_MS);
-  assert.equal(boundedStageTimeout(10_000, 45_000, 1_000), 9_000);
-  assert.equal(boundedStageTimeout(10_000, 45_000, 12_000), 0);
 });
 
 test("activity region focus places the target above the queue panel", () => {
@@ -379,8 +369,10 @@ test("contributions route positioned references through contextual generation", 
   assert.match(storeSource, /const executionMode = "openai"/);
   assert.doesNotMatch(storeSource, /hasPlacement|placementBytes|createPlacementDisplayMaskSvg/);
   assert.match(schemaSource, /enum: \["openai", "placement", "none"\]/);
+  assert.match(routeSource, /await processQueue\(env, 1\)/);
+  assert.match(routeSource, /await getPublicJob\(env, job\.id\)/);
   assert.match(workerSource, /ctx\.waitUntil\(/);
-  assert.match(workerSource, /processQueue\(env, 1\)/);
+  assert.doesNotMatch(workerSource, /processQueue|\/api\/edits/);
   assert.doesNotMatch(readme, /demo renderer/i);
 });
 
@@ -511,7 +503,7 @@ test("reference-guided edits receive fidelity, placement, blending, and source r
   assert.equal(extractReferenceEditReview({ output: [] }), null);
 });
 
-test("prompt generation uses one bounded image pass and one review pass", async () => {
+test("prompt generation uses one image pass and one review pass without a time cutoff", async () => {
   const [clientSource, queueSource] = await Promise.all([
     readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8"),
     readFile(new URL("../lib/palimpsest/queue.ts", import.meta.url), "utf8"),
@@ -523,7 +515,7 @@ test("prompt generation uses one bounded image pass and one review pass", async 
   assert.doesNotMatch(clientSource, /automatic retry/);
   assert.doesNotMatch(clientSource, /plans the request/);
   assert.equal(queueSource.match(/await generateOpenAiPatch\(/gu)?.length, 1);
-  assert.match(queueSource, /job\.prompt,\s*deadlineAt/);
+  assert.doesNotMatch(queueSource, /deadlineAt|AbortController/);
   assert.doesNotMatch(queueSource, /planEditPrompt|generalRetryPrompt|referenceRetryPrompt/);
   assert.doesNotMatch(queueSource, /MAX_GENERAL_EDIT_ATTEMPTS|MAX_REFERENCE_ATTEMPTS/);
   assert.doesNotMatch(queueSource, /\/v1\/moderations|omni-moderation/);
@@ -544,9 +536,10 @@ test("prompt generation uses one bounded image pass and one review pass", async 
     /review\.faithful &&[\s\S]*review\.placementMatched &&[\s\S]*review\.blended &&[\s\S]*review\.sourcePreserved/,
   );
   assert.match(queueSource, /startWorkerHeartbeat/);
-  assert.match(queueSource, /WORKER_TOTAL_BUDGET_MS/);
-  assert.match(queueSource, /providerStageTimeout\(deadlineAt, IMAGE_EDIT_TIMEOUT_MS\)/);
-  assert.match(queueSource, /providerStageTimeout\(deadlineAt, EDIT_REVIEW_TIMEOUT_MS\)/);
+  assert.doesNotMatch(
+    queueSource,
+    /AbortController|WORKER_TOTAL_BUDGET_MS|IMAGE_EDIT_TIMEOUT_MS|EDIT_REVIEW_TIMEOUT_MS|providerStageTimeout/,
+  );
   assert.match(queueSource, /use retry for one fresh attempt/);
   assert.match(queueSource, /Last review:/);
   assert.match(queueSource, /SUBJECT_OUT_OF_FRAME/);
@@ -801,10 +794,13 @@ test("extreme reference aspects are rejected after visible bounds are prepared",
   );
 });
 
-test("reference generation has redundant queue wakeup and fast bounded polling", async () => {
-  const [clientSource, workerSource] = await Promise.all([
+test("generation stays attached to submission and retry requests", async () => {
+  const [clientSource, workerSource, editRoute, retryRoute, revertRoute] = await Promise.all([
     readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8"),
     readFile(new URL("../worker/index.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/edits/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/jobs/[jobId]/retry/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/reverts/route.ts", import.meta.url), "utf8"),
   ]);
   const submitStart = clientSource.indexOf("const submitEdit = async");
   const revertStart = clientSource.indexOf("const submitRevert = async", submitStart);
@@ -815,9 +811,11 @@ test("reference generation has redundant queue wakeup and fast bounded polling",
   assert.doesNotMatch(submit, /if \(!placement\) void requestQueueDrain/);
   assert.match(clientSource, /referenceImage \? 350 : 3000/);
   assert.match(clientSource, /fetchJson<\{ job: Job \}>\(`\/api\/jobs\//);
-  assert.match(workerSource, /response\.status === 202/);
-  assert.match(workerSource, /ctx\.waitUntil\(/);
-  assert.match(workerSource, /processQueue\(env, 1\)/);
+  for (const route of [editRoute, retryRoute, revertRoute]) {
+    assert.match(route, /await processQueue\(env, 1\)/);
+    assert.match(route, /await getPublicJob\(env, job\.id\)/);
+  }
+  assert.doesNotMatch(workerSource, /processQueue|\/api\/edits/);
 });
 
 test("adaptive generation frames give small edits a high-resolution working crop", () => {

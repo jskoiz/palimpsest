@@ -435,9 +435,9 @@ export const RECENT_JOBS_SQL = `SELECT
       j.error_code IN (
         'PROVIDER_TEMPORARY',
         'SUBJECT_OUT_OF_FRAME',
-        'REFERENCE_REVIEW_FAILED'
+        'REFERENCE_REVIEW_FAILED',
+        'QUEUE_LEASE_EXPIRED'
       )
-      OR (j.error_code = 'QUEUE_LEASE_EXPIRED' AND j.started_at IS NULL)
     )
     AND j.display_mask_blob_id IS NOT NULL
     AND EXISTS (SELECT 1 FROM blobs display WHERE display.id = j.display_mask_blob_id)
@@ -1710,7 +1710,6 @@ type RetryCandidateRow = {
   executionMode: "openai" | "placement" | "none";
   referenceBlobId: string | null;
   errorCode: string | null;
-  startedAt: number | null;
   sourceKey: string | null;
   maskKey: string | null;
   displayMaskKey: string | null;
@@ -1754,9 +1753,9 @@ WHERE parent.artwork_id = c.artwork_id
     parent.error_code IN (
       'PROVIDER_TEMPORARY',
       'SUBJECT_OUT_OF_FRAME',
-      'REFERENCE_REVIEW_FAILED'
+      'REFERENCE_REVIEW_FAILED',
+      'QUEUE_LEASE_EXPIRED'
     )
-    OR (parent.error_code = 'QUEUE_LEASE_EXPIRED' AND parent.started_at IS NULL)
   )
   AND parent.display_mask_blob_id IS NOT NULL
   AND EXISTS (SELECT 1 FROM blobs display WHERE display.id = parent.display_mask_blob_id)
@@ -1830,7 +1829,7 @@ export async function retryFailedEditJob(
     env.DB.prepare(
       `SELECT j.id, j.state, j.execution_mode AS executionMode,
               j.reference_blob_id AS referenceBlobId,
-              j.error_code AS errorCode, j.started_at AS startedAt,
+              j.error_code AS errorCode,
               source.r2_key AS sourceKey, mask.r2_key AS maskKey,
               display.r2_key AS displayMaskKey, reference.r2_key AS referenceKey,
               (SELECT child.id FROM edit_jobs child
@@ -1865,8 +1864,8 @@ export async function retryFailedEditJob(
       "PROVIDER_TEMPORARY",
       "SUBJECT_OUT_OF_FRAME",
       "REFERENCE_REVIEW_FAILED",
-    ].includes(candidate.errorCode ?? "") ||
-      (candidate.errorCode === "QUEUE_LEASE_EXPIRED" && candidate.startedAt == null));
+      "QUEUE_LEASE_EXPIRED",
+    ].includes(candidate.errorCode ?? ""));
   const requiredKeys =
     candidate.executionMode === "openai"
       ? [
@@ -2026,9 +2025,9 @@ export async function getPublicJob(env: AppEnv, jobId: string) {
            j.error_code IN (
              'PROVIDER_TEMPORARY',
              'SUBJECT_OUT_OF_FRAME',
-             'REFERENCE_REVIEW_FAILED'
+             'REFERENCE_REVIEW_FAILED',
+             'QUEUE_LEASE_EXPIRED'
            )
-           OR (j.error_code = 'QUEUE_LEASE_EXPIRED' AND j.started_at IS NULL)
          )
          AND j.display_mask_blob_id IS NOT NULL
          AND EXISTS (SELECT 1 FROM blobs display WHERE display.id = j.display_mask_blob_id)

@@ -15,9 +15,11 @@ import {
   MAX_REFERENCE_PNG_BYTES,
   validateReferencePng,
 } from "@/lib/palimpsest/png.mjs";
+import { processQueue } from "@/lib/palimpsest/queue";
 import { contributionRatePolicy } from "@/lib/palimpsest/rate-policy.mjs";
 import {
   ensurePalimpsest,
+  getPublicJob,
   insertEditJob,
   recordVisitorEvent,
   requesterHash,
@@ -211,8 +213,10 @@ export async function POST(request: Request) {
       mode: referenceBytes ? "openai-reference" : "openai",
       ratePolicy: ratePolicy.name,
     });
+    await processQueue(env, 1);
+    const processedJob = await getPublicJob(env, job.id);
     return Response.json(
-      { job },
+      { job: { ...processedJob, retryToken } },
       { status: 202, headers: { "Cache-Control": "no-store", "X-Request-Id": requestId } },
     );
   } catch (error) {

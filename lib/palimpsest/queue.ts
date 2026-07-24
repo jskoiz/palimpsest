@@ -24,12 +24,8 @@ import {
   regionInGenerationFrame,
 } from "./geometry.mjs";
 import {
-  EDIT_REVIEW_TIMEOUT_MS,
-  IMAGE_EDIT_TIMEOUT_MS,
   WORKER_HEARTBEAT_MS,
   WORKER_LEASE_MS,
-  WORKER_TOTAL_BUDGET_MS,
-  boundedStageTimeout,
 } from "./worker-policy.mjs";
 
 type QueueJob = {
@@ -555,17 +551,6 @@ function startWorkerHeartbeat(env: AppEnv, job: QueueJob): WorkerHeartbeat {
   };
 }
 
-function providerStageTimeout(deadlineAt: number, stageLimitMs: number) {
-  const timeoutMs = boundedStageTimeout(deadlineAt, stageLimitMs);
-  if (timeoutMs < 1_000) {
-    throw new DomainError(
-      "PROVIDER_TEMPORARY",
-      "The live generation time budget was exhausted. Nothing was added to history.",
-    );
-  }
-  return timeoutMs;
-}
-
 async function processClaimedJob(env: AppEnv, job: QueueJob) {
   let heartbeat: WorkerHeartbeat | null = null;
   try {
@@ -595,7 +580,6 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
     const region = jobRegion(job);
     const frame = jobFrame(job);
     const generationRegion = regionInGenerationFrame(region, frame);
-    const deadlineAt = Date.now() + WORKER_TOTAL_BUDGET_MS;
     heartbeat = startWorkerHeartbeat(env, job);
     await updateStage(env, job, "moderating", "generating");
     const patch = await generateOpenAiPatch(
@@ -603,7 +587,6 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
       job,
       apiKey,
       job.prompt,
-      deadlineAt,
     );
     await heartbeat.checkpoint();
     await updateStage(env, job, "generating", "generating");
@@ -615,7 +598,6 @@ async function processClaimedJob(env: AppEnv, job: QueueJob) {
       patch.providerMaskBytes,
       patch.referenceBytes,
       generationRegion,
-      deadlineAt,
     );
     await heartbeat.checkpoint();
     console.info(`[palimpsest:${job.id}] edit output review`, {
@@ -702,7 +684,6 @@ async function generateOpenAiPatch(
   job: QueueJob,
   apiKey: string,
   requestedPrompt: string,
-  deadlineAt: number,
 ): Promise<{
   bytes: Uint8Array;
   contentType: string;
@@ -780,11 +761,6 @@ async function generateOpenAiPatch(
   form.append("output_format", "png");
   form.append("moderation", "auto");
 
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    providerStageTimeout(deadlineAt, IMAGE_EDIT_TIMEOUT_MS),
-  );
   let response: Response;
   let body:
     | { data?: Array<{ b64_json?: string }>; error?: { code?: string } }
@@ -794,7 +770,6 @@ async function generateOpenAiPatch(
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}` },
       body: form,
-      signal: controller.signal,
     });
     body = (await response.json().catch(() => null)) as
       | { data?: Array<{ b64_json?: string }>; error?: { code?: string } }
@@ -806,10 +781,8 @@ async function generateOpenAiPatch(
     });
     throw new DomainError(
       "PROVIDER_TEMPORARY",
-      "Live image editing did not respond in time. Nothing was added to history.",
+      "The image provider connection ended before returning an image. Nothing was added to history.",
     );
-  } finally {
-    clearTimeout(timeout);
   }
 
   const providerRequestId = response.headers.get("x-request-id") ?? undefined;
@@ -886,13 +859,7 @@ async function reviewEditOutput(
   providerMaskBytes: Uint8Array,
   referenceBytes: Uint8Array | null,
   editableRegion: { x: number; y: number; width: number; height: number },
-  deadlineAt: number,
 ): Promise<EditOutputReview | ReferenceEditReview> {
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    providerStageTimeout(deadlineAt, EDIT_REVIEW_TIMEOUT_MS),
-  );
   let response: Response;
   let body: { output?: Array<unknown> } | null;
   try {
@@ -919,7 +886,6 @@ async function reviewEditOutput(
               editableRegion,
             }),
       ),
-      signal: controller.signal,
     });
     body = (await response.json().catch(() => null)) as typeof body;
   } catch {
@@ -929,8 +895,6 @@ async function reviewEditOutput(
         ? "The generated image could not be checked for reference fidelity. Nothing was added to history."
         : "The generated image could not be checked for complete framing. Nothing was added to history.",
     );
-  } finally {
-    clearTimeout(timeout);
   }
   if (!response.ok) {
     throw new DomainError(
