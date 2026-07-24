@@ -1396,24 +1396,6 @@ body {
   font-size: 13px !important;
 }
 
-.mono-reference-background {
-  height: 100%;
-  flex: 0 0 auto;
-  padding: 0 5px !important;
-  color: rgba(255, 255, 255, 0.58) !important;
-  font-family: var(--font-mono) !important;
-  font-size: 7px !important;
-  white-space: nowrap;
-}
-
-.mono-reference-background.is-active {
-  color: rgba(255, 255, 255, 0.9) !important;
-}
-
-.mono-reference-background:disabled {
-  opacity: 0.45;
-}
-
 .mono-input {
   flex: 1;
   min-width: 120px;

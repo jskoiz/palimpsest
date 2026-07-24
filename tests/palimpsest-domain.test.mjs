@@ -372,7 +372,7 @@ test("contributions route positioned references through contextual generation", 
   assert.doesNotMatch(clientSource, /setExecutionMode|\[x\] live ai edit/);
   assert.match(clientSource, /prepareReferencePixels/);
   assert.match(clientSource, /referenceGuideLayer/);
-  assert.match(clientSource, /backgroundRemovalEnabled/);
+  assert.doesNotMatch(clientSource, /backgroundRemovalEnabled|backgroundRemoved|cutoutBlob/);
   assert.match(clientSource, /initialReferencePlacementRegion/);
   assert.match(clientSource, /resizeReferencePlacementRegion/);
   assert.match(clientSource, /form\.append\("source", source, "source\.png"\)/);
@@ -409,10 +409,11 @@ test("reference prompts require faithful regeneration and natural blending", () 
     "Blend the uploaded logo into the canvas.",
     true,
   );
-  assert.match(prompt, /Image 2 is a positioned transparent visual reference/);
-  assert.match(prompt, /identity, silhouette, geometry, proportions, symbols, labels/);
-  assert.match(prompt, /Match Image 2's center and relative scale/);
-  assert.match(prompt, /never paste Image 2's pixels or rectangular background directly/);
+  assert.match(prompt, /may include its original source background/);
+  assert.match(prompt, /Remove or ignore only the source background/);
+  assert.match(prompt, /Pale, white, reflective, transparent, translucent, frosted/);
+  assert.match(prompt, /Match the primary subject's center and relative scale/);
+  assert.match(prompt, /Do not reproduce its rectangular photo frame/);
   assert.match(prompt, /lighting, texture, edge softness, and contact shadow/);
   assert.match(prompt, /Preserve all existing Image 1 pixels/);
   assert.match(prompt, /Do not redesign, simplify, substitute, crop, truncate/);
@@ -483,8 +484,10 @@ test("reference-guided edits receive fidelity, placement, blending, and source r
       "data:image/png;base64,mask",
     ],
   );
-  assert.match(request.instructions, /faithful to the reference guide/i);
+  assert.match(request.instructions, /faithful to the primary subject in the reference guide/i);
   assert.match(request.instructions, /center and relative scale/i);
+  assert.match(request.instructions, /source background behind the referenced subject must be omitted/i);
+  assert.match(request.instructions, /transparent, translucent, frosted/i);
   assert.match(request.instructions, /naturally blended/i);
   assert.match(request.instructions, /Existing text, marks, and artwork must remain unchanged/i);
   assert.deepEqual(request.text.format.schema.required, [
@@ -576,7 +579,8 @@ test("uploaded references never bypass generation or review", async () => {
     /Promise\.all\(\[[\s\S]*flattenArtworkFrame[\s\S]*providerMask[\s\S]*referenceGuideLayer/,
   );
   assert.match(clientSource, /setSubmitted\(true\);\s*void requestQueueDrain\(\)/);
-  assert.match(clientSource, /Background removed — position the reference preview for GPT Image to blend/);
+  assert.match(clientSource, /Reference preview ready — position it for GPT Image to isolate and blend/);
+  assert.doesNotMatch(clientSource, /backgroundRemovalEnabled|backgroundRemoved|cutoutBlob/);
   assert.match(queueSource, /await generateOpenAiPatch\(/);
   assert.match(queueSource, /await reviewEditOutput\(/);
   assert.match(queueSource, /REFERENCE_REVIEW_FAILED/);

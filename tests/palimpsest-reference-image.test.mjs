@@ -33,19 +33,6 @@ function setPixel(data, width, x, y, [red, green, blue, alpha]) {
   data[offset + 3] = alpha;
 }
 
-function pixel(data, width, x, y) {
-  const offset = (y * width + x) * 4;
-  return Array.from(data.subarray(offset, offset + 4));
-}
-
-function visiblePixelCount(data) {
-  let count = 0;
-  for (let offset = 3; offset < data.length; offset += 4) {
-    if (data[offset] > 8) count += 1;
-  }
-  return count;
-}
-
 function mascotOnDarkNavyBackground() {
   const width = 11;
   const height = 13;
@@ -65,8 +52,8 @@ function mascotOnDarkNavyBackground() {
   for (let x = 3; x <= 4; x += 1) setPixel(data, width, x, 11, blue);
   for (let x = 6; x <= 7; x += 1) setPixel(data, width, x, 11, blue);
 
-  // Match the opaque source background exactly. Flood fill must not erase this
-  // enclosed screen merely because it shares the dominant border color.
+  // Match the opaque source background exactly. Pixel preparation must preserve
+  // both the border and this enclosed screen without trying to classify either.
   for (let y = 5; y <= 6; y += 1) {
     for (let x = 4; x <= 6; x += 1) setPixel(data, width, x, y, navy);
   }
@@ -84,50 +71,36 @@ function assertAspectLocked(region, aspectRatio) {
   );
 }
 
-test("opaque bordered mascot references remove only edge-connected background", () => {
+test("opaque references remain byte-exact with their full rectangular bounds", () => {
   const fixture = mascotOnDarkNavyBackground();
   const original = new Uint8ClampedArray(fixture.data);
   const result = prepareReferencePixels(fixture);
 
-  assert.equal(result.backgroundRemoved, true);
-  assert.deepEqual(result.bounds, { x: 2, y: 2, width: 7, height: 10 });
+  assert.deepEqual(result.bounds, {
+    x: 0,
+    y: 0,
+    width: fixture.width,
+    height: fixture.height,
+  });
+  assert.deepEqual(result.data, original);
+  assert.notEqual(result.data, fixture.data, "the returned pixels must not alias the upload");
   assert.deepEqual(fixture.data, original, "preparation must not mutate the upload pixels");
-
-  for (const [x, y] of [
-    [0, 0],
-    [fixture.width - 1, 0],
-    [0, fixture.height - 1],
-    [fixture.width - 1, fixture.height - 1],
-  ]) {
-    assert.equal(pixel(result.data, fixture.width, x, y)[3], 0);
-  }
-
-  assert.deepEqual(
-    pixel(result.data, fixture.width, 5, 5),
-    fixture.navy,
-    "an enclosed dark screen must survive the border flood fill",
-  );
-  assert.deepEqual(
-    pixel(result.data, fixture.width, 2, 4),
-    fixture.blue,
-    "the blue subject shell must remain opaque and color-faithful",
-  );
-
-  const removedPixels = fixture.width * fixture.height - visiblePixelCount(result.data);
-  assert.ok(Math.abs(
-    result.removedFraction - removedPixels / (fixture.width * fixture.height),
-  ) < 1e-9);
 });
 
-test("one stray translucent pixel cannot disable background removal", () => {
+test("near-opaque edge pixels remain byte-exact", () => {
   const fixture = mascotOnDarkNavyBackground();
   setPixel(fixture.data, fixture.width, 0, 0, [8, 8, 24, 249]);
+  const original = new Uint8ClampedArray(fixture.data);
 
   const result = prepareReferencePixels(fixture);
 
-  assert.equal(result.backgroundRemoved, true);
-  assert.deepEqual(result.bounds, { x: 2, y: 2, width: 7, height: 10 });
-  assert.equal(pixel(result.data, fixture.width, 0, 0)[3], 0);
+  assert.deepEqual(result.bounds, {
+    x: 0,
+    y: 0,
+    width: fixture.width,
+    height: fixture.height,
+  });
+  assert.deepEqual(result.data, original);
 });
 
 test("existing reference transparency stays byte-exact and produces tight visible bounds", () => {
@@ -145,8 +118,6 @@ test("existing reference transparency stays byte-exact and produces tight visibl
 
   const result = prepareReferencePixels({ data, width, height });
 
-  assert.equal(result.backgroundRemoved, false);
-  assert.equal(result.removedFraction, 0);
   assert.deepEqual(result.bounds, { x: 2, y: 2, width: 4, height: 3 });
   assert.deepEqual(result.data, before);
   assert.notEqual(result.data, data, "the returned pixels must not alias caller-owned input");

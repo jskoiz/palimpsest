@@ -193,14 +193,10 @@ type Stroke = {
 };
 
 type ReferenceImage = {
-  backgroundRemovalEnabled: boolean;
-  backgroundRemoved: boolean;
-  cutoutBlob: Blob;
-  cutoutPreviewUrl: string;
+  blob: Blob;
   fileName: string;
   height: number;
-  originalBlob: Blob;
-  originalPreviewUrl: string;
+  previewUrl: string;
   sourceBlob: Blob;
   width: number;
 };
@@ -808,10 +804,8 @@ function canvasBlob(canvas: HTMLCanvasElement, message: string): Promise<Blob> {
 async function normalizeReferenceImage(
   file: File,
 ): Promise<{
-  backgroundRemoved: boolean;
-  cutoutBlob: Blob;
+  blob: Blob;
   height: number;
-  originalBlob: Blob;
   width: number;
 }> {
   let image: ImageBitmap;
@@ -855,30 +849,20 @@ async function normalizeReferenceImage(
       );
     }
 
-    const crop = async (pixels: Uint8ClampedArray, message: string) => {
-      const canvas = document.createElement("canvas");
-      canvas.width = bounds.width;
-      canvas.height = bounds.height;
-      const cropContext = canvas.getContext("2d");
-      if (!cropContext) throw new Error("This browser cannot prepare reference images.");
-      const ownedPixels = new Uint8ClampedArray(pixels.length);
-      ownedPixels.set(pixels);
-      cropContext.putImageData(
-        new ImageData(ownedPixels, decodedWidth, decodedHeight),
-        -bounds.x,
-        -bounds.y,
-      );
-      return canvasBlob(canvas, message);
-    };
-    const [cutoutBlob, originalBlob] = await Promise.all([
-      crop(prepared.data, "The transparent reference could not be encoded."),
-      crop(original.data, "The original reference could not be encoded."),
-    ]);
+    const canvas = document.createElement("canvas");
+    canvas.width = bounds.width;
+    canvas.height = bounds.height;
+    const cropContext = canvas.getContext("2d");
+    if (!cropContext) throw new Error("This browser cannot prepare reference images.");
+    cropContext.putImageData(
+      new ImageData(prepared.data, decodedWidth, decodedHeight),
+      -bounds.x,
+      -bounds.y,
+    );
+    const blob = await canvasBlob(canvas, "The reference image could not be encoded.");
     return {
-      backgroundRemoved: prepared.backgroundRemoved,
-      cutoutBlob,
+      blob,
       height: bounds.height,
-      originalBlob,
       width: bounds.width,
     };
   } finally {
@@ -1233,7 +1217,7 @@ export default function Palimpsest() {
   const overlayCoverRef = useRef<HTMLDivElement>(null);
   const maskCanvasRef = useRef<HTMLCanvasElement>(null);
   const referenceInputRef = useRef<HTMLInputElement>(null);
-  const referencePreviewUrlsRef = useRef<string[]>([]);
+  const referencePreviewUrlRef = useRef<string | null>(null);
 
   const revisions = history?.revisions ?? EMPTY_REVISIONS;
   const selectedRevision = revisions[selectedIndex] ?? null;
@@ -1256,16 +1240,8 @@ export default function Palimpsest() {
   const patchMinimumEdge = referenceImage
     ? REFERENCE_PLACEMENT_MIN_EDGE
     : EDIT_REGION_MIN_EDGE;
-  const activeReferenceBlob = referenceImage
-    ? referenceImage.backgroundRemovalEnabled
-      ? referenceImage.cutoutBlob
-      : referenceImage.originalBlob
-    : null;
-  const activeReferencePreviewUrl = referenceImage
-    ? referenceImage.backgroundRemovalEnabled
-      ? referenceImage.cutoutPreviewUrl
-      : referenceImage.originalPreviewUrl
-    : null;
+  const activeReferenceBlob = referenceImage?.blob ?? null;
+  const activeReferencePreviewUrl = referenceImage?.previewUrl ?? null;
   const referenceAspectRatio = referenceImage
     ? referenceImage.width / referenceImage.height
     : 1;
@@ -1452,10 +1428,10 @@ export default function Palimpsest() {
   }, [saveRetryCapabilities]);
 
   const clearReferenceImage = useCallback(() => {
-    for (const url of referencePreviewUrlsRef.current) {
-      URL.revokeObjectURL(url);
+    if (referencePreviewUrlRef.current) {
+      URL.revokeObjectURL(referencePreviewUrlRef.current);
+      referencePreviewUrlRef.current = null;
     }
-    referencePreviewUrlsRef.current = [];
     if (referenceInputRef.current) referenceInputRef.current.value = "";
     setReferenceImage(null);
   }, []);
@@ -1622,10 +1598,10 @@ export default function Palimpsest() {
 
   useEffect(
     () => () => {
-      for (const url of referencePreviewUrlsRef.current) {
-        URL.revokeObjectURL(url);
+      if (referencePreviewUrlRef.current) {
+        URL.revokeObjectURL(referencePreviewUrlRef.current);
+        referencePreviewUrlRef.current = null;
       }
-      referencePreviewUrlsRef.current = [];
     },
     [],
   );
@@ -2575,33 +2551,24 @@ export default function Palimpsest() {
         latest.current.editRegion,
         normalized.width / normalized.height,
       );
-      for (const url of referencePreviewUrlsRef.current) {
-        URL.revokeObjectURL(url);
+      if (referencePreviewUrlRef.current) {
+        URL.revokeObjectURL(referencePreviewUrlRef.current);
       }
-      const cutoutPreviewUrl = URL.createObjectURL(normalized.cutoutBlob);
-      const originalPreviewUrl = URL.createObjectURL(normalized.originalBlob);
-      referencePreviewUrlsRef.current = [cutoutPreviewUrl, originalPreviewUrl];
+      const previewUrl = URL.createObjectURL(normalized.blob);
+      referencePreviewUrlRef.current = previewUrl;
       setEditRegion(placementRegion);
       setStrokes([]);
       setFillMask(true);
       setStep(3);
       setReferenceImage({
-        backgroundRemovalEnabled: normalized.backgroundRemoved,
-        backgroundRemoved: normalized.backgroundRemoved,
-        cutoutBlob: normalized.cutoutBlob,
-        cutoutPreviewUrl,
+        blob: normalized.blob,
         fileName: file.name,
         height: normalized.height,
-        originalBlob: normalized.originalBlob,
-        originalPreviewUrl,
+        previewUrl,
         sourceBlob: file,
         width: normalized.width,
       });
-      showToast(
-        normalized.backgroundRemoved
-          ? "Background removed — position the reference preview for GPT Image to blend."
-          : "Reference preview ready — position it for GPT Image to blend.",
-      );
+      showToast("Reference preview ready — position it for GPT Image to isolate and blend.");
       trackVisitorInteraction("reference_added");
     } catch (error) {
       event.currentTarget.value = "";
@@ -2642,7 +2609,6 @@ export default function Palimpsest() {
       meta,
       reference: referenceImage
         ? {
-            backgroundRemovalEnabled: referenceImage.backgroundRemovalEnabled,
             fileName: referenceImage.fileName,
             size: referenceImage.sourceBlob.size,
             type: referenceImage.sourceBlob.type,
@@ -3676,29 +3642,6 @@ export default function Palimpsest() {
                     onClick={clearReferenceImage}
                   >
                     ×
-                  </button>
-                ) : null}
-                {referenceImage?.backgroundRemoved ? (
-                  <button
-                    type="button"
-                    className={`mono-reference-background${referenceImage.backgroundRemovalEnabled ? " is-active" : ""}`}
-                    aria-pressed={referenceImage.backgroundRemovalEnabled}
-                    disabled={submitted || isPreparing}
-                    onClick={() =>
-                      setReferenceImage((current) =>
-                        current
-                          ? {
-                              ...current,
-                              backgroundRemovalEnabled:
-                                !current.backgroundRemovalEnabled,
-                            }
-                          : current,
-                      )
-                    }
-                  >
-                    {referenceImage.backgroundRemovalEnabled
-                      ? "[x] background removed"
-                      : "[ ] background removed"}
                   </button>
                 ) : null}
               </div>
