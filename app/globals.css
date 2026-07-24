@@ -125,7 +125,8 @@ body {
 }
 
 .debug-refresh button,
-.debug-failures button {
+.debug-failures button,
+.debug-resume-credits {
   border: 1px solid rgba(248, 243, 235, 0.55);
   min-height: 38px;
   padding: 8px 13px;
@@ -138,13 +139,15 @@ body {
 }
 
 .debug-refresh button:hover,
-.debug-failures button:hover {
+.debug-failures button:hover,
+.debug-resume-credits:hover {
   border-color: var(--accent);
   color: var(--accent);
 }
 
 .debug-refresh button:disabled,
-.debug-failures button:disabled {
+.debug-failures button:disabled,
+.debug-resume-credits:disabled {
   opacity: 0.55;
   cursor: default;
 }
@@ -275,6 +278,10 @@ body {
 .debug-system dd {
   color: #f8f3eb;
   font-size: 18px;
+}
+
+.debug-resume-credits {
+  margin-top: 18px;
 }
 
 .debug-failures {

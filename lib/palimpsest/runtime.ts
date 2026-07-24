@@ -165,6 +165,9 @@ export function publicJobMessage(state: string): string | null {
   if (state === "moderating") return "Checking this contribution for safety.";
   if (state === "generating") return "Making the next revision.";
   if (state === "committing") return "Adding the revision to permanent history.";
+  if (state === "waiting_for_credits") {
+    return "This edit is safely saved and waiting for generation credits.";
+  }
   if (state === "succeeded") return "This revision is now part of Palimpsest.";
   return null;
 }

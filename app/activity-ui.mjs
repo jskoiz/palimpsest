@@ -3,6 +3,7 @@ const ACTIVE_JOB_STATES = new Set([
   "moderating",
   "generating",
   "committing",
+  "waiting_for_credits",
 ]);
 
 const FAILED_JOB_STATES = new Set(["failed", "rejected", "stale"]);
@@ -17,6 +18,7 @@ const FAILED_JOB_STATES = new Set(["failed", "rejected", "stale"]);
 export function activityJobState(job) {
   if (job.state === "succeeded") return "done";
   if (FAILED_JOB_STATES.has(job.state)) return "failed";
+  if (job.state === "waiting_for_credits") return "credit-paused";
   if (!job.reservationActive && ACTIVE_JOB_STATES.has(job.state)) return "recovering";
   if (job.state === "queued") return "reserved";
   if (job.state === "moderating") return "starting";
