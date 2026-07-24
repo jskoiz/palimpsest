@@ -1,36 +1,43 @@
 import type { Metadata, Viewport } from "next";
 import { headers } from "next/headers";
+import { siteUrlFromHeaders } from "@/lib/site-url";
 import "./globals.css";
 
 export async function generateMetadata(): Promise<Metadata> {
   const requestHeaders = await headers();
-  const host =
-    requestHeaders.get("x-forwarded-host") ??
-    requestHeaders.get("host") ??
-    "localhost:3000";
-  const protocol =
-    requestHeaders.get("x-forwarded-proto") ??
-    (host.startsWith("localhost") ? "http" : "https");
-  const metadataBase = new URL(`${protocol}://${host}`);
+  const metadataBase = siteUrlFromHeaders(requestHeaders);
   const title = "Palimpsest";
   const description =
-    "A live communal canvas where people create non-overlapping AI edits in parallel and every accepted change becomes part of an immutable public history.";
+    "A shared canvas edited with GPT Image 2. Add to the image and explore every revision.";
 
   return {
     metadataBase,
-    title,
+    title: {
+      default: title,
+      template: "%s | Palimpsest",
+    },
     description,
     applicationName: "Palimpsest",
-    keywords: [
-      "collaborative art",
-      "AI image editing",
-      "shared canvas",
-      "GPT-5.6",
-      "OpenAI",
-    ],
+    alternates: {
+      canonical: "/",
+    },
+    category: "art",
+    manifest: "/manifest.webmanifest",
     icons: {
-      icon: "/og.png",
-      shortcut: "/og.png",
+      icon: [{ url: "/icon.svg", type: "image/svg+xml" }],
+      shortcut: "/icon.svg",
+      apple: "/apple-touch-icon.png",
+    },
+    robots: {
+      index: true,
+      follow: true,
+      googleBot: {
+        index: true,
+        follow: true,
+        "max-image-preview": "large",
+        "max-snippet": -1,
+        "max-video-preview": -1,
+      },
     },
     openGraph: {
       type: "website",
@@ -38,12 +45,13 @@ export async function generateMetadata(): Promise<Metadata> {
       description,
       url: "/",
       siteName: "Palimpsest",
+      locale: "en_US",
       images: [
         {
           url: "/og.png",
-          width: 1536,
-          height: 1024,
-          alt: "Palimpsest artwork and revision timeline",
+          width: 1200,
+          height: 630,
+          alt: "Palimpsest — a shared canvas edited with GPT Image 2",
         },
       ],
     },
@@ -59,7 +67,7 @@ export async function generateMetadata(): Promise<Metadata> {
 export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
-  themeColor: "#141210",
+  themeColor: "#21185e",
   colorScheme: "dark",
 };
 
