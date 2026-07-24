@@ -60,13 +60,14 @@ test("verified admins bypass every edit and restore limit", () => {
   }
 });
 
-test("visitor activity endpoint relies on the dispatcher-authenticated admin gate", async () => {
+test("debug endpoint is intentionally public and contains no client-controlled bypass", async () => {
   const source = await readFile(
-    new URL("../app/api/visitors/route.ts", import.meta.url),
+    new URL("../app/api/debug/route.ts", import.meta.url),
     "utf8",
   );
-  assert.match(source, /isVerifiedAdminRequest\(env, request\)/u);
-  assert.match(source, /status:\s*403/u);
+  assert.match(source, /getDebugSnapshot\(getRuntimeEnv\(\), request\.url\)/u);
+  assert.doesNotMatch(source, /isVerifiedAdminRequest/u);
+  assert.doesNotMatch(source, /status:\s*403/u);
   assert.doesNotMatch(source, /x-palimpsest-admin/i);
 });
 

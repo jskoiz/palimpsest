@@ -40,7 +40,6 @@ import {
   collaborationPollDelay,
   publicActivityJobs,
   queueRecoveryDelay,
-  visibleActivityJobs,
   viewForActivityRegion,
 } from "../app/activity-ui.mjs";
 import {
@@ -78,14 +77,6 @@ test("activity jobs use stable visitor-facing states and separate failures from 
   ]);
   assert.deepEqual(activityJobCounts(jobs), { inProcess: 5, failed: 1, done: 1 });
   assert.deepEqual(publicActivityJobs(jobs), jobs.slice(0, 5));
-  assert.deepEqual(
-    visibleActivityJobs(jobs, new Set(["owned-failure"])),
-    jobs.slice(0, 6),
-  );
-  assert.deepEqual(
-    visibleActivityJobs(jobs, new Set()),
-    jobs.slice(0, 5),
-  );
 });
 
 test("queue recovery and collaboration polling back off with bounded jitter", () => {

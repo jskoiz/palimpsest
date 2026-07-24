@@ -12,12 +12,10 @@ import type {
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   activityJobIsInProcess,
-  activityJobNeedsAttention,
   activityJobState,
   collaborationPollDelay,
   publicActivityJobs,
   queueRecoveryDelay,
-  visibleActivityJobs as activityJobsVisibleToVisitor,
   viewForActivityRegion,
 } from "@/app/activity-ui.mjs";
 import {
@@ -370,17 +368,6 @@ function jobStateLabel(state: string) {
 
 function activeStateLabel(active: ActiveRegion) {
   return active.reservationActive ? jobStateLabel(active.state) : "recovering";
-}
-
-function activityFailureQualifier(job: ActivityJob) {
-  if (job.state === "rejected") return "rejected";
-  if (job.error?.code.includes("LEASE_EXPIRED")) return "expired";
-  if (job.error?.code === "PROVIDER_TEMPORARY") return "temporary";
-  if (job.error?.code === "REFERENCE_REVIEW_FAILED") return "fidelity check";
-  if (job.error?.code === "SUBJECT_OUT_OF_FRAME") return "framing check";
-  if (job.state === "stale") return "superseded";
-  if (!job.startedAt) return "never started";
-  return "attention";
 }
 
 function overlapMessage(active: ActiveRegion) {
@@ -1171,8 +1158,7 @@ export default function Palimpsest() {
   const [toast, setToast] = useState<string | null>(null);
   const [welcomeOpen, setWelcomeOpen] = useState(false);
   const [focusedJobId, setFocusedJobId] = useState<string | null>(null);
-  const [retryingJobId, setRetryingJobId] = useState<string | null>(null);
-  const [retryCapabilitiesByJobId, setRetryCapabilitiesByJobId] = useState<
+  const [, setRetryCapabilitiesByJobId] = useState<
     Record<string, RetryCapability>
   >({});
 
@@ -1197,7 +1183,6 @@ export default function Palimpsest() {
     useState<LocalSubmissionFailure | null>(null);
 
   const drainInFlight = useRef(false);
-  const retryInFlightJobId = useRef<string | null>(null);
   const activityRequest = useRef<Promise<ActivityPayload> | null>(null);
   const activitySignatureRef = useRef(activitySignature(EMPTY_ACTIVITY));
   const idleTimer = useRef<number | null>(null);
@@ -1247,12 +1232,7 @@ export default function Palimpsest() {
     : 1;
   const jobActive = Boolean(job && !terminalJobStates.has(job.state));
   const liveActivityJobs = publicActivityJobs(activity.jobs) as ActivityJob[];
-  const visibleActivityJobs = activityJobsVisibleToVisitor(
-    activity.jobs,
-    new Set(Object.keys(retryCapabilitiesByJobId)),
-  ) as ActivityJob[];
-  const retryableActivityJobs = visibleActivityJobs.filter(activityJobNeedsAttention);
-  const queueTotal = visibleActivityJobs.length;
+  const queueTotal = liveActivityJobs.length;
   const queueBusy = liveActivityJobs.length > 0 || jobActive;
   const hasRecoverableWork =
     activity.queue.queued > 0 ||
@@ -1405,26 +1385,6 @@ export default function Palimpsest() {
       ...current,
       [jobId]: { token },
     }));
-  }, [saveRetryCapabilities]);
-
-  const rememberRetryRequestKey = useCallback((jobId: string, requestKey: string) => {
-    saveRetryCapabilities((current) => {
-      const capability = current[jobId];
-      if (!capability) return current;
-      return {
-        ...current,
-        [jobId]: { ...capability, requestKey },
-      };
-    });
-  }, [saveRetryCapabilities]);
-
-  const replaceRetryCapability = useCallback((previousJobId: string, job: Job) => {
-    saveRetryCapabilities((current) => {
-      const next = { ...current };
-      delete next[previousJobId];
-      if (job.retryToken) next[job.id] = { token: job.retryToken };
-      return next;
-    });
   }, [saveRetryCapabilities]);
 
   const clearReferenceImage = useCallback(() => {
@@ -1889,71 +1849,6 @@ export default function Palimpsest() {
       wake();
     },
     [showToast, wake],
-  );
-
-  const retryActivityJob = useCallback(
-    async (activityJob: ActivityJob) => {
-      const capability = retryCapabilitiesByJobId[activityJob.id];
-      if (!activityJob.retryable || !capability || retryInFlightJobId.current) return;
-      const requestKey = capability.requestKey ?? crypto.randomUUID();
-      rememberRetryRequestKey(activityJob.id, requestKey);
-      retryInFlightJobId.current = activityJob.id;
-      setRetryingJobId(activityJob.id);
-      try {
-        const payload = await fetchJson<{ job: Job }>(
-          `/api/jobs/${encodeURIComponent(activityJob.id)}/retry`,
-          {
-            method: "POST",
-            headers: {
-              "Idempotency-Key": requestKey,
-              "X-Palimpsest-Retry-Token": capability.token,
-            },
-          },
-        );
-        replaceRetryCapability(activityJob.id, payload.job);
-        if (terminalJobStates.has(payload.job.state)) {
-          setJob(null);
-          setPendingEdit(null);
-          if (payload.job.state === "succeeded" && payload.job.resultRevisionId) {
-            await refreshHistory(payload.job.resultRevisionId);
-            showToast("The retried contribution was already accepted.");
-          } else {
-            showToast(
-              payload.job.error?.message ??
-                payload.job.message ??
-                "The retried contribution could not be completed.",
-            );
-          }
-          await refreshActivity();
-          return;
-        }
-        setJob(payload.job);
-        setPendingEdit({
-          jobId: payload.job.id,
-          author: activityJob.author,
-          prompt: activityJob.displaySummary,
-          region: activityJob.region,
-        });
-        showToast("Retry reserved — one fresh image pass is starting.");
-        void requestQueueDrain();
-        await refreshActivity();
-      } catch (error) {
-        showToast(error instanceof Error ? error.message : "This retry could not be started.");
-        await refreshActivity().catch(() => undefined);
-      } finally {
-        retryInFlightJobId.current = null;
-        setRetryingJobId(null);
-      }
-    },
-    [
-      refreshActivity,
-      refreshHistory,
-      rememberRetryRequestKey,
-      replaceRetryCapability,
-      requestQueueDrain,
-      retryCapabilitiesByJobId,
-      showToast,
-    ],
   );
 
   const openRecentRevision = useCallback(
@@ -3054,7 +2949,7 @@ export default function Palimpsest() {
         <button
           type="button"
           className="mono-queue-toggle"
-          aria-label={`Queue, ${liveActivityJobs.length} in process, ${retryableActivityJobs.length} need attention`}
+          aria-label={`Queue, ${liveActivityJobs.length} in process`}
           aria-controls="contribution-activity"
           aria-expanded={queueOpen}
           onClick={toggleQueue}
@@ -3332,9 +3227,6 @@ export default function Palimpsest() {
           <div className="mono-strip-head">
             <span className="mono-strip-summary">
               live work — {liveActivityJobs.length} in process
-              {retryableActivityJobs.length > 0
-                ? ` · ${retryableActivityJobs.length} needs attention`
-                : ""}
               {liveActivityJobs.length > 0 ? " · use show to find work on the canvas" : ""}
             </span>
             <button
@@ -3350,23 +3242,17 @@ export default function Palimpsest() {
             <section className="mono-activity-group" aria-labelledby="activity-jobs-title">
               <div className="mono-activity-group-head">
                 <h2 id="activity-jobs-title">contributions</h2>
-                <span>{visibleActivityJobs.length} shown</span>
+                <span>{liveActivityJobs.length} shown</span>
               </div>
-              {visibleActivityJobs.length === 0 ? (
+              {liveActivityJobs.length === 0 ? (
                 <p className="mono-queue-empty">
-                  No contributions are currently in process or need attention.
+                  No contributions are currently in process.
                 </p>
               ) : (
                 <div className="mono-queue-list" role="list" aria-live="polite">
-                  {visibleActivityJobs.map((activityJob, index) => {
+                  {liveActivityJobs.map((activityJob, index) => {
                     const state = activityJobState(activityJob);
-                    const failed = activityJobNeedsAttention(activityJob);
-                    const canRetry = Boolean(
-                      activityJob.retryable && retryCapabilitiesByJobId[activityJob.id],
-                    );
-                    const canShow = Boolean(
-                      activityJob.region && activityJobIsInProcess(activityJob),
-                    );
+                    const canShow = Boolean(activityJob.region);
                     return (
                       <article
                         key={activityJob.id}
@@ -3376,18 +3262,7 @@ export default function Palimpsest() {
                       >
                         <div className="mono-queue-entry-head">
                           <span className="mono-queue-author">{activityJob.author}</span>
-                          <span
-                            className={`mono-queue-state${
-                              failed
-                                ? " is-failed"
-                                : activityJobIsInProcess(activityJob)
-                                  ? " is-accent"
-                                  : ""
-                            }`}
-                          >
-                            {state}
-                            {failed ? ` · ${activityFailureQualifier(activityJob)}` : ""}
-                          </span>
+                          <span className="mono-queue-state is-accent">{state}</span>
                           <time
                             dateTime={activityJob.updatedAt}
                             title={new Date(activityJob.updatedAt).toLocaleString()}
@@ -3396,38 +3271,21 @@ export default function Palimpsest() {
                           </time>
                         </div>
                         <p className="mono-queue-summary">{activityJob.displaySummary}</p>
-                        {failed ? (
-                          <p className="mono-queue-error">
-                            {activityJob.error?.message ?? "This contribution could not be completed."}
-                          </p>
-                        ) : null}
                         <div className="mono-queue-detail">
                           <span>submitted {compactTime(activityJob.submittedAt)} ago</span>
-                          {activityJob.error?.code ? <span>{activityJob.error.code}</span> : null}
                           {activityJob.requestId ? (
                             <span>request {activityJob.requestId}</span>
                           ) : null}
                         </div>
-                        {canShow || canRetry ? (
+                        {canShow ? (
                           <div className="mono-queue-actions">
-                            {canShow ? (
-                              <button
-                                type="button"
-                                aria-pressed={focusedJobId === activityJob.id}
-                                onClick={() => focusActivityJob(activityJob)}
-                              >
-                                {focusedJobId === activityJob.id ? "shown" : "show"}
-                              </button>
-                            ) : null}
-                            {canRetry ? (
-                              <button
-                                type="button"
-                                disabled={retryingJobId !== null}
-                                onClick={() => void retryActivityJob(activityJob)}
-                              >
-                                {retryingJobId === activityJob.id ? "retrying…" : "retry"}
-                              </button>
-                            ) : null}
+                            <button
+                              type="button"
+                              aria-pressed={focusedJobId === activityJob.id}
+                              onClick={() => focusActivityJob(activityJob)}
+                            >
+                              {focusedJobId === activityJob.id ? "shown" : "show"}
+                            </button>
                           </div>
                         ) : null}
                       </article>

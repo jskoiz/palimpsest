@@ -66,11 +66,11 @@ Open `http://localhost:4317/` (or the port printed by the development server). N
 
 Without `OPENAI_API_KEY`, the archive remains viewable but new contributions are disabled. Configure the same name as a production secret before deployment.
 
-## Visitor activity
+## Public debug dashboard
 
-`/visitors` is a private activity dashboard for an authenticated administrator. It shows page views, key canvas interactions, and server-confirmed generation or restore requests. The dashboard calls a fail-closed API guarded by the existing `ADMIN_EMAIL_ALLOWLIST` dispatcher identity.
+`/debug` is a public, unlinked, `noindex` operations dashboard. It shows current queue health, durable failures, request and error IDs, recent reference-image uploads, accepted revisions, privacy-bounded viewer stats, and the latest activity events. Terminal failures never appear in the live canvas queue. A retry button appears on `/debug` only when the current browser owns the server-validated retry capability for that job.
 
-Visitor records contain a salted, pseudonymous network ID, an opaque per-tab session ID when JavaScript is available, country code, and a truncated user agent. They deliberately exclude raw IP addresses, prompts, reference uploads, and image data. Configure `VISITOR_LOG_SALT` as a production secret (or retain the existing `RATE_LIMIT_SALT` as a temporary fallback) before deployment.
+Visitor records contain a salted, pseudonymous network ID, an opaque per-tab session ID when JavaScript is available, country code, and a truncated user agent. Raw IP addresses are never stored. Configure `VISITOR_LOG_SALT` as a production secret (or retain the existing `RATE_LIMIT_SALT` as a temporary fallback) before deployment.
 
 ## Validation
 

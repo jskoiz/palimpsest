@@ -725,6 +725,59 @@ export async function getVisitorActivity(env: AppEnv, limit = 160) {
   };
 }
 
+type RecentReferenceUploadRow = {
+  id: string;
+  contentType: string;
+  byteLength: number;
+  width: number;
+  height: number;
+  createdAt: number;
+};
+
+export async function getRecentReferenceUploads(env: AppEnv, limit = 24) {
+  const boundedLimit = Math.max(1, Math.min(48, Math.floor(limit)));
+  const uploads = await env.DB.prepare(
+    `SELECT
+       id,
+       content_type AS contentType,
+       byte_length AS byteLength,
+       width,
+       height,
+       created_at AS createdAt
+     FROM blobs
+     WHERE artwork_id = ? AND kind = 'reference'
+     ORDER BY created_at DESC, id DESC
+     LIMIT ?`,
+  )
+    .bind(ARTWORK_ID, boundedLimit)
+    .all<RecentReferenceUploadRow>();
+
+  return uploads.results.map((upload) => ({
+    id: upload.id,
+    url: `/api/blobs/${encodeURIComponent(upload.id)}`,
+    contentType: upload.contentType,
+    byteLength: Number(upload.byteLength),
+    width: Number(upload.width),
+    height: Number(upload.height),
+    createdAt: new Date(Number(upload.createdAt)).toISOString(),
+  }));
+}
+
+export async function getDebugSnapshot(env: AppEnv, requestUrl: string) {
+  const [activity, visitors, uploads] = await Promise.all([
+    getActivity(env, requestUrl),
+    getVisitorActivity(env),
+    getRecentReferenceUploads(env),
+  ]);
+
+  return {
+    generatedAt: new Date().toISOString(),
+    activity,
+    visitors,
+    uploads,
+  };
+}
+
 export type ContributionRateLimit = {
   scope: string;
   limit: number;
