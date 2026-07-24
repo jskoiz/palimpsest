@@ -168,6 +168,7 @@ export const editJobs = sqliteTable(
         "moderating",
         "generating",
         "committing",
+        "waiting_for_credits",
         "succeeded",
         "stale",
         "rejected",

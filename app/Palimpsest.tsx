@@ -105,7 +105,7 @@ type HistoryPayload = {
 };
 
 type ActivityPayload = {
-  queue: { queued: number; active: number };
+  queue: { queued: number; active: number; waitingForCredits: number };
   jobs: ActivityJob[];
   recent: Revision[];
   activeRegions: ActiveRegion[];
@@ -146,6 +146,7 @@ type Job = {
     | "moderating"
     | "generating"
     | "committing"
+    | "waiting_for_credits"
     | "succeeded"
     | "stale"
     | "rejected"
@@ -199,7 +200,13 @@ type ReferenceImage = {
   width: number;
 };
 
-const terminalJobStates = new Set(["succeeded", "stale", "rejected", "failed"]);
+const locallySettledJobStates = new Set([
+  "succeeded",
+  "stale",
+  "rejected",
+  "failed",
+  "waiting_for_credits",
+]);
 
 const AUTO_HIDE = true;
 const IDLE_HIDE_MS = 4000;
@@ -218,7 +225,7 @@ const MAX_REFERENCE_UPLOAD_BYTES = 10 * 1024 * 1024;
 const REFERENCE_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 
 const EMPTY_ACTIVITY: ActivityPayload = {
-  queue: { queued: 0, active: 0 },
+  queue: { queued: 0, active: 0, waitingForCredits: 0 },
   jobs: [],
   recent: [],
   activeRegions: [],
@@ -363,6 +370,7 @@ function jobStateLabel(state: string) {
   if (state === "moderating") return "planning";
   if (state === "committing") return "finishing";
   if (state === "generating") return "generating";
+  if (state === "waiting_for_credits") return "saved — waiting for credits";
   return state;
 }
 
@@ -380,6 +388,8 @@ function overlapMessage(active: ActiveRegion) {
     message = `${active.author} is planning an edit here — this area is locked.`;
   } else if (active.state === "committing") {
     message = `${active.author} is finishing an edit here — this area is locked.`;
+  } else if (active.state === "waiting_for_credits") {
+    message = `${active.author}'s edit is safely saved until generation credits are restored — this area stays locked.`;
   } else {
     message = `${active.author} is generating here — this area is locked.`;
   }
@@ -1245,7 +1255,7 @@ export default function Palimpsest() {
   const referenceAspectRatio = referenceImage
     ? referenceImage.width / referenceImage.height
     : 1;
-  const jobActive = Boolean(job && !terminalJobStates.has(job.state));
+  const jobActive = Boolean(job && !locallySettledJobStates.has(job.state));
   const liveActivityJobs = publicActivityJobs(activity.jobs) as ActivityJob[];
   const queueTotal = liveActivityJobs.length;
   const queueBusy = liveActivityJobs.length > 0 || jobActive;
@@ -1683,11 +1693,11 @@ export default function Palimpsest() {
   }, [conflictingJobId, editOpen, showToast, submitted]);
 
   useEffect(() => {
-    if (!job || terminalJobStates.has(job.state)) return;
+    if (!job || locallySettledJobStates.has(job.state)) return;
     const timer = window.setTimeout(async () => {
       try {
         const payload = await fetchJson<{ job: Job }>(`/api/jobs/${encodeURIComponent(job.id)}`);
-        if (!terminalJobStates.has(payload.job.state)) {
+        if (!locallySettledJobStates.has(payload.job.state)) {
           setJob(payload.job);
           return;
         }
@@ -1711,6 +1721,16 @@ export default function Palimpsest() {
           clearReferenceImage();
         } else {
           showToast(payload.job.message ?? payload.job.error?.message ?? "nothing was added to the work");
+          if (payload.job.state === "waiting_for_credits") {
+            setEditOpen(false);
+            setEditBase(null);
+            setSubmitted(false);
+            setStep(1);
+            setPrompt("");
+            setStrokes([]);
+            setFillMask(false);
+            clearReferenceImage();
+          }
         }
         setJob(null);
         setPendingEdit(null);
@@ -2562,7 +2582,7 @@ export default function Palimpsest() {
       });
       rememberRetryCapability(payload.job.id, payload.job.retryToken ?? retryToken);
       setLocalSubmissionFailure(null);
-      if (terminalJobStates.has(payload.job.state)) {
+      if (locallySettledJobStates.has(payload.job.state)) {
         setJob(null);
         setPendingEdit(null);
         setSubmitted(false);
@@ -2584,6 +2604,14 @@ export default function Palimpsest() {
           setSubmitError(message);
           setEditOpen(false);
           setQueueOpen(true);
+          if (payload.job.state === "waiting_for_credits") {
+            setEditBase(null);
+            setStep(1);
+            setPrompt("");
+            setStrokes([]);
+            setFillMask(false);
+            clearReferenceImage();
+          }
           showToast(message);
         }
         await refreshActivity();

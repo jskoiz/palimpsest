@@ -54,7 +54,7 @@ type VisitorEvent = {
 type DebugSnapshot = {
   generatedAt: string;
   activity: {
-    queue: { queued: number; active: number };
+    queue: { queued: number; active: number; waitingForCredits: number };
     activeRegions: Array<{
       jobId: string;
       author: string;
@@ -101,7 +101,13 @@ type RetryJob = {
 
 const RETRY_CAPABILITIES_STORAGE_KEY = "palimpsest:retry-capabilities:v1";
 const FAILURE_STATES = new Set(["failed", "rejected", "stale"]);
-const ACTIVE_STATES = new Set(["queued", "moderating", "generating", "committing"]);
+const ACTIVE_STATES = new Set([
+  "queued",
+  "moderating",
+  "generating",
+  "committing",
+  "waiting_for_credits",
+]);
 
 function formatDate(value: string) {
   return new Intl.DateTimeFormat(undefined, {
@@ -123,6 +129,7 @@ function eventLabel(value: string) {
 function jobState(job: DebugJob) {
   if (FAILURE_STATES.has(job.state)) return "failed";
   if (job.state === "succeeded") return "done";
+  if (job.state === "waiting_for_credits") return "credit-paused";
   if (!job.reservationActive && ACTIVE_STATES.has(job.state)) return "recovering";
   if (job.state === "queued") return "reserved";
   if (job.state === "moderating") return "starting";
@@ -184,6 +191,7 @@ export function DebugDashboard() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [retryingJobId, setRetryingJobId] = useState<string | null>(null);
+  const [resumingCredits, setResumingCredits] = useState(false);
   const [retryNotice, setRetryNotice] = useState<string | null>(null);
   const [retryCapabilities, setRetryCapabilities] = useState<
     Record<string, RetryCapability>
@@ -294,6 +302,30 @@ export function DebugDashboard() {
     ],
   );
 
+  const resumeCreditBlockedJobs = useCallback(async () => {
+    if (resumingCredits) return;
+    setResumingCredits(true);
+    setRetryNotice(null);
+    try {
+      const payload = await readJson<{ resumed: number; message: string }>(
+        "/api/queue/resume-credits",
+        { method: "POST" },
+      );
+      setRetryNotice(
+        `${payload.message} If billing is still updating, the edits will remain safely paused.`,
+      );
+      await load();
+    } catch (resumeError) {
+      setRetryNotice(
+        resumeError instanceof Error
+          ? resumeError.message
+          : "Saved edits could not be returned to the queue.",
+      );
+    } finally {
+      setResumingCredits(false);
+    }
+  }, [load, resumingCredits]);
+
   const failures = useMemo(
     () => snapshot?.activity.jobs.filter((job) => FAILURE_STATES.has(job.state)) ?? [],
     [snapshot],
@@ -381,6 +413,10 @@ export function DebugDashboard() {
                 <dd>{snapshot.activity.queue.active}</dd>
               </div>
               <div>
+                <dt>waiting for credits</dt>
+                <dd>{snapshot.activity.queue.waitingForCredits}</dd>
+              </div>
+              <div>
                 <dt>recovering locks</dt>
                 <dd>
                   {
@@ -395,6 +431,16 @@ export function DebugDashboard() {
                 <dd>{snapshot.visitors.summary.generations}</dd>
               </div>
             </dl>
+            {snapshot.activity.queue.waitingForCredits > 0 ? (
+              <button
+                type="button"
+                className="debug-resume-credits"
+                disabled={resumingCredits}
+                onClick={() => void resumeCreditBlockedJobs()}
+              >
+                {resumingCredits ? "resuming saved edits…" : "resume saved edits after top-up"}
+              </button>
+            ) : null}
           </section>
 
           <section className="debug-section" aria-labelledby="failures-title">
@@ -504,7 +550,7 @@ export function DebugDashboard() {
             <div className="debug-section-head">
               <div>
                 <h2 id="jobs-title">job log</h2>
-                <p>Active work plus the latest 24 terminal attempts.</p>
+                <p>Active and credit-paused work plus the latest 24 terminal attempts.</p>
               </div>
               <span>{snapshot.activity.jobs.length} entries</span>
             </div>

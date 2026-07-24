@@ -1522,6 +1522,239 @@ test("a fenced worker can record failure after its lease lapses", async () => {
   db.close();
 });
 
+test("credit exhaustion preserves the original job and resumes it after top-up", async () => {
+  const db = await migratedDatabase();
+  seedArtwork(db);
+  const [
+    insertSql,
+    pauseSql,
+    resumeSql,
+    activeRegionsSql,
+    statusSql,
+    claimSql,
+    expireReadySql,
+  ] = await Promise.all([
+      readSqlConstant("lib/palimpsest/store.ts", "INSERT_EDIT_RESERVATION_SQL"),
+      readSqlConstant("lib/palimpsest/queue.ts", "WAIT_FOR_GENERATION_CREDITS_SQL"),
+      readSqlConstant("lib/palimpsest/store.ts", "RESUME_CREDIT_BLOCKED_JOBS_SQL"),
+      readSqlConstant("lib/palimpsest/store.ts", "ACTIVE_REGIONS_SQL"),
+      readSqlConstant("lib/palimpsest/queue.ts", "QUEUE_WORK_STATUS_SQL"),
+      readSqlConstant("lib/palimpsest/queue.ts", "CLAIM_NEXT_JOB_SQL"),
+      readSqlConstant(
+        "lib/palimpsest/queue.ts",
+        "EXPIRE_READY_QUEUE_RESERVATION_SQL",
+      ),
+    ]);
+  const now = 21_000;
+  assert.equal(
+    db.prepare(insertSql).run(...reservationValues({
+      jobId: "credit-paused",
+      authorId: "author-a",
+      region: { x: 10, y: 20, width: 100, height: 120 },
+      now,
+    })).changes,
+    1,
+  );
+  db.exec(`
+    INSERT INTO blobs (
+      id, artwork_id, kind, r2_key, content_type, byte_length,
+      sha256, width, height, created_at
+    ) VALUES
+      ('source-credit-paused', 'palimpsest', 'input', 'credit-source.png', 'image/png', 1, 's', 1024, 1024, 1),
+      ('mask-credit-paused', 'palimpsest', 'mask', 'credit-mask.png', 'image/png', 1, 'm', 1024, 1024, 1),
+      ('display-credit-paused', 'palimpsest', 'display_mask', 'credit-display.svg', 'image/svg+xml', 1, 'd', 1024, 1024, 1);
+    UPDATE edit_jobs
+    SET state = 'generating', worker_token = 'credit-worker',
+        lease_fence = 7, lease_expires_at = 22000, started_at = 21000
+    WHERE id = 'credit-paused';
+  `);
+
+  const message =
+    "This edit is safely saved and waiting for generation credits.";
+  assert.equal(
+    db.prepare(pauseSql).run(
+      message,
+      Number.MAX_SAFE_INTEGER,
+      now + 500,
+      "credit-paused",
+      "credit-worker",
+      7,
+    ).changes,
+    1,
+  );
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        `SELECT state, source_blob_id, mask_blob_id, display_mask_blob_id,
+                error_code, public_error_message, worker_token,
+                lease_expires_at, completed_at
+         FROM edit_jobs WHERE id = 'credit-paused'`,
+      ).get(),
+    },
+    {
+      state: "waiting_for_credits",
+      source_blob_id: "source-credit-paused",
+      mask_blob_id: "mask-credit-paused",
+      display_mask_blob_id: "display-credit-paused",
+      error_code: "GENERATION_CREDITS_EXHAUSTED",
+      public_error_message: message,
+      worker_token: null,
+      lease_expires_at: Number.MAX_SAFE_INTEGER,
+      completed_at: null,
+    },
+  );
+  assert.deepEqual(
+    db.prepare(activeRegionsSql)
+      .all(now + 1_000, "palimpsest")
+      .map((row) => ({
+        jobId: row.jobId,
+        state: row.state,
+        reservationActive: row.reservationActive,
+      })),
+    [
+      {
+        jobId: "credit-paused",
+        state: "waiting_for_credits",
+        reservationActive: 1,
+      },
+    ],
+  );
+  assert.equal(
+    db.prepare(insertSql).run(...reservationValues({
+      jobId: "overlap-credit-paused",
+      authorId: "author-b",
+      region: { x: 50, y: 60, width: 100, height: 120 },
+      now: now + 1_000,
+    })).changes,
+    0,
+    "the preserved reservation must keep overlapping edits out",
+  );
+  assert.deepEqual(
+    {
+      ...db.prepare(statusSql).get(
+        "palimpsest",
+        Number.MAX_SAFE_INTEGER,
+        now + 1_000,
+        now + 1_000,
+        "palimpsest",
+        now + 1_000,
+      ),
+    },
+    { hasReady: 0, needsRecovery: 0 },
+  );
+
+  const resumedAt = now + 2_000;
+  assert.equal(
+    db.prepare(resumeSql).run(
+      resumedAt,
+      resumedAt + 4 * 60 * 1_000,
+      resumedAt,
+      "palimpsest",
+      "palimpsest",
+      8,
+    ).changes,
+    1,
+  );
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        `SELECT state, source_blob_id, mask_blob_id, display_mask_blob_id,
+                error_code, public_error_message, available_at,
+                lease_expires_at, completed_at
+         FROM edit_jobs WHERE id = 'credit-paused'`,
+      ).get(),
+    },
+    {
+      state: "queued",
+      source_blob_id: "source-credit-paused",
+      mask_blob_id: "mask-credit-paused",
+      display_mask_blob_id: "display-credit-paused",
+      error_code: "GENERATION_CREDITS_EXHAUSTED",
+      public_error_message: message,
+      available_at: resumedAt,
+      lease_expires_at: resumedAt + 4 * 60 * 1_000,
+      completed_at: null,
+    },
+  );
+  assert.equal(
+    db.prepare(statusSql).get(
+      "palimpsest",
+      Number.MAX_SAFE_INTEGER,
+      resumedAt,
+      resumedAt,
+      "palimpsest",
+      resumedAt,
+    ).hasReady,
+    1,
+  );
+  const recoveryAt = resumedAt + 4 * 60 * 1_000 + 1;
+  assert.equal(
+    db.prepare(expireReadySql).run(
+      recoveryAt,
+      recoveryAt,
+      "palimpsest",
+      Number.MAX_SAFE_INTEGER,
+      recoveryAt,
+    ).changes,
+    1,
+  );
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        `SELECT state, error_code, lease_expires_at, completed_at
+         FROM edit_jobs WHERE id = 'credit-paused'`,
+      ).get(),
+    },
+    {
+      state: "waiting_for_credits",
+      error_code: "GENERATION_CREDITS_EXHAUSTED",
+      lease_expires_at: Number.MAX_SAFE_INTEGER,
+      completed_at: null,
+    },
+    "an interrupted resume must return to the durable credit pause",
+  );
+  const secondResumeAt = recoveryAt + 1;
+  assert.equal(
+    db.prepare(resumeSql).run(
+      secondResumeAt,
+      secondResumeAt + 4 * 60 * 1_000,
+      secondResumeAt,
+      "palimpsest",
+      "palimpsest",
+      8,
+    ).changes,
+    1,
+  );
+  const claimed = db.prepare(claimSql).get(
+    "resumed-worker",
+    secondResumeAt + 60_000,
+    secondResumeAt,
+    secondResumeAt,
+    "palimpsest",
+    secondResumeAt,
+    secondResumeAt,
+    secondResumeAt,
+    secondResumeAt,
+    secondResumeAt,
+  );
+  assert.equal(claimed.id, "credit-paused");
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        `SELECT state, error_code, public_error_message, worker_token
+         FROM edit_jobs WHERE id = 'credit-paused'`,
+      ).get(),
+    },
+    {
+      state: "moderating",
+      error_code: null,
+      public_error_message: null,
+      worker_token: "resumed-worker",
+    },
+  );
+  db.close();
+});
+
 test("full-artwork reverts wait for every active reservation", async () => {
   const db = await migratedDatabase();
   seedArtwork(db);

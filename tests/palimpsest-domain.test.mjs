@@ -47,6 +47,7 @@ import {
   WORKER_HEARTBEAT_MS,
   WORKER_LEASE_MS,
 } from "../lib/palimpsest/worker-policy.mjs";
+import { isGenerationCreditExhaustion } from "../lib/palimpsest/provider-errors.mjs";
 
 function expectCode(callback, code) {
   assert.throws(callback, (error) => error instanceof DomainError && error.code === code);
@@ -58,6 +59,12 @@ test("activity jobs use stable visitor-facing states and separate failures from 
     { id: "moderating", state: "moderating", reservationActive: true, retryable: false },
     { id: "generating", state: "generating", reservationActive: true, retryable: false },
     { id: "committing", state: "committing", reservationActive: true, retryable: false },
+    {
+      id: "credit-paused",
+      state: "waiting_for_credits",
+      reservationActive: true,
+      retryable: false,
+    },
     { id: "recovering", state: "generating", reservationActive: false, retryable: false },
     { id: "owned-failure", state: "failed", reservationActive: false, retryable: true },
     { id: "done", state: "succeeded", reservationActive: false, retryable: false },
@@ -68,12 +75,48 @@ test("activity jobs use stable visitor-facing states and separate failures from 
     "starting",
     "generating",
     "finishing",
+    "credit-paused",
     "recovering",
     "failed",
     "done",
   ]);
-  assert.deepEqual(activityJobCounts(jobs), { inProcess: 5, failed: 1, done: 1 });
-  assert.deepEqual(publicActivityJobs(jobs), jobs.slice(0, 5));
+  assert.deepEqual(activityJobCounts(jobs), { inProcess: 6, failed: 1, done: 1 });
+  assert.deepEqual(publicActivityJobs(jobs), jobs.slice(0, 6));
+});
+
+test("generation credit exhaustion stays distinct from ordinary rate limits", () => {
+  assert.equal(
+    isGenerationCreditExhaustion(429, {
+      code: "insufficient_quota",
+      message: "You exceeded your current quota.",
+    }),
+    true,
+  );
+  assert.equal(
+    isGenerationCreditExhaustion(400, {
+      type: "billing_hard_limit_reached",
+    }),
+    true,
+  );
+  assert.equal(
+    isGenerationCreditExhaustion(429, {
+      message: "Your credit balance is empty. Add to balance to continue.",
+    }),
+    true,
+  );
+  assert.equal(
+    isGenerationCreditExhaustion(429, {
+      code: "rate_limit_exceeded",
+      message: "Rate limit reached for requests per minute.",
+    }),
+    false,
+  );
+  assert.equal(
+    isGenerationCreditExhaustion(500, {
+      message: "The upstream service is unavailable.",
+    }),
+    false,
+  );
 });
 
 test("queue recovery and collaboration polling back off with bounded jitter", () => {

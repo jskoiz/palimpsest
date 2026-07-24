@@ -27,6 +27,7 @@ export type GlobalRegion = {
 export type GenerationFrame = GlobalRegion;
 
 export const RESERVATION_LEASE_MS = 4 * 60 * 1000;
+export const PRESERVED_RESERVATION_EXPIRES_AT = Number.MAX_SAFE_INTEGER;
 export const PREPARING_AVAILABLE_AT = Number.MAX_SAFE_INTEGER;
 const PURPLE_SEED_REVISION_ID = "rev-seed-purple-000";
 const PURPLE_SEED_KEYFRAME_ID = "keyframe-purple-000000";
@@ -392,7 +393,7 @@ export const ACTIVE_REGIONS_SQL = `SELECT
 FROM edit_jobs j
 JOIN authors a ON a.id = j.author_id
 WHERE j.artwork_id = ?
-  AND j.state IN ('queued', 'moderating', 'generating', 'committing')
+  AND j.state IN ('queued', 'moderating', 'generating', 'committing', 'waiting_for_credits')
   AND j.region_x IS NOT NULL
   AND j.region_y IS NOT NULL
   AND j.region_width > 0
@@ -417,7 +418,7 @@ export const RECENT_JOBS_SQL = `SELECT
   j.region_width AS regionWidth,
   j.region_height AS regionHeight,
   CASE
-    WHEN j.state IN ('queued', 'moderating', 'generating', 'committing')
+    WHEN j.state IN ('queued', 'moderating', 'generating', 'committing', 'waiting_for_credits')
       AND j.lease_expires_at > ? THEN 1
     ELSE 0
   END AS reservationActive,
@@ -457,7 +458,7 @@ FROM edit_jobs j
 JOIN authors a ON a.id = j.author_id
 WHERE j.artwork_id = ?
   AND (
-    j.state IN ('queued', 'moderating', 'generating', 'committing')
+    j.state IN ('queued', 'moderating', 'generating', 'committing', 'waiting_for_credits')
     OR j.id IN (
       SELECT terminal.id
       FROM edit_jobs terminal
@@ -481,7 +482,13 @@ export async function getActivity(env: AppEnv, requestUrl: string) {
     env.DB.prepare(
       `SELECT
          SUM(CASE WHEN state = 'queued' AND lease_expires_at > ? THEN 1 ELSE 0 END) AS queued,
-         SUM(CASE WHEN state IN ('moderating','generating','committing') AND lease_expires_at > ? THEN 1 ELSE 0 END) AS active
+         SUM(CASE WHEN state IN ('moderating','generating','committing') AND lease_expires_at > ? THEN 1 ELSE 0 END) AS active,
+         SUM(CASE
+           WHEN state = 'waiting_for_credits'
+             OR (state = 'queued' AND error_code = 'GENERATION_CREDITS_EXHAUSTED')
+             THEN 1
+           ELSE 0
+         END) AS waitingForCredits
        FROM edit_jobs WHERE artwork_id = ?`,
     )
       .bind(now, now, ARTWORK_ID),
@@ -491,16 +498,85 @@ export async function getActivity(env: AppEnv, requestUrl: string) {
       `${revisionSelect} WHERE r.artwork_id = ? ORDER BY r.sequence DESC LIMIT 8`,
     ).bind(ARTWORK_ID),
   ]));
-  const counts = firstResult<{ queued: number | null; active: number | null }>(results[0]);
+  const counts = firstResult<{
+    queued: number | null;
+    active: number | null;
+    waitingForCredits: number | null;
+  }>(results[0]);
   const activeRegions = (results[1]?.results ?? []) as unknown as ActiveRegionRow[];
   const jobs = (results[2]?.results ?? []) as unknown as RecentJobRow[];
   const recent = (results[3]?.results ?? []) as unknown as RevisionRow[];
   return {
-    queue: { queued: Number(counts?.queued ?? 0), active: Number(counts?.active ?? 0) },
+    queue: {
+      queued: Number(counts?.queued ?? 0),
+      active: Number(counts?.active ?? 0),
+      waitingForCredits: Number(counts?.waitingForCredits ?? 0),
+    },
     activeRegions: activeRegions.map(serializeActiveRegion),
     jobs: jobs.map(serializeRecentJob),
     recent: recent.map(serializeRevision),
   };
+}
+
+export const RESUME_CREDIT_BLOCKED_JOBS_SQL = `UPDATE edit_jobs
+SET state = 'queued',
+    available_at = ?,
+    lease_expires_at = ?,
+    worker_token = NULL,
+    updated_at = ?,
+    completed_at = NULL
+WHERE artwork_id = ?
+  AND kind = 'edit'
+  AND execution_mode = 'openai'
+  AND state = 'waiting_for_credits'
+  AND error_code = 'GENERATION_CREDITS_EXHAUSTED'
+  AND source_blob_id IS NOT NULL
+  AND mask_blob_id IS NOT NULL
+  AND display_mask_blob_id IS NOT NULL
+  AND EXISTS (
+    SELECT 1 FROM blobs source
+    WHERE source.id = edit_jobs.source_blob_id
+  )
+  AND EXISTS (
+    SELECT 1 FROM blobs mask
+    WHERE mask.id = edit_jobs.mask_blob_id
+  )
+  AND EXISTS (
+    SELECT 1 FROM blobs display
+    WHERE display.id = edit_jobs.display_mask_blob_id
+  )
+  AND (
+    reference_blob_id IS NULL
+    OR EXISTS (
+      SELECT 1 FROM blobs reference
+      WHERE reference.id = edit_jobs.reference_blob_id
+    )
+  )
+  AND id IN (
+    SELECT candidate.id
+    FROM edit_jobs candidate
+    WHERE candidate.artwork_id = ?
+      AND candidate.state = 'waiting_for_credits'
+    ORDER BY candidate.created_at ASC, candidate.id ASC
+    LIMIT ?
+  )`;
+
+export async function resumeCreditBlockedJobs(env: AppEnv, maxJobs = 8) {
+  const boundedMaxJobs = Math.max(1, Math.min(8, Math.floor(maxJobs)));
+  const now = Date.now();
+  const result = await runIdempotentD1(() =>
+    env.DB.prepare(RESUME_CREDIT_BLOCKED_JOBS_SQL)
+      .bind(
+        now,
+        now + RESERVATION_LEASE_MS,
+        now,
+        ARTWORK_ID,
+        ARTWORK_ID,
+        boundedMaxJobs,
+      )
+      .run(),
+  );
+  return Number(result.meta.changes ?? 0);
 }
 
 export async function getBlobRecord(env: AppEnv, blobId: string) {
@@ -908,7 +984,7 @@ const activeConflictSql = `SELECT
 FROM edit_jobs j
 JOIN authors a ON a.id = j.author_id
 WHERE j.artwork_id = ?
-  AND j.state IN ('queued', 'moderating', 'generating', 'committing')
+  AND j.state IN ('queued', 'moderating', 'generating', 'committing', 'waiting_for_credits')
   AND j.lease_expires_at > ?
   AND j.region_x < ? + ?
   AND j.region_x + j.region_width > ?
@@ -965,7 +1041,7 @@ AND (
 AND NOT EXISTS (
   SELECT 1 FROM edit_jobs active
   WHERE active.artwork_id = c.artwork_id
-    AND active.state IN ('queued', 'moderating', 'generating', 'committing')
+    AND active.state IN ('queued', 'moderating', 'generating', 'committing', 'waiting_for_credits')
     AND active.lease_expires_at > c.now_ms
     AND active.region_x < c.region_x + c.region_width
     AND active.region_x + active.region_width > c.region_x
@@ -1020,7 +1096,7 @@ JOIN revisions target
 WHERE NOT EXISTS (
   SELECT 1 FROM edit_jobs active
   WHERE active.artwork_id = c.artwork_id
-    AND active.state IN ('queued', 'moderating', 'generating', 'committing')
+    AND active.state IN ('queued', 'moderating', 'generating', 'committing', 'waiting_for_credits')
     AND active.lease_expires_at > c.now_ms
 )
 AND (
@@ -1477,7 +1553,7 @@ export async function insertEditJob(env: AppEnv, input: InsertEditInput) {
              SELECT 1 FROM edit_jobs active
              WHERE active.artwork_id = edit_jobs.artwork_id
                AND active.id <> edit_jobs.id
-               AND active.state IN ('queued', 'moderating', 'generating', 'committing')
+               AND active.state IN ('queued', 'moderating', 'generating', 'committing', 'waiting_for_credits')
                AND active.lease_expires_at > ?
                AND active.region_x < edit_jobs.region_x + edit_jobs.region_width
                AND active.region_x + active.region_width > edit_jobs.region_x
@@ -1778,7 +1854,7 @@ WHERE parent.artwork_id = c.artwork_id
   AND NOT EXISTS (
     SELECT 1 FROM edit_jobs active
     WHERE active.artwork_id = parent.artwork_id
-      AND active.state IN ('queued', 'moderating', 'generating', 'committing')
+      AND active.state IN ('queued', 'moderating', 'generating', 'committing', 'waiting_for_credits')
       AND active.lease_expires_at > c.now_ms
       AND active.region_x < parent.region_x + parent.region_width
       AND active.region_x + active.region_width > parent.region_x
@@ -2074,7 +2150,13 @@ export async function getPublicJob(env: AppEnv, jobId: string) {
     }>());
   if (!row) throw new DomainError("NOT_FOUND", "That queue item could not be found.");
   const reservationActive =
-    ["queued", "moderating", "generating", "committing"].includes(row.state) &&
+    [
+      "queued",
+      "moderating",
+      "generating",
+      "committing",
+      "waiting_for_credits",
+    ].includes(row.state) &&
     Number(row.leaseExpiresAt ?? 0) > now;
   return {
     id: row.id,

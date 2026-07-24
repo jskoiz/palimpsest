@@ -36,6 +36,8 @@ The queue fails closed if any required OpenAI step is unavailable. The original 
 - R2 for canonical tiles, masks, references, patches, and keyframes
 - Generated D1 migrations as the authoritative schema
 - Atomic global-coordinate reservations with lease recovery and overlap rejection
+- Durable credit pauses that retain the original source, mask, reference, and
+  region reservation until an operator resumes saved edits after topping up
 - Parallel moderation/generation with a short fenced commit lock that preserves linear history
 - Region-aware rebasing for non-overlapping jobs after the head advances
 - Append-only database triggers for immutable revisions
@@ -69,6 +71,12 @@ Without `OPENAI_API_KEY`, the archive remains viewable but new contributions are
 ## Public debug dashboard
 
 `/debug` is a public, unlinked, `noindex` operations dashboard. It shows current queue health, durable failures, request and error IDs, recent reference-image uploads, accepted revisions, privacy-bounded viewer stats, and the latest activity events. Terminal failures never appear in the live canvas queue. A retry button appears on `/debug` only when the current browser owns the server-validated retry capability for that job.
+
+If the OpenAI account runs out of generation credits, accepted edit inputs are
+paused durably instead of becoming terminal failures. Their canvas regions stay
+reserved so later revisions cannot invalidate them. After topping up the
+account, use **resume saved edits after top-up** on `/debug`; the original jobs
+return to the queue with the same immutable inputs.
 
 Visitor records contain a salted, pseudonymous network ID, an opaque per-tab session ID when JavaScript is available, country code, and a truncated user agent. Raw IP addresses are never stored. Configure `VISITOR_LOG_SALT` as a production secret (or retain the existing `RATE_LIMIT_SALT` as a temporary fallback) before deployment.
 

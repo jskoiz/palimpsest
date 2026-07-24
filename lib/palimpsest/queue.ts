@@ -15,6 +15,7 @@ import type { AppEnv } from "./runtime";
 import { readPngDimensions, sha256Hex } from "./runtime";
 import {
   PREPARING_AVAILABLE_AT,
+  PRESERVED_RESERVATION_EXPIRES_AT,
   getBlobRecord,
   type GenerationFrame,
   type GlobalRegion,
@@ -28,6 +29,7 @@ import {
   WORKER_HEARTBEAT_MS,
   WORKER_LEASE_MS,
 } from "./worker-policy.mjs";
+import { isGenerationCreditExhaustion } from "./provider-errors.mjs";
 
 type QueueJob = {
   id: string;
@@ -237,6 +239,8 @@ SET state = CASE
       WHEN kind = 'revert' THEN 'committing'
       ELSE 'moderating'
     END,
+    error_code = NULL,
+    public_error_message = NULL,
     worker_token = ?,
     lease_fence = lease_fence + 1,
     lease_expires_at = ?,
@@ -260,7 +264,7 @@ WHERE id = (
       SELECT 1 FROM edit_jobs active
       WHERE active.artwork_id = candidate.artwork_id
         AND active.id <> candidate.id
-        AND active.state IN ('queued', 'moderating', 'generating', 'committing')
+        AND active.state IN ('queued', 'moderating', 'generating', 'committing', 'waiting_for_credits')
         AND active.lease_expires_at > ?
         AND active.region_x < candidate.region_x + candidate.region_width
         AND active.region_x + active.region_width > candidate.region_x
@@ -379,6 +383,18 @@ WHERE id = ?
   AND worker_token = ?
   AND lease_fence = ?`;
 
+export const WAIT_FOR_GENERATION_CREDITS_SQL = `UPDATE edit_jobs
+SET state = 'waiting_for_credits',
+    error_code = 'GENERATION_CREDITS_EXHAUSTED',
+    public_error_message = ?,
+    worker_token = NULL,
+    lease_expires_at = ?,
+    updated_at = ?,
+    completed_at = NULL
+WHERE id = ?
+  AND worker_token = ?
+  AND lease_fence = ?`;
+
 export const EXPIRE_PREPARING_RESERVATION_SQL = `UPDATE edit_jobs
 SET state = 'failed',
     error_code = 'QUEUE_PREPARATION_EXPIRED',
@@ -394,13 +410,33 @@ WHERE artwork_id = ?
   AND (lease_expires_at IS NULL OR lease_expires_at <= ?)`;
 
 export const EXPIRE_READY_QUEUE_RESERVATION_SQL = `UPDATE edit_jobs
-SET state = 'failed',
-    error_code = 'QUEUE_LEASE_EXPIRED',
-    public_error_message = 'The queued edit was not claimed before its reservation expired. Nothing was added to history.',
+SET state = CASE
+      WHEN error_code = 'GENERATION_CREDITS_EXHAUSTED'
+        THEN 'waiting_for_credits'
+      ELSE 'failed'
+    END,
+    error_code = CASE
+      WHEN error_code = 'GENERATION_CREDITS_EXHAUSTED'
+        THEN error_code
+      ELSE 'QUEUE_LEASE_EXPIRED'
+    END,
+    public_error_message = CASE
+      WHEN error_code = 'GENERATION_CREDITS_EXHAUSTED'
+        THEN public_error_message
+      ELSE 'The queued edit was not claimed before its reservation expired. Nothing was added to history.'
+    END,
     worker_token = NULL,
-    lease_expires_at = NULL,
+    lease_expires_at = CASE
+      WHEN error_code = 'GENERATION_CREDITS_EXHAUSTED'
+        THEN 9007199254740991
+      ELSE NULL
+    END,
     updated_at = ?,
-    completed_at = ?
+    completed_at = CASE
+      WHEN error_code = 'GENERATION_CREDITS_EXHAUSTED'
+        THEN NULL
+      ELSE ?
+    END
 WHERE artwork_id = ?
   AND state = 'queued'
   AND available_at <> ?
@@ -445,7 +481,7 @@ WHERE artwork_id = ?
     SELECT 1 FROM edit_jobs active
     WHERE active.artwork_id = edit_jobs.artwork_id
       AND active.id <> edit_jobs.id
-      AND active.state IN ('queued', 'moderating', 'generating', 'committing')
+      AND active.state IN ('queued', 'moderating', 'generating', 'committing', 'waiting_for_credits')
       AND active.lease_expires_at > ?
       AND active.region_x < edit_jobs.region_x + edit_jobs.region_width
       AND active.region_x + active.region_width > edit_jobs.region_x
@@ -788,7 +824,10 @@ async function generateOpenAiPatch(
 
   let response: Response;
   let body:
-    | { data?: Array<{ b64_json?: string }>; error?: { code?: string } }
+    | {
+        data?: Array<{ b64_json?: string }>;
+        error?: { code?: string; type?: string; message?: string };
+      }
     | null;
   try {
     response = await fetch("https://api.openai.com/v1/images/edits", {
@@ -797,7 +836,10 @@ async function generateOpenAiPatch(
       body: form,
     });
     body = (await response.json().catch(() => null)) as
-      | { data?: Array<{ b64_json?: string }>; error?: { code?: string } }
+      | {
+          data?: Array<{ b64_json?: string }>;
+          error?: { code?: string; type?: string; message?: string };
+        }
       | null;
   } catch (error) {
     console.error(`[palimpsest:${job.id}] image edit request failed`, {
@@ -821,6 +863,12 @@ async function generateOpenAiPatch(
       throw new DomainError(
         "CONTENT_POLICY",
         "This edit could not be completed because it did not meet safety requirements.",
+      );
+    }
+    if (isGenerationCreditExhaustion(response.status, body?.error)) {
+      throw new DomainError(
+        "GENERATION_CREDITS_EXHAUSTED",
+        "This edit is safely saved and waiting for generation credits. Top up the account, then resume saved edits from the operations dashboard.",
       );
     }
     if (response.status === 401 || response.status === 403) {
@@ -1072,7 +1120,7 @@ async function assertCommitStillValid(
        JOIN edit_jobs active
          ON active.artwork_id = job.artwork_id AND active.id <> job.id
        WHERE job.id = ?
-         AND active.state IN ('queued', 'moderating', 'generating', 'committing')
+         AND active.state IN ('queued', 'moderating', 'generating', 'committing', 'waiting_for_credits')
          AND active.lease_expires_at > ?
          AND active.region_x < job.region_x + job.region_width
          AND active.region_x + active.region_width > job.region_x
@@ -1167,7 +1215,7 @@ WHERE job.state = 'committing'
     SELECT 1 FROM edit_jobs active
     WHERE active.artwork_id = job.artwork_id
       AND active.id <> job.id
-      AND active.state IN ('queued', 'moderating', 'generating', 'committing')
+      AND active.state IN ('queued', 'moderating', 'generating', 'committing', 'waiting_for_credits')
       AND active.lease_expires_at > c.now_ms
       AND active.region_x < job.region_x + job.region_width
       AND active.region_x + active.region_width > job.region_x
@@ -1383,7 +1431,7 @@ WHERE job.kind = 'revert'
     SELECT 1 FROM edit_jobs active
     WHERE active.artwork_id = job.artwork_id
       AND active.id <> job.id
-      AND active.state IN ('queued', 'moderating', 'generating', 'committing')
+      AND active.state IN ('queued', 'moderating', 'generating', 'committing', 'waiting_for_credits')
       AND active.lease_expires_at > c.now_ms
       AND active.region_x < job.region_x + job.region_width
       AND active.region_x + active.region_width > job.region_x
@@ -1463,6 +1511,19 @@ async function commitRevert(env: AppEnv, job: QueueJob) {
 async function handleFailure(env: AppEnv, job: QueueJob, error: unknown) {
   const domain = error instanceof DomainError ? error : null;
   const now = Date.now();
+  if (domain?.code === "GENERATION_CREDITS_EXHAUSTED") {
+    await env.DB.prepare(WAIT_FOR_GENERATION_CREDITS_SQL)
+      .bind(
+        domain.message,
+        PRESERVED_RESERVATION_EXPIRES_AT,
+        now,
+        job.id,
+        job.workerToken,
+        job.leaseFence,
+      )
+      .run();
+    return;
+  }
   const state =
     domain?.code === "STALE_BASE_REVISION"
       ? "stale"
