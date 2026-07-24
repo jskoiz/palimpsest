@@ -92,6 +92,13 @@
       "when": 1784839324633,
       "tag": "0012_visitor_activity",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1784851295000,
+      "tag": "0013_remove_logo_mascot_generations",
+      "breakpoints": true
     }
   ]
 }

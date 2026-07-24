@@ -741,6 +741,299 @@ test("canvas-and-history reset clears the current archive and durable job state"
   db.close();
 });
 
+test("logo and mascot cleanup restores revision 2 without touching earlier work", async () => {
+  const db = await migratedDatabase();
+  db.exec(`
+    INSERT INTO artworks (
+      id, slug, title, width, height, tile_width, tile_height,
+      columns, rows, head_revision_id, head_sequence, created_at
+    ) VALUES ('palimpsest-purple', 'palimpsest', 'Palimpsest', 2048, 2048,
+      1024, 1024, 2, 2, '5068a183-cb54-4e38-996b-ea3b1179f32c', 6, 1);
+    INSERT INTO authors (id, display_name, source, created_at) VALUES
+      ('archive-purple', 'Palimpsest Archive', 'seed', 1),
+      ('visitor-purple', 'Visitor', 'visitor', 2),
+      ('target-only-author', 'Target only', 'visitor', 3);
+    INSERT INTO blobs (
+      id, artwork_id, kind, r2_key, content_type, byte_length,
+      sha256, width, height, created_at
+    ) VALUES
+      ('keep-source', 'palimpsest-purple', 'input', 'keep-source.png',
+        'image/png', 1, 'keep-source-hash', 1024, 1024, 1),
+      ('keep-patch', 'palimpsest-purple', 'patch', 'keep-patch.png',
+        'image/png', 1, 'keep-patch-hash', 1024, 1024, 1),
+      ('mascot-source', 'palimpsest-purple', 'input', 'mascot-source.png',
+        'image/png', 1, 'mascot-source-hash', 1024, 1024, 2),
+      ('mascot-patch', 'palimpsest-purple', 'patch', 'mascot-patch.png',
+        'image/png', 1, 'mascot-patch-hash', 1024, 1024, 2),
+      ('mascot-tile', 'palimpsest-purple', 'keyframe', 'mascot-tile.png',
+        'image/png', 1, 'mascot-tile-hash', 1024, 1024, 2),
+      ('placement-source', 'palimpsest-purple', 'input', 'placement-source.png',
+        'image/png', 1, 'placement-source-hash', 1024, 1024, 3),
+      ('placement-patch', 'palimpsest-purple', 'patch', 'placement-patch.png',
+        'image/png', 1, 'placement-patch-hash', 1024, 1024, 3),
+      ('logo-source', 'palimpsest-purple', 'input', 'logo-source.png',
+        'image/png', 1, 'logo-source-hash', 1024, 1024, 4),
+      ('logo-patch', 'palimpsest-purple', 'patch', 'logo-patch.png',
+        'image/png', 1, 'logo-patch-hash', 1024, 1024, 4),
+      ('failed-mask', 'palimpsest-purple', 'mask', 'failed-mask.png',
+        'image/png', 1, 'failed-mask-hash', 1024, 1024, 5);
+    INSERT INTO revisions (
+      id, artwork_id, sequence, parent_revision_id, origin, status,
+      author_id, prompt, revert_target_revision_id, created_at
+    ) VALUES
+      ('rev-seed-purple-000', 'palimpsest-purple', 0, NULL, 'seed', 'accepted',
+        'archive-purple', 'Purple abstract canvas.', NULL, 1),
+      ('63eac4d4-f2a9-454b-b347-5d8660e309a4', 'palimpsest-purple', 1,
+        'rev-seed-purple-000', 'openai', 'accepted', 'visitor-purple',
+        'Codex is awesome', NULL, 2),
+      ('fe142165-05bf-4eec-acf1-5d7ddad605be', 'palimpsest-purple', 2,
+        '63eac4d4-f2a9-454b-b347-5d8660e309a4', 'openai', 'accepted',
+        'visitor-purple', 'a jalapeno', NULL, 3),
+      ('ee06571d-e36b-4443-bf6a-ec150d65fee0', 'palimpsest-purple', 3,
+        'fe142165-05bf-4eec-acf1-5d7ddad605be', 'openai', 'accepted',
+        'visitor-purple', 'codex mascot', NULL, 4),
+      ('ec0166ea-26b2-4565-959b-454e68ccb29b', 'palimpsest-purple', 4,
+        'ee06571d-e36b-4443-bf6a-ec150d65fee0', 'revert', 'accepted',
+        'archive-purple', 'Restore revision 2',
+        'fe142165-05bf-4eec-acf1-5d7ddad605be', 5),
+      ('6dd5039b-416e-419f-87e8-7a21b1bb0426', 'palimpsest-purple', 5,
+        'ec0166ea-26b2-4565-959b-454e68ccb29b', 'placement', 'accepted',
+        'visitor-purple', 'Codex mascot placement', NULL, 6),
+      ('5068a183-cb54-4e38-996b-ea3b1179f32c', 'palimpsest-purple', 6,
+        '6dd5039b-416e-419f-87e8-7a21b1bb0426', 'placement', 'accepted',
+        'visitor-purple', 'openai logo', NULL, 7);
+    INSERT INTO revision_patches (
+      revision_id, patch_blob_id, display_mask_blob_id,
+      frame_x, frame_y, frame_width, frame_height
+    ) VALUES
+      ('fe142165-05bf-4eec-acf1-5d7ddad605be', 'keep-patch', NULL,
+        1024, 1024, 1024, 1024),
+      ('ee06571d-e36b-4443-bf6a-ec150d65fee0', 'mascot-patch', NULL,
+        0, 0, 1024, 1024),
+      ('6dd5039b-416e-419f-87e8-7a21b1bb0426', 'placement-patch', NULL,
+        0, 0, 1024, 1024),
+      ('5068a183-cb54-4e38-996b-ea3b1179f32c', 'logo-patch', NULL,
+        0, 0, 1024, 1024);
+    INSERT INTO keyframes (id, artwork_id, revision_id, sequence, created_at)
+      VALUES ('mascot-keyframe', 'palimpsest-purple',
+        'ee06571d-e36b-4443-bf6a-ec150d65fee0', 3, 4);
+    INSERT INTO keyframe_tiles (keyframe_id, tile_x, tile_y, blob_id)
+      VALUES ('mascot-keyframe', 0, 0, 'mascot-tile');
+  `);
+
+  const insertJob = db.prepare(`
+    INSERT INTO edit_jobs (
+      id, artwork_id, kind, state, execution_mode, author_id, requester_hash,
+      base_revision_id, target_revision_id, prompt, source_blob_id, mask_blob_id,
+      idempotency_key, request_fingerprint, available_at, result_revision_id,
+      created_at, updated_at
+    ) VALUES (?, 'palimpsest-purple', ?, ?, ?, ?, 'requester', ?, ?, ?, ?, ?,
+      ?, ?, 1, ?, ?, ?)
+  `);
+  const addJob = ({
+    id,
+    kind = "edit",
+    state = "succeeded",
+    executionMode = "openai",
+    authorId = "visitor-purple",
+    baseRevisionId,
+    targetRevisionId = null,
+    prompt,
+    sourceBlobId = null,
+    maskBlobId = null,
+    resultRevisionId = null,
+    createdAt,
+  }) => insertJob.run(
+    id,
+    kind,
+    state,
+    executionMode,
+    authorId,
+    baseRevisionId,
+    targetRevisionId,
+    prompt,
+    sourceBlobId,
+    maskBlobId,
+    `idem-${id}`,
+    `fingerprint-${id}`,
+    resultRevisionId,
+    createdAt,
+    createdAt,
+  );
+  addJob({
+    id: "keep-job",
+    baseRevisionId: "63eac4d4-f2a9-454b-b347-5d8660e309a4",
+    prompt: "a jalapeno",
+    sourceBlobId: "keep-source",
+    resultRevisionId: "fe142165-05bf-4eec-acf1-5d7ddad605be",
+    createdAt: 3,
+  });
+  addJob({
+    id: "52529bdd-ab6e-42b7-9e1e-10cf682664ef",
+    baseRevisionId: "fe142165-05bf-4eec-acf1-5d7ddad605be",
+    prompt: "codex mascot",
+    sourceBlobId: "mascot-source",
+    resultRevisionId: "ee06571d-e36b-4443-bf6a-ec150d65fee0",
+    createdAt: 4,
+  });
+  addJob({
+    id: "fbfcb2e2-c602-486e-91bf-0b9596dd0ac8",
+    kind: "revert",
+    executionMode: "none",
+    authorId: "archive-purple",
+    baseRevisionId: "ee06571d-e36b-4443-bf6a-ec150d65fee0",
+    targetRevisionId: "fe142165-05bf-4eec-acf1-5d7ddad605be",
+    prompt: "Restore revision 2",
+    resultRevisionId: "ec0166ea-26b2-4565-959b-454e68ccb29b",
+    createdAt: 5,
+  });
+  addJob({
+    id: "abd4230f-7a43-4d8b-a66d-e667d37ea3c5",
+    executionMode: "placement",
+    baseRevisionId: "ec0166ea-26b2-4565-959b-454e68ccb29b",
+    prompt: "Codex mascot placement",
+    sourceBlobId: "placement-source",
+    resultRevisionId: "6dd5039b-416e-419f-87e8-7a21b1bb0426",
+    createdAt: 6,
+  });
+  addJob({
+    id: "7fe30312-b131-4da3-81d5-23c0d52d2f3f",
+    executionMode: "placement",
+    baseRevisionId: "6dd5039b-416e-419f-87e8-7a21b1bb0426",
+    prompt: "openai logo",
+    sourceBlobId: "logo-source",
+    resultRevisionId: "5068a183-cb54-4e38-996b-ea3b1179f32c",
+    createdAt: 7,
+  });
+  addJob({
+    id: "52e44704-48d0-49b6-81cf-416d8fa87be3",
+    state: "failed",
+    authorId: "target-only-author",
+    baseRevisionId: "fe142165-05bf-4eec-acf1-5d7ddad605be",
+    prompt: "failed mascot attempt",
+    maskBlobId: "failed-mask",
+    createdAt: 8,
+  });
+
+  db.exec(`
+    INSERT INTO artwork_commit_locks (
+      artwork_id, owner_token, fence, job_id, acquired_at, lease_expires_at
+    ) VALUES ('palimpsest-purple', 'worker', 7,
+      '7fe30312-b131-4da3-81d5-23c0d52d2f3f', 7, 9);
+    INSERT INTO rate_limit_claims (
+      requester_hash, scope, window_start, idempotency_key, job_id, created_at
+    ) VALUES
+      ('requester', 'edit:short', 0, 'keep', 'keep-job', 1),
+      ('requester', 'edit:short', 1, 'logo',
+        '7fe30312-b131-4da3-81d5-23c0d52d2f3f', 2);
+    INSERT INTO visitor_events (
+      id, visitor_hash, event_type, path, job_id, created_at
+    ) VALUES
+      ('keep-event', 'visitor', 'generation_requested', '/', 'keep-job', 1),
+      ('logo-event', 'visitor', 'generation_requested', '/',
+        '7fe30312-b131-4da3-81d5-23c0d52d2f3f', 2);
+  `);
+
+  const cleanup = await readFile(
+    new URL("drizzle/0013_remove_logo_mascot_generations.sql", root),
+    "utf8",
+  );
+  applyMigration(db, cleanup);
+
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        "SELECT head_revision_id, head_sequence FROM artworks WHERE id = 'palimpsest-purple'",
+      ).get(),
+    },
+    {
+      head_revision_id: "fe142165-05bf-4eec-acf1-5d7ddad605be",
+      head_sequence: 2,
+    },
+  );
+  assert.deepEqual(
+    db.prepare(
+      "SELECT id FROM revisions WHERE artwork_id = 'palimpsest-purple' ORDER BY sequence",
+    ).all().map(({ id }) => id),
+    [
+      "rev-seed-purple-000",
+      "63eac4d4-f2a9-454b-b347-5d8660e309a4",
+      "fe142165-05bf-4eec-acf1-5d7ddad605be",
+    ],
+  );
+  assert.deepEqual(
+    db.prepare("SELECT id FROM edit_jobs ORDER BY id").all().map(({ id }) => id),
+    ["keep-job"],
+  );
+  assert.deepEqual(
+    db.prepare("SELECT id FROM blobs ORDER BY id").all().map(({ id }) => id),
+    ["keep-patch", "keep-source"],
+  );
+  assert.deepEqual(
+    db.prepare(
+      "SELECT id, job_id FROM visitor_events ORDER BY id",
+    ).all().map((row) => ({ ...row })),
+    [
+      { id: "keep-event", job_id: "keep-job" },
+      { id: "logo-event", job_id: null },
+    ],
+  );
+  assert.deepEqual(
+    db.prepare("SELECT job_id FROM rate_limit_claims ORDER BY job_id").all()
+      .map(({ job_id: jobId }) => jobId),
+    ["keep-job"],
+  );
+  assert.deepEqual(
+    {
+      ...db.prepare(
+        "SELECT owner_token, job_id, acquired_at, lease_expires_at FROM artwork_commit_locks",
+      ).get(),
+    },
+    {
+      owner_token: null,
+      job_id: null,
+      acquired_at: null,
+      lease_expires_at: null,
+    },
+  );
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS count FROM authors WHERE id = 'target-only-author'").get().count,
+    0,
+  );
+  assert.equal(
+    db.prepare(
+      "SELECT COUNT(*) AS count FROM sqlite_master WHERE name LIKE '_cleanup_0013_%'",
+    ).get().count,
+    0,
+  );
+  assert.throws(() => db.exec(
+    "DELETE FROM revisions WHERE id = 'fe142165-05bf-4eec-acf1-5d7ddad605be'",
+  ));
+  db.close();
+
+  const diverged = await migratedDatabase();
+  diverged.exec(`
+    INSERT INTO artworks (
+      id, slug, title, width, height, tile_width, tile_height,
+      columns, rows, head_revision_id, head_sequence, created_at
+    ) VALUES ('palimpsest-purple', 'palimpsest', 'Palimpsest', 2048, 2048,
+      1024, 1024, 2, 2, 'future-revision', 7, 1);
+  `);
+  assert.throws(
+    () => applyMigration(diverged, cleanup),
+    /CHECK constraint failed/u,
+  );
+  assert.deepEqual(
+    {
+      ...diverged.prepare(
+        "SELECT head_revision_id, head_sequence FROM artworks WHERE id = 'palimpsest-purple'",
+      ).get(),
+    },
+    { head_revision_id: "future-revision", head_sequence: 7 },
+  );
+  diverged.close();
+});
+
 test("atomic spatial reservations reject overlap, allow touching, and expire cleanly", async () => {
   const db = await migratedDatabase();
   seedArtwork(db);
