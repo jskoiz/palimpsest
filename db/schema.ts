@@ -294,7 +294,6 @@ export const visitorEvents = sqliteTable(
         "mask_confirmed",
         "reference_added",
         "generation_requested",
-        "restore_requested",
       ],
     }).notNull(),
     path: text("path").notNull(),

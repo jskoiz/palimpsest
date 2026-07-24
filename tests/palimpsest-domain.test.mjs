@@ -847,23 +847,22 @@ test("extreme reference aspects are rejected after visible bounds are prepared",
 });
 
 test("generation stays attached to submission and retry requests", async () => {
-  const [clientSource, workerSource, editRoute, retryRoute, revertRoute] = await Promise.all([
+  const [clientSource, workerSource, editRoute, retryRoute] = await Promise.all([
     readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8"),
     readFile(new URL("../worker/index.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/api/edits/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/api/jobs/[jobId]/retry/route.ts", import.meta.url), "utf8"),
-    readFile(new URL("../app/api/reverts/route.ts", import.meta.url), "utf8"),
   ]);
   const submitStart = clientSource.indexOf("const submitEdit = async");
-  const revertStart = clientSource.indexOf("const submitRevert = async", submitStart);
-  assert.ok(submitStart >= 0 && revertStart > submitStart);
-  const submit = clientSource.slice(submitStart, revertStart);
+  const renderStart = clientSource.indexOf("const zoomStyle", submitStart);
+  assert.ok(submitStart >= 0 && renderStart > submitStart);
+  const submit = clientSource.slice(submitStart, renderStart);
 
   assert.match(submit, /setSubmitted\(true\);\s*void requestQueueDrain\(\)/);
   assert.doesNotMatch(submit, /if \(!placement\) void requestQueueDrain/);
   assert.match(clientSource, /referenceImage \? 350 : 3000/);
   assert.match(clientSource, /fetchJson<\{ job: Job \}>\(`\/api\/jobs\//);
-  for (const route of [editRoute, retryRoute, revertRoute]) {
+  for (const route of [editRoute, retryRoute]) {
     assert.match(route, /await processQueue\(env, 1\)/);
     assert.match(route, /await getPublicJob\(env, job\.id\)/);
   }

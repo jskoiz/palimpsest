@@ -12,13 +12,13 @@ Multiple people can work at once. A live reservation locks only the region curre
 2. **Mask** the pixels that may change, or choose the entire patch.
 3. **Describe** the edit and optionally attach a PNG, JPEG, or WebP reference.
 4. **Render and review.** GPT Image edits the current masked context frame. A positioned reference preview is supplied as a second visual input, and the original source frame is retained for an independent fidelity, preview-alignment, blending, and preservation review.
-5. **Remember.** The accepted patch is appended as a new revision. The timeline can scrub, compare, replay, share, and restore earlier states without erasing history.
+5. **Remember.** The accepted patch is appended as a new revision. The timeline can scrub, compare, replay, and share earlier states without changing the current canvas.
 
 ## Why it is different
 
 - **Parallel creation without collisions.** Atomic artwork-space reservations reject positive-area overlap while allowing independent edits to generate concurrently.
 - **Precise, reversible AI editing.** Each generated context frame retains a display mask, so pixels outside the reserved area remain unchanged.
-- **A public creative memory.** Restoring an earlier look creates another revision instead of rewriting the archive.
+- **A public creative memory.** Earlier looks remain available as a view-only archive without becoming the current canvas again.
 - **Fluid canvas navigation.** Patches can cross former tile seams, while pan, zoom, keyboard movement, and a draggable timeline keep the full work navigable.
 
 ## OpenAI in the product
@@ -80,7 +80,7 @@ npx tsc --noEmit
 npm test
 ```
 
-Focused tests cover revision ordering, free-position region limits, seam crossing, reservation overlap, expired leases, generation frames, region-aware concurrency, reference images, GPT-5.6 request/response handling, revert resolution, and stable secret-free history serialization.
+Focused tests cover revision ordering, free-position region limits, seam crossing, reservation overlap, expired leases, generation frames, region-aware concurrency, reference images, GPT-5.6 request/response handling, view-only history, and stable secret-free history serialization.
 
 ## Built with Codex
 

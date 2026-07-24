@@ -20,7 +20,7 @@ A contributor places a free-position patch anywhere on one canonical canvas, pai
 
 The collaboration model is spatial. Every active contribution owns a temporary global-coordinate reservation. Overlapping work is blocked atomically, edge contact stays available, and non-overlapping edits can moderate and generate in parallel. A short fenced commit step keeps the visible history linear even when creation is concurrent.
 
-Accepted edits never overwrite the archive. The timeline can scrub, play, compare, share, and restore earlier looks; a restore is itself a new revision. Palimpsest is both a canvas and the memory of everyone who touched it.
+Accepted edits never overwrite the archive. The timeline can scrub, play, compare, and share earlier looks, but history is view-only and cannot replace the current canvas. Palimpsest is both a canvas and the memory of everyone who touched it.
 
 ## Problem and impact
 
@@ -58,7 +58,7 @@ The final video must be public, under three minutes, and include spoken audio.
 
 **0:15–0:35 — The living archive**
 
-Open the bottom timeline. Drag through revisions, play the sequence, compare one change, and show that an earlier state can be restored without deleting later history.
+Open the bottom timeline. Drag through revisions, play the sequence, compare one change, and show that earlier states remain viewable without changing the current canvas.
 
 **0:35–1:10 — Make a precise edit**
 

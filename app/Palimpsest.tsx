@@ -1190,7 +1190,6 @@ export default function Palimpsest() {
   const [submitted, setSubmitted] = useState(false);
   const [isPreparing, setIsPreparing] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
-  const [confirmRestore, setConfirmRestore] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
   const [pendingEdit, setPendingEdit] = useState<PendingEdit | null>(null);
   const [localSubmissionFailure, setLocalSubmissionFailure] =
@@ -1359,7 +1358,6 @@ export default function Palimpsest() {
   const openWelcome = useCallback(() => {
     setPlaying(false);
     setCompareOn(false);
-    setConfirmRestore(false);
     setQueueOpen(false);
     setHistoryOpen(false);
     setHoverIdx(-1);
@@ -1802,7 +1800,6 @@ export default function Palimpsest() {
       if (!latest.current.revLen) return;
       setPlaying(false);
       setQueueOpen(false);
-      setConfirmRestore(false);
       setHistoryOpen(true);
       setSelectedIndex((index) =>
         Math.max(0, Math.min(latest.current.revLen - 1, index + delta)),
@@ -1819,7 +1816,6 @@ export default function Palimpsest() {
     setQueueOpen(false);
     setHistoryOpen(true);
     setCompareOn(false);
-    setConfirmRestore(false);
     if (next && current.selectedIndex >= current.revLen - 1) setSelectedIndex(0);
     setPlaying(next);
     wake();
@@ -1833,7 +1829,6 @@ export default function Palimpsest() {
     setPlaying(false);
     setCompareOn(false);
     setSubmitted(false);
-    setConfirmRestore(false);
     if (!localSubmissionFailure) clearReferenceImage();
     wake();
   }, [clearReferenceImage, localSubmissionFailure, queueOpen, wake]);
@@ -1874,7 +1869,6 @@ export default function Palimpsest() {
       setHistoryOpen(true);
       setPlaying(false);
       setCompareOn(false);
-      setConfirmRestore(false);
       wake();
     },
     [revisions, wake],
@@ -1889,7 +1883,6 @@ export default function Palimpsest() {
     setPlaying(false);
     setCompareOn(false);
     setSubmitted(false);
-    setConfirmRestore(false);
     clearReferenceImage();
     wake();
   }, [clearReferenceImage, historyOpen, wake]);
@@ -1930,7 +1923,6 @@ export default function Palimpsest() {
     setLocalSubmissionFailure(null);
     setSubmitted(false);
     setSubmitError(null);
-    setConfirmRestore(false);
     setView({ zoom: 1, x: 0, y: 0 });
     trackVisitorInteraction("contribution_opened");
     if (closeTimer.current) window.clearTimeout(closeTimer.current);
@@ -1956,7 +1948,6 @@ export default function Palimpsest() {
     setCompareOn(false);
     setPlaying(false);
     setSubmitted(false);
-    setConfirmRestore(false);
     setHoverIdx(-1);
     if (!localSubmissionFailure) clearReferenceImage();
     setView({ zoom: 1, x: 0, y: 0 });
@@ -1969,7 +1960,6 @@ export default function Palimpsest() {
     setSelectedIndex(latest.current.revLen - 1);
     setPlaying(false);
     setCompareOn(false);
-    setConfirmRestore(false);
     wake();
   }, [wake]);
 
@@ -1982,7 +1972,6 @@ export default function Palimpsest() {
     setCompareOn(false);
     setPlaying(false);
     setSubmitted(false);
-    setConfirmRestore(false);
     setHoverIdx(-1);
     clearReferenceImage();
     if (latest.current.revLen) {
@@ -2070,7 +2059,6 @@ export default function Palimpsest() {
     setSelectedIndex(index);
     setPlaying(false);
     setCompareOn(false);
-    setConfirmRestore(false);
     wake();
   };
 
@@ -2631,41 +2619,6 @@ export default function Palimpsest() {
     }
   };
 
-  const submitRevert = async () => {
-    if (!history || !selectedRevision || selectedRevision.id === history.headRevisionId) return;
-    setConfirmRestore(false);
-    try {
-      const sessionId = visitorSessionId();
-      const payload = await fetchJson<{ job: Job }>("/api/reverts", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Idempotency-Key": crypto.randomUUID(),
-          ...(sessionId ? { "X-Palimpsest-Session": sessionId } : {}),
-        },
-        body: JSON.stringify({
-          artworkId: "palimpsest",
-          baseRevisionId: history.headRevisionId,
-          targetRevisionId: selectedRevision.id,
-          displayName: cleanDisplayName(),
-        }),
-      });
-      setJob(payload.job);
-      rememberRetryCapability(payload.job.id, payload.job.retryToken);
-      setPendingEdit({
-        jobId: payload.job.id,
-        author: cleanDisplayName() || "anonymous visitor",
-        prompt: `restore ${seqTag(selectedRevision.sequence)}`,
-        region: null,
-      });
-      void requestQueueDrain();
-      await refreshActivity();
-      showToast(`queued — restoring ${seqTag(selectedRevision.sequence)}`);
-    } catch (error) {
-      showToast(error instanceof Error ? error.message : "The restore could not be queued.");
-    }
-  };
-
   const zoomStyle = { transform: `translate(${view.x}px, ${view.y}px) scale(${view.zoom})` };
   const zoomClass = `mono-zoom${panning ? " is-panning" : ""}`;
   const chromeState = playing ? " is-dimmed" : chromeShown ? "" : " is-hidden";
@@ -3118,7 +3071,6 @@ export default function Palimpsest() {
             if (event.pointerType !== "mouse" || playing || compareOn) return;
             setHistoryOpen(false);
             setHoverIdx(-1);
-            setConfirmRestore(false);
             wake();
           }}
         >
@@ -3209,19 +3161,6 @@ export default function Palimpsest() {
               >
                 {compareOn ? "[x] compare" : "[ ] compare"}
               </button>
-              {notCurrent ? (
-                <button
-                  type="button"
-                  className={`mono-action${confirmRestore ? " is-accent" : ""}`}
-                  onClick={() => {
-                    if (confirmRestore) void submitRevert();
-                    else setConfirmRestore(true);
-                    wake();
-                  }}
-                >
-                  {confirmRestore ? "confirm restore →" : "restore this look"}
-                </button>
-              ) : null}
               {notCurrent ? (
                 <button type="button" className="mono-action is-accent" onClick={returnToCurrent}>
                   return to current

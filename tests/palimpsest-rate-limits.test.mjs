@@ -10,7 +10,7 @@ const adminEnv = {
 };
 
 function requestWithHeaders(headers = {}) {
-  return new Request("https://palimpsest.example/api/reverts", { headers });
+  return new Request("https://palimpsest.example/api/edits", { headers });
 }
 
 test("only an exact dispatcher-authenticated allowlist identity is an admin", () => {
@@ -47,17 +47,15 @@ test("only an exact dispatcher-authenticated allowlist identity is an admin", ()
   );
 });
 
-test("verified admins bypass every edit and restore limit", () => {
+test("verified admins bypass edit limits", () => {
   const request = requestWithHeaders({
     "oai-authenticated-user-email": "owner@example.com",
   });
 
-  for (const kind of ["edit", "revert"]) {
-    assert.deepEqual(contributionRatePolicy(adminEnv, request, kind), {
-      name: "admin-bypass",
-      limits: [],
-    });
-  }
+  assert.deepEqual(contributionRatePolicy(adminEnv, request, "edit"), {
+    name: "admin-bypass",
+    limits: [],
+  });
 });
 
 test("debug endpoint is intentionally public and contains no client-controlled bypass", async () => {
@@ -83,33 +81,32 @@ test("public visitor events are bounded before storage", async () => {
   assert.match(store, /WHERE NOT EXISTS/u);
 });
 
-test("both contribution routes consume the centralized server policy", async () => {
-  const [editRoute, revertRoute] = await Promise.all([
-    readFile(new URL("../app/api/edits/route.ts", import.meta.url), "utf8"),
-    readFile(new URL("../app/api/reverts/route.ts", import.meta.url), "utf8"),
-  ]);
-
-  for (const route of [editRoute, revertRoute]) {
-    assert.match(route, /contributionRatePolicy\(env, request, "(?:edit|revert)"\)/);
-    assert.match(route, /rateLimits: ratePolicy\.limits/);
-    assert.doesNotMatch(route, /enforceRateLimit/);
-    assert.doesNotMatch(route, /x-palimpsest-admin/i);
-  }
-});
-
-test("regular restores allow two attempts per ten-minute window", async () => {
-  assert.deepEqual(contributionRatePolicy(adminEnv, requestWithHeaders(), "revert"), {
-    name: "regular",
-    limits: [{ scope: "revert-10m", limit: 2, windowMs: 10 * 60 * 1000 }],
-  });
-
-  const revertRoute = await readFile(
-    new URL("../app/api/reverts/route.ts", import.meta.url),
+test("the edit route consumes the centralized server policy", async () => {
+  const editRoute = await readFile(
+    new URL("../app/api/edits/route.ts", import.meta.url),
     "utf8",
   );
 
-  assert.doesNotMatch(revertRoute, /revert-hour|60 \* 60 \* 1000/);
-  assert.match(revertRoute, /Retry-After", "600"/);
+  assert.match(editRoute, /contributionRatePolicy\(env, request, "edit"\)/);
+  assert.match(editRoute, /rateLimits: ratePolicy\.limits/);
+  assert.doesNotMatch(editRoute, /enforceRateLimit/);
+  assert.doesNotMatch(editRoute, /x-palimpsest-admin/i);
+});
+
+test("history is view-only and exposes no restore write path", async () => {
+  const [client, store, queue] = await Promise.all([
+    readFile(new URL("../app/Palimpsest.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../lib/palimpsest/store.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/palimpsest/queue.ts", import.meta.url), "utf8"),
+  ]);
+
+  await assert.rejects(
+    readFile(new URL("../app/api/reverts/route.ts", import.meta.url), "utf8"),
+    { code: "ENOENT" },
+  );
+  assert.doesNotMatch(client, /submitRevert|restore this look|confirm restore|\/api\/reverts/u);
+  assert.doesNotMatch(store, /insertRevertJob|INSERT_REVERT_RESERVATION_SQL/u);
+  assert.doesNotMatch(queue, /commitRevert|COMMIT_REVERT_REVISION_SQL/u);
 });
 
 test("unknown contribution kinds cannot silently inherit another policy", () => {
