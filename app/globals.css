@@ -1686,12 +1686,37 @@ body {
   padding: 18px 0 20px;
 }
 
+.mono-welcome-intro {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
 .mono-welcome-summary {
   max-width: 29ch;
   margin: 0;
   color: rgba(255, 255, 255, 0.84);
   font-size: 16px;
   line-height: 1.52;
+}
+
+.mono-welcome-credit {
+  max-width: 30ch;
+  margin: auto 0 0;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.mono-welcome-credit a {
+  color: rgba(255, 255, 255, 0.78);
+  text-decoration-color: rgba(255, 255, 255, 0.32);
+  text-underline-offset: 3px;
+}
+
+.mono-welcome-credit a:hover {
+  color: var(--accent);
+  text-decoration-color: currentColor;
 }
 
 .mono-welcome-path {
@@ -2419,6 +2444,15 @@ body {
   .mono-welcome-summary {
     max-width: 48ch;
     font-size: 14px;
+  }
+
+  .mono-welcome-intro {
+    gap: 10px;
+  }
+
+  .mono-welcome-credit {
+    max-width: none;
+    margin-top: 0;
   }
 
   .mono-welcome-path {
