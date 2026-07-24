@@ -242,25 +242,24 @@ BEGIN SELECT RAISE(ABORT, 'accepted revisions are immutable'); END;
 --> statement-breakpoint
 DELETE FROM `blobs`
 WHERE `id` IN (SELECT `id` FROM `_cleanup_0013_blobs`)
-	AND `id` NOT IN (
-		SELECT `patch_blob_id` FROM `revision_patches`
-		UNION
-		SELECT `display_mask_blob_id` FROM `revision_patches`
-			WHERE `display_mask_blob_id` IS NOT NULL
-		UNION
-		SELECT `blob_id` FROM `keyframe_tiles`
-		UNION
-		SELECT `source_blob_id` FROM `edit_jobs`
-			WHERE `source_blob_id` IS NOT NULL
-		UNION
-		SELECT `mask_blob_id` FROM `edit_jobs`
-			WHERE `mask_blob_id` IS NOT NULL
-		UNION
-		SELECT `display_mask_blob_id` FROM `edit_jobs`
-			WHERE `display_mask_blob_id` IS NOT NULL
-		UNION
-		SELECT `reference_blob_id` FROM `edit_jobs`
-			WHERE `reference_blob_id` IS NOT NULL
+	AND NOT EXISTS (
+		SELECT 1
+		FROM `revision_patches`
+		WHERE `patch_blob_id` = `blobs`.`id`
+			OR `display_mask_blob_id` = `blobs`.`id`
+	)
+	AND NOT EXISTS (
+		SELECT 1
+		FROM `keyframe_tiles`
+		WHERE `blob_id` = `blobs`.`id`
+	)
+	AND NOT EXISTS (
+		SELECT 1
+		FROM `edit_jobs`
+		WHERE `source_blob_id` = `blobs`.`id`
+			OR `mask_blob_id` = `blobs`.`id`
+			OR `display_mask_blob_id` = `blobs`.`id`
+			OR `reference_blob_id` = `blobs`.`id`
 	);
 --> statement-breakpoint
 DELETE FROM `authors`
